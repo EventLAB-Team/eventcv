@@ -221,3 +221,6 @@ __marimo__/
 # Added by cargo
 
 /target
+
+AGENTS.md
+*.DS_Store

@@ -1,0 +1,13 @@
+[package]
+name = "eventcv-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+eventcv-core = { path = "../eventcv-core" }
+pyo3 = { version = "0.29", features = ["extension-module"] }
+numpy = "0.29"

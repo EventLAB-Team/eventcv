@@ -1,0 +1,9 @@
+[package]
+name = "eventcv-core"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+ndarray = "0.17"
+npyz = { version = "0.9", features = ["derive", "npz"] }
+rayon = "1.10"

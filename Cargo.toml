@@ -1,6 +1,6 @@
-[package]
-name = "eventcv"
-version = "0.0.1"
-edition = "2024"
-
-[dependencies]
+[workspace]
+members = [
+    "crates/eventcv-core",
+    "crates/eventcv-py"
+]
+resolver = "2"
