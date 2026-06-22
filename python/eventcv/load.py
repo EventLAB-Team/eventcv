@@ -1,6 +1,8 @@
 from . import _rust
 
 EventStream = _rust.EventStream
+EventFrame = _rust.EventFrame
+Polarity = _rust.Polarity
 
 
 def load(path: str) -> EventStream:
@@ -8,4 +10,4 @@ def load(path: str) -> EventStream:
     return _rust.load(path)
 
 
-__all__ = ["EventStream", "load"]
+__all__ = ["EventFrame", "EventStream", "Polarity", "load"]

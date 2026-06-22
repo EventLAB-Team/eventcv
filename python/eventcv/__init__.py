@@ -1,3 +1,3 @@
-from .load import EventStream, load
+from .load import EventFrame, EventStream, Polarity, load
 
-__all__ = ["EventStream", "load"]
+__all__ = ["EventFrame", "EventStream", "Polarity", "load"]

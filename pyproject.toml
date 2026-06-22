@@ -13,7 +13,7 @@ authors = [
   { name = "Adam Hines", email = "a.david.hines@gmail.com"}
 ]
 dependencies = [
-    "numpy>=1.24"
+    "numpy>=1.24,<2"
 ]
 
 [tool.maturin]
