@@ -14,6 +14,12 @@ const AXIS_Z: u32 = 0xc77dff;
 const DEFAULT_ANGLE: f32 = -0.55;
 const RESET_BOUNDS: (usize, usize, usize, usize) = (16, 16, 96, 48);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragAxis {
+    Horizontal,
+    Vertical,
+}
+
 pub(crate) fn view(frame: &EventFrame, normalize: bool) -> Result<(), String> {
     match prepare_frame(frame, normalize)? {
         PreparedView::Image {
@@ -125,13 +131,19 @@ fn show_cloud(points: &[CloudPoint], z_label: &str, name: &str) -> Result<(), St
         },
     )
     .map_err(|error| error.to_string())?;
+
     window.set_target_fps(60);
 
-    let mut angle = DEFAULT_ANGLE;
+    let mut pitch = DEFAULT_ANGLE;
+    let mut yaw = 0.0_f32;
+    let mut last_x = 0.0_f32;
     let mut last_y = 0.0_f32;
+
     let mut dragging = false;
+    let mut drag_axis = None;
     let mut previous_down = false;
-    let mut buffer = render_cloud(points, z_label, VIEW_WIDTH, VIEW_HEIGHT, angle);
+
+    let mut buffer = render_cloud(points, z_label, VIEW_WIDTH, VIEW_HEIGHT, pitch, yaw);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let mouse = window.get_mouse_pos(MouseMode::Discard);
@@ -140,33 +152,64 @@ fn show_cloud(points: &[CloudPoint], z_label: &str, name: &str) -> Result<(), St
 
         if down && !previous_down {
             if mouse.is_some_and(|(x, y)| reset_contains(x, y)) {
-                angle = DEFAULT_ANGLE;
+                pitch = DEFAULT_ANGLE;
+                yaw = 0.0;
                 redraw = true;
-            } else if let Some((_, y)) = mouse {
+            } else if let Some((x, y)) = mouse {
                 dragging = true;
+                last_x = x;
                 last_y = y;
+                drag_axis = None;
             }
         }
+
         if down && dragging {
-            if let Some((_, y)) = mouse {
-                let next_angle = (angle + (y - last_y) * 0.008).clamp(-1.45, 1.45);
-                redraw |= next_angle != angle;
-                angle = next_angle;
+            if let Some((x, y)) = mouse {
+                let delta_x = x - last_x;
+                let delta_y = y - last_y;
+                drag_axis = drag_axis.or_else(|| dominant_axis(delta_x, delta_y));
+                match drag_axis {
+                    Some(DragAxis::Horizontal) if delta_x != 0.0 => {
+                        yaw += delta_x * 0.008;
+                        redraw = true;
+                    }
+                    Some(DragAxis::Vertical) if delta_y != 0.0 => {
+                        let next_pitch = (pitch + delta_y * 0.008).clamp(-1.45, 1.45);
+                        redraw = next_pitch != pitch;
+                        pitch = next_pitch;
+                    }
+                    _ => {}
+                }
+                last_x = x;
                 last_y = y;
             }
         } else if !down {
             dragging = false;
+            drag_axis = None;
         }
+
         if redraw {
-            buffer = render_cloud(points, z_label, VIEW_WIDTH, VIEW_HEIGHT, angle);
+            buffer = render_cloud(points, z_label, VIEW_WIDTH, VIEW_HEIGHT, pitch, yaw);
         }
 
         window
             .update_with_buffer(&buffer, VIEW_WIDTH, VIEW_HEIGHT)
             .map_err(|error| error.to_string())?;
+
         previous_down = down;
     }
+
     Ok(())
+}
+
+fn dominant_axis(delta_x: f32, delta_y: f32) -> Option<DragAxis> {
+    if delta_x == 0.0 && delta_y == 0.0 {
+        None
+    } else if delta_x.abs() >= delta_y.abs() {
+        Some(DragAxis::Horizontal)
+    } else {
+        Some(DragAxis::Vertical)
+    }
 }
 
 fn render_polarity(
@@ -424,7 +467,8 @@ fn render_cloud(
     z_label: &str,
     width: usize,
     height: usize,
-    angle: f32,
+    pitch: f32,
+    yaw: f32,
 ) -> Vec<u32> {
     let mut buffer = vec![BACKGROUND; width * height];
     let mut depth_buffer = vec![f32::INFINITY; width * height];
@@ -434,7 +478,7 @@ fn render_cloud(
         .fold(0.0_f32, f32::max);
 
     for point in points {
-        if let Some(projected) = project(*point, angle, width, height) {
+        if let Some(projected) = project(*point, pitch, yaw, width, height) {
             let relative = if maximum > 0.0 {
                 (point.strength / maximum).sqrt()
             } else {
@@ -454,7 +498,7 @@ fn render_cloud(
         }
     }
 
-    draw_axes(&mut buffer, width, height, angle, z_label);
+    draw_axes(&mut buffer, width, height, pitch, yaw, z_label);
     draw_reset(&mut buffer, width, height);
     draw_legend(&mut buffer, width, height);
     buffer
@@ -462,11 +506,13 @@ fn render_cloud(
 
 fn project(
     point: CloudPoint,
-    angle: f32,
+    pitch: f32,
+    yaw: f32,
     width: usize,
     height: usize,
 ) -> Option<ProjectedPoint> {
-    let (x, y, z) = rotate_x(point.x as f32, point.y as f32, point.z as f32, angle);
+    let (x, y, z) = rotate_y(point.x as f32, point.y as f32, point.z as f32, yaw);
+    let (x, y, z) = rotate_x(x, y, z, pitch);
     let depth = 3.4 - z;
     if depth <= 0.1 {
         return None;
@@ -488,6 +534,12 @@ fn rotate_x(x: f32, y: f32, z: f32, angle: f32) -> (f32, f32, f32) {
     let cosine = angle.cos();
     let sine = angle.sin();
     (x, y * cosine - z * sine, y * sine + z * cosine)
+}
+
+fn rotate_y(x: f32, y: f32, z: f32, angle: f32) -> (f32, f32, f32) {
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    (x * cosine + z * sine, y, -x * sine + z * cosine)
 }
 
 fn draw_depth_point(
@@ -513,11 +565,18 @@ fn draw_depth_point(
     }
 }
 
-fn draw_axes(buffer: &mut [u32], width: usize, height: usize, angle: f32, z_label: &str) {
-    let origin = axis_project(-1.0, -1.0, -1.0, angle, width, height);
-    let x_end = axis_project(1.0, -1.0, -1.0, angle, width, height);
-    let y_end = axis_project(-1.0, 1.0, -1.0, angle, width, height);
-    let z_end = axis_project(-1.0, -1.0, 1.0, angle, width, height);
+fn draw_axes(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    pitch: f32,
+    yaw: f32,
+    z_label: &str,
+) {
+    let origin = axis_project(-1.0, -1.0, -1.0, pitch, yaw, width, height);
+    let x_end = axis_project(1.0, -1.0, -1.0, pitch, yaw, width, height);
+    let y_end = axis_project(-1.0, 1.0, -1.0, pitch, yaw, width, height);
+    let z_end = axis_project(-1.0, -1.0, 1.0, pitch, yaw, width, height);
     if let (Some(origin), Some(x_end)) = (origin, x_end) {
         draw_line(buffer, width, height, origin, x_end, AXIS_X);
         draw_label_at(buffer, width, height, x_end, "X", AXIS_X);
@@ -550,7 +609,8 @@ fn axis_project(
     x: f64,
     y: f64,
     z: f64,
-    angle: f32,
+    pitch: f32,
+    yaw: f32,
     width: usize,
     height: usize,
 ) -> Option<(i32, i32)> {
@@ -562,7 +622,8 @@ fn axis_project(
             strength: 1.0,
             color: 0,
         },
-        angle,
+        pitch,
+        yaw,
         width,
         height,
     )
@@ -831,9 +892,10 @@ mod tests {
     };
 
     use super::{
-        point_set_cloud, prepare_frame, render_cloud, render_polarity_values, render_tencode,
-        reset_contains, rgb, rotate_x, scale_counts, voxel_cloud, PreparedView, DEFAULT_ANGLE,
-        VIEW_HEIGHT, VIEW_WIDTH,
+        dominant_axis, point_set_cloud, prepare_frame, project, render_cloud,
+        render_polarity_values, render_tencode, reset_contains, rgb, rotate_x, rotate_y,
+        scale_counts, voxel_cloud, CloudPoint, DragAxis, PreparedView, DEFAULT_ANGLE, VIEW_HEIGHT,
+        VIEW_WIDTH,
     };
 
     #[test]
@@ -855,6 +917,39 @@ mod tests {
         assert_eq!(rotated.0, 0.75);
         assert_ne!(rotated.1, -0.25);
         assert_ne!(rotated.2, 0.5);
+    }
+
+    #[test]
+    fn rotation_is_strictly_about_y() {
+        let rotated = rotate_y(0.75, -0.25, 0.5, DEFAULT_ANGLE);
+
+        assert_ne!(rotated.0, 0.75);
+        assert_eq!(rotated.1, -0.25);
+        assert_ne!(rotated.2, 0.5);
+    }
+
+    #[test]
+    fn locks_viewpoint_movement_to_the_dominant_drag_axis() {
+        assert_eq!(dominant_axis(8.0, 3.0), Some(DragAxis::Horizontal));
+        assert_eq!(dominant_axis(2.0, -9.0), Some(DragAxis::Vertical));
+        assert_eq!(dominant_axis(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn viewpoint_changes_keep_the_volume_origin_fixed() {
+        let point = CloudPoint {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            strength: 1.0,
+            color: 0,
+        };
+        let original = project(point, DEFAULT_ANGLE, 0.0, VIEW_WIDTH, VIEW_HEIGHT).unwrap();
+        let moved = project(point, 0.75, -0.8, VIEW_WIDTH, VIEW_HEIGHT).unwrap();
+
+        assert_eq!(moved.x, original.x);
+        assert_eq!(moved.y, original.y);
+        assert_eq!(moved.depth, original.depth);
     }
 
     #[test]
@@ -918,7 +1013,14 @@ mod tests {
         let points = voxel_cloud(&frame).unwrap();
         let start = std::time::Instant::now();
 
-        let pixels = render_cloud(&points, "TIME BIN", VIEW_WIDTH, VIEW_HEIGHT, DEFAULT_ANGLE);
+        let pixels = render_cloud(
+            &points,
+            "TIME BIN",
+            VIEW_WIDTH,
+            VIEW_HEIGHT,
+            DEFAULT_ANGLE,
+            0.0,
+        );
 
         assert_eq!(pixels.len(), VIEW_WIDTH * VIEW_HEIGHT);
         eprintln!(

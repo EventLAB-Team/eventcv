@@ -224,3 +224,4 @@ __marimo__/
 
 AGENTS.md
 *.DS_Store
+tests/quickview.py
