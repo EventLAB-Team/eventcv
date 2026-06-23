@@ -3,6 +3,7 @@ use std::{error::Error, fmt, io, path::Path};
 use ndarray::{Array2, ArrayView2};
 use npyz::npz::NpzArchive;
 
+pub mod image;
 pub mod representation;
 
 const COLUMN_COUNT: usize = 4;
@@ -47,6 +48,7 @@ pub struct EventStream {
     events: Array2<u64>,
     width: usize,
     height: usize,
+    timestamp_scale_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +74,10 @@ impl EventStream {
 
     pub fn sensor_size(&self) -> (usize, usize) {
         (self.width, self.height)
+    }
+
+    pub fn timestamp_scale_ms(&self) -> f64 {
+        self.timestamp_scale_ms
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
@@ -136,6 +142,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<EventStream, LoadError> {
         events,
         width: N_IMAGENET_WIDTH,
         height: N_IMAGENET_HEIGHT,
+        timestamp_scale_ms: 0.001,
     })
 }
 

@@ -1,19 +1,100 @@
-use eventcv_core::representation::{EventFrame, EventFrameData, RepresentationKind};
-use minifb::{Key, Scale, Window, WindowOptions};
-use plotters::backend::{BitMapBackend, DrawingBackend};
+use eventcv_core::representation::{
+    EventFrame, EventFrameData, EventPointSet, RepresentationKind,
+};
+use minifb::{Key, MouseButton, MouseMode, Scale, Window, WindowOptions};
+
+const VIEW_WIDTH: usize = 960;
+const VIEW_HEIGHT: usize = 720;
+const BACKGROUND: u32 = 0x0b1020;
+const POSITIVE: u32 = 0xff496c;
+const NEGATIVE: u32 = 0x27c2ff;
+const AXIS_X: u32 = 0xffca3a;
+const AXIS_Y: u32 = 0x8ac926;
+const AXIS_Z: u32 = 0xc77dff;
+const DEFAULT_ANGLE: f32 = -0.55;
+const RESET_BOUNDS: (usize, usize, usize, usize) = (16, 16, 96, 48);
 
 pub(crate) fn view(frame: &EventFrame, normalize: bool) -> Result<(), String> {
-    if frame.kind() != RepresentationKind::Polarity {
-        return Err("EventFrame does not have a viewer".to_owned());
+    match prepare_frame(frame, normalize)? {
+        PreparedView::Image {
+            pixels,
+            width,
+            height,
+            name,
+        } => show_image(&pixels, width, height, name),
+        PreparedView::Cloud {
+            points,
+            z_label,
+            name,
+        } => show_cloud(&points, z_label, name),
     }
+}
 
+pub(crate) fn view_point_set(points: &EventPointSet) -> Result<(), String> {
+    show_cloud(&point_set_cloud(points), "TIME", "Point Set")
+}
+
+enum PreparedView {
+    Image {
+        pixels: Vec<u32>,
+        width: usize,
+        height: usize,
+        name: &'static str,
+    },
+    Cloud {
+        points: Vec<CloudPoint>,
+        z_label: &'static str,
+        name: &'static str,
+    },
+}
+
+fn prepare_frame(frame: &EventFrame, normalize: bool) -> Result<PreparedView, String> {
     let (_, height, width) = frame.shape();
-    let pixels = match frame.data() {
-        EventFrameData::U8(data) => render_values(data, width, height, true)?,
-        EventFrameData::U16(data) => render_counts(data, width, height, normalize)?,
-    };
+    match frame.kind() {
+        RepresentationKind::Polarity => Ok(PreparedView::Image {
+            pixels: render_polarity(frame.data(), width, height, normalize)?,
+            width,
+            height,
+            name: "Polarity",
+        }),
+        RepresentationKind::Binary => Ok(PreparedView::Image {
+            pixels: render_binary(frame.data(), width, height)?,
+            width,
+            height,
+            name: "Binary",
+        }),
+        RepresentationKind::Tencode => Ok(PreparedView::Image {
+            pixels: render_tencode(frame.data(), width, height, normalize)?,
+            width,
+            height,
+            name: "Tencode",
+        }),
+        RepresentationKind::Voxel => Ok(PreparedView::Cloud {
+            points: voxel_cloud(frame)?,
+            z_label: "TIME BIN",
+            name: "Voxel Grid",
+        }),
+        RepresentationKind::TimeSurface => Ok(PreparedView::Cloud {
+            points: time_surface_cloud(frame)?,
+            z_label: "RESPONSE",
+            name: "Time Surface",
+        }),
+        RepresentationKind::Mcts => Ok(PreparedView::Cloud {
+            points: mcts_cloud(frame)?,
+            z_label: "WINDOW MS",
+            name: "MCTS",
+        }),
+    }
+}
+
+fn show_image(
+    pixels: &[u32],
+    width: usize,
+    height: usize,
+    name: &str,
+) -> Result<(), String> {
     let mut window = Window::new(
-        "eventcv - Polarity",
+        &format!("eventcv - {name}"),
         width,
         height,
         WindowOptions {
@@ -23,160 +104,827 @@ pub(crate) fn view(frame: &EventFrame, normalize: bool) -> Result<(), String> {
         },
     )
     .map_err(|error| error.to_string())?;
-    window.set_background_color(255, 255, 255);
     window.set_target_fps(60);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         window
-            .update_with_buffer(&pixels, width, height)
+            .update_with_buffer(pixels, width, height)
             .map_err(|error| error.to_string())?;
     }
-
     Ok(())
 }
 
-fn render_counts(
-    data: &[u16],
+fn show_cloud(points: &[CloudPoint], z_label: &str, name: &str) -> Result<(), String> {
+    let mut window = Window::new(
+        &format!("eventcv - {name}"),
+        VIEW_WIDTH,
+        VIEW_HEIGHT,
+        WindowOptions {
+            resize: false,
+            ..WindowOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    window.set_target_fps(60);
+
+    let mut angle = DEFAULT_ANGLE;
+    let mut last_y = 0.0_f32;
+    let mut dragging = false;
+    let mut previous_down = false;
+    let mut buffer = render_cloud(points, z_label, VIEW_WIDTH, VIEW_HEIGHT, angle);
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let mouse = window.get_mouse_pos(MouseMode::Discard);
+        let down = window.get_mouse_down(MouseButton::Left);
+        let mut redraw = false;
+
+        if down && !previous_down {
+            if mouse.is_some_and(|(x, y)| reset_contains(x, y)) {
+                angle = DEFAULT_ANGLE;
+                redraw = true;
+            } else if let Some((_, y)) = mouse {
+                dragging = true;
+                last_y = y;
+            }
+        }
+        if down && dragging {
+            if let Some((_, y)) = mouse {
+                let next_angle = (angle + (y - last_y) * 0.008).clamp(-1.45, 1.45);
+                redraw |= next_angle != angle;
+                angle = next_angle;
+                last_y = y;
+            }
+        } else if !down {
+            dragging = false;
+        }
+        if redraw {
+            buffer = render_cloud(points, z_label, VIEW_WIDTH, VIEW_HEIGHT, angle);
+        }
+
+        window
+            .update_with_buffer(&buffer, VIEW_WIDTH, VIEW_HEIGHT)
+            .map_err(|error| error.to_string())?;
+        previous_down = down;
+    }
+    Ok(())
+}
+
+fn render_polarity(
+    data: &EventFrameData,
     width: usize,
     height: usize,
     normalize: bool,
 ) -> Result<Vec<u32>, String> {
-    let values = if normalize {
-        let maximum = data.iter().copied().max().unwrap_or(0);
-        if maximum == 0 {
-            vec![0; data.len()]
-        } else {
-            data.iter()
-                .map(|&count| {
-                    let scaled = u32::from(count) * u32::from(u8::MAX);
-                    ((scaled + u32::from(maximum) / 2) / u32::from(maximum)) as u8
-                })
-                .collect()
+    match data {
+        EventFrameData::U8(values) => render_polarity_values(values, width, height, true),
+        EventFrameData::U16(values) => {
+            let values = scale_counts(values, normalize);
+            render_polarity_values(&values, width, height, normalize)
         }
-    } else {
-        data.iter()
-            .map(|&count| count.min(u16::from(u8::MAX)) as u8)
-            .collect()
-    };
-    render_values(&values, width, height, normalize)
+        EventFrameData::U64(values) => {
+            let values = scale_counts(values, normalize);
+            render_polarity_values(&values, width, height, normalize)
+        }
+        EventFrameData::F32(_) => Err("polarity frame cannot use float32 data".to_owned()),
+    }
 }
 
-fn render_values(
+fn scale_counts<T>(data: &[T], normalize: bool) -> Vec<u8>
+where
+    T: Copy + Into<u64>,
+{
+    if !normalize {
+        return data
+            .iter()
+            .map(|&value| value.into().min(u64::from(u8::MAX)) as u8)
+            .collect();
+    }
+    let maximum = data.iter().copied().map(Into::into).max().unwrap_or(0);
+    if maximum == 0 {
+        return vec![0; data.len()];
+    }
+    data.iter()
+        .map(|&value| {
+            let value = u128::from(value.into());
+            ((value * u128::from(u8::MAX) + u128::from(maximum) / 2)
+                / u128::from(maximum)) as u8
+        })
+        .collect()
+}
+
+fn render_polarity_values(
     data: &[u8],
     width: usize,
     height: usize,
     enhance: bool,
 ) -> Result<Vec<u32>, String> {
-    let plane_len = width
-        .checked_mul(height)
-        .ok_or_else(|| "frame dimensions are too large".to_owned())?;
-    let data_len = plane_len
-        .checked_mul(2)
-        .ok_or_else(|| "frame dimensions are too large".to_owned())?;
-    if data.len() != data_len {
+    let plane_len = checked_plane_len(width, height)?;
+    if data.len() != plane_len * 2 {
         return Err("polarity frame must have two channels".to_owned());
     }
-
-    let source_len = plane_len
-        .checked_mul(3)
-        .ok_or_else(|| "frame dimensions are too large".to_owned())?;
-    let display_curve: [u8; 256] = std::array::from_fn(|value| {
+    let curve: [u8; 256] = std::array::from_fn(|value| {
         ((value as f32 / f32::from(u8::MAX)).sqrt() * f32::from(u8::MAX)).round() as u8
     });
-    let mut source = vec![255; source_len];
-    for index in 0..plane_len {
-        let positive = if enhance {
-            display_curve[usize::from(data[index])]
-        } else {
-            data[index]
-        };
-        let negative = if enhance {
-            display_curve[usize::from(data[plane_len + index])]
-        } else {
-            data[plane_len + index]
-        };
-        let intensity = positive.max(negative);
-        source[index * 3] = u8::MAX - intensity + positive;
-        source[index * 3 + 1] = u8::MAX - intensity;
-        source[index * 3 + 2] = u8::MAX - intensity + negative;
-    }
-
-    let dimensions = (
-        u32::try_from(width).map_err(|error| error.to_string())?,
-        u32::try_from(height).map_err(|error| error.to_string())?,
-    );
-    let mut rendered = vec![0; source.len()];
-    {
-        let mut backend = BitMapBackend::with_buffer(&mut rendered, dimensions);
-        backend
-            .blit_bitmap((0, 0), dimensions, &source)
-            .map_err(|error| error.to_string())?;
-        backend.present().map_err(|error| error.to_string())?;
-    }
-
-    Ok(rendered
-        .chunks_exact(3)
-        .map(|pixel| {
-            (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2])
+    Ok((0..plane_len)
+        .map(|index| {
+            let positive = if enhance {
+                curve[usize::from(data[index])]
+            } else {
+                data[index]
+            };
+            let negative = if enhance {
+                curve[usize::from(data[plane_len + index])]
+            } else {
+                data[plane_len + index]
+            };
+            let intensity = positive.max(negative);
+            rgb(
+                u8::MAX - intensity + positive,
+                u8::MAX - intensity,
+                u8::MAX - intensity + negative,
+            )
         })
         .collect())
 }
 
+fn render_binary(
+    data: &EventFrameData,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u32>, String> {
+    let plane_len = checked_plane_len(width, height)?;
+    if frame_data_len(data) != plane_len {
+        return Err("binary frame must have one channel".to_owned());
+    }
+    Ok((0..plane_len)
+        .map(|index| {
+            if frame_value(data, index).unwrap_or(0.0) > 0.0 {
+                0x20d9c5
+            } else {
+                0x071018
+            }
+        })
+        .collect())
+}
+
+fn render_tencode(
+    data: &EventFrameData,
+    width: usize,
+    height: usize,
+    normalize: bool,
+) -> Result<Vec<u32>, String> {
+    let plane_len = checked_plane_len(width, height)?;
+    if frame_data_len(data) != plane_len * 3 {
+        return Err("tencode frame must have three channels".to_owned());
+    }
+    let maximum = if normalize {
+        (0..frame_data_len(data))
+            .map(|index| frame_value(data, index).unwrap_or(0.0))
+            .fold(0.0_f64, f64::max)
+    } else {
+        255.0
+    };
+    let scale = if maximum > 255.0 { 255.0 / maximum } else { 1.0 };
+
+    Ok((0..plane_len)
+        .map(|index| {
+            let positive = (frame_value(data, index).unwrap_or(0.0) * scale)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let age = (frame_value(data, plane_len + index).unwrap_or(0.0) * scale)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let negative = (frame_value(data, 2 * plane_len + index).unwrap_or(0.0) * scale)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            rgb(positive, age, negative)
+        })
+        .collect())
+}
+
+fn voxel_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
+    let (channels, height, width) = frame.shape();
+    let values = float_data(frame)?;
+    let plane_len = checked_plane_len(width, height)?;
+    let mut points = Vec::new();
+    for channel in 0..channels {
+        let z = normalize_index(channel, channels);
+        for index in 0..plane_len {
+            let value = values[channel * plane_len + index];
+            if value != 0.0 {
+                points.push(spatial_point(
+                    index,
+                    width,
+                    height,
+                    z,
+                    value.abs(),
+                    if value > 0.0 { POSITIVE } else { NEGATIVE },
+                ));
+            }
+        }
+    }
+    Ok(points)
+}
+
+fn time_surface_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
+    let (channels, height, width) = frame.shape();
+    if channels != 2 {
+        return Err("tsurf frame must have two channels".to_owned());
+    }
+    let values = float_data(frame)?;
+    let plane_len = checked_plane_len(width, height)?;
+    let mut points = Vec::new();
+    for channel in 0..channels {
+        for index in 0..plane_len {
+            let value = values[channel * plane_len + index];
+            if value > 0.0 {
+                points.push(spatial_point(
+                    index,
+                    width,
+                    height,
+                    f64::from(value) * 2.0 - 1.0,
+                    value,
+                    if channel == 0 { POSITIVE } else { NEGATIVE },
+                ));
+            }
+        }
+    }
+    Ok(points)
+}
+
+fn mcts_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
+    let (channels, height, width) = frame.shape();
+    if channels != 10 {
+        return Err("mcts frame must have ten channels".to_owned());
+    }
+    let values = float_data(frame)?;
+    let plane_len = checked_plane_len(width, height)?;
+    let windows = channels / 2;
+    let mut points = Vec::new();
+    for channel in 0..channels {
+        let z = normalize_index(channel % windows, windows);
+        for index in 0..plane_len {
+            let value = values[channel * plane_len + index];
+            if value > 0.0 {
+                points.push(spatial_point(
+                    index,
+                    width,
+                    height,
+                    z,
+                    value,
+                    if channel < windows { NEGATIVE } else { POSITIVE },
+                ));
+            }
+        }
+    }
+    Ok(points)
+}
+
+fn point_set_cloud(points: &EventPointSet) -> Vec<CloudPoint> {
+    points
+        .data()
+        .chunks_exact(4)
+        .map(|point| CloudPoint {
+            x: f64::from(point[0]) * 2.0 - 1.0,
+            y: 1.0 - f64::from(point[1]) * 2.0,
+            z: f64::from(point[2]) * 2.0 - 1.0,
+            strength: 1.0,
+            color: if point[3] > 0.0 { POSITIVE } else { NEGATIVE },
+        })
+        .collect()
+}
+
+fn spatial_point(
+    index: usize,
+    width: usize,
+    height: usize,
+    z: f64,
+    strength: f32,
+    color: u32,
+) -> CloudPoint {
+    CloudPoint {
+        x: normalize_index(index % width, width),
+        y: -normalize_index(index / width, height),
+        z,
+        strength,
+        color,
+    }
+}
+
+fn normalize_index(index: usize, length: usize) -> f64 {
+    if length <= 1 {
+        0.0
+    } else {
+        index as f64 / (length - 1) as f64 * 2.0 - 1.0
+    }
+}
+
+fn render_cloud(
+    points: &[CloudPoint],
+    z_label: &str,
+    width: usize,
+    height: usize,
+    angle: f32,
+) -> Vec<u32> {
+    let mut buffer = vec![BACKGROUND; width * height];
+    let mut depth_buffer = vec![f32::INFINITY; width * height];
+    let maximum = points
+        .iter()
+        .map(|point| point.strength)
+        .fold(0.0_f32, f32::max);
+
+    for point in points {
+        if let Some(projected) = project(*point, angle, width, height) {
+            let relative = if maximum > 0.0 {
+                (point.strength / maximum).sqrt()
+            } else {
+                0.0
+            };
+            let radius = 1 + relative.round() as i32;
+            let color = scale_color(point.color, 0.45 + relative * 0.55);
+            draw_depth_point(
+                &mut buffer,
+                &mut depth_buffer,
+                width,
+                height,
+                projected,
+                radius,
+                color,
+            );
+        }
+    }
+
+    draw_axes(&mut buffer, width, height, angle, z_label);
+    draw_reset(&mut buffer, width, height);
+    draw_legend(&mut buffer, width, height);
+    buffer
+}
+
+fn project(
+    point: CloudPoint,
+    angle: f32,
+    width: usize,
+    height: usize,
+) -> Option<ProjectedPoint> {
+    let (x, y, z) = rotate_x(point.x as f32, point.y as f32, point.z as f32, angle);
+    let depth = 3.4 - z;
+    if depth <= 0.1 {
+        return None;
+    }
+    let scale = width.min(height) as f32 * 0.75 / depth;
+    let screen_x = width as f32 * 0.5 + x * scale;
+    let screen_y = height as f32 * 0.52 - y * scale;
+    if screen_x < 0.0 || screen_x >= width as f32 || screen_y < 0.0 || screen_y >= height as f32 {
+        return None;
+    }
+    Some(ProjectedPoint {
+        x: screen_x.round() as i32,
+        y: screen_y.round() as i32,
+        depth,
+    })
+}
+
+fn rotate_x(x: f32, y: f32, z: f32, angle: f32) -> (f32, f32, f32) {
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    (x, y * cosine - z * sine, y * sine + z * cosine)
+}
+
+fn draw_depth_point(
+    buffer: &mut [u32],
+    depth_buffer: &mut [f32],
+    width: usize,
+    height: usize,
+    point: ProjectedPoint,
+    radius: i32,
+    color: u32,
+) {
+    for y in point.y - radius..=point.y + radius {
+        for x in point.x - radius..=point.x + radius {
+            if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                continue;
+            }
+            let index = y as usize * width + x as usize;
+            if point.depth < depth_buffer[index] {
+                depth_buffer[index] = point.depth;
+                buffer[index] = color;
+            }
+        }
+    }
+}
+
+fn draw_axes(buffer: &mut [u32], width: usize, height: usize, angle: f32, z_label: &str) {
+    let origin = axis_project(-1.0, -1.0, -1.0, angle, width, height);
+    let x_end = axis_project(1.0, -1.0, -1.0, angle, width, height);
+    let y_end = axis_project(-1.0, 1.0, -1.0, angle, width, height);
+    let z_end = axis_project(-1.0, -1.0, 1.0, angle, width, height);
+    if let (Some(origin), Some(x_end)) = (origin, x_end) {
+        draw_line(buffer, width, height, origin, x_end, AXIS_X);
+        draw_label_at(buffer, width, height, x_end, "X", AXIS_X);
+    }
+    if let (Some(origin), Some(y_end)) = (origin, y_end) {
+        draw_line(buffer, width, height, origin, y_end, AXIS_Y);
+        draw_label_at(
+            buffer,
+            width,
+            height,
+            (y_end.0 - 18, y_end.1 - 10),
+            "Y",
+            AXIS_Y,
+        );
+    }
+    if let (Some(origin), Some(z_end)) = (origin, z_end) {
+        draw_line(buffer, width, height, origin, z_end, AXIS_Z);
+        draw_label_at(
+            buffer,
+            width,
+            height,
+            (z_end.0 - (z_label.len() * 12 + 14) as i32, z_end.1),
+            z_label,
+            AXIS_Z,
+        );
+    }
+}
+
+fn axis_project(
+    x: f64,
+    y: f64,
+    z: f64,
+    angle: f32,
+    width: usize,
+    height: usize,
+) -> Option<(i32, i32)> {
+    project(
+        CloudPoint {
+            x,
+            y,
+            z,
+            strength: 1.0,
+            color: 0,
+        },
+        angle,
+        width,
+        height,
+    )
+    .map(|point| (point.x, point.y))
+}
+
+fn draw_reset(buffer: &mut [u32], width: usize, height: usize) {
+    let (left, top, right, bottom) = RESET_BOUNDS;
+    fill_rect(buffer, width, height, left, top, right, bottom, 0x26324d);
+    stroke_rect(buffer, width, height, left, top, right, bottom, 0xd7e3ff);
+    draw_text(buffer, width, height, left + 12, top + 9, "RESET", 0xffffff, 2);
+}
+
+fn draw_legend(buffer: &mut [u32], width: usize, height: usize) {
+    let x = width.saturating_sub(132);
+    fill_rect(buffer, width, height, x, 17, x + 10, 27, POSITIVE);
+    draw_text(buffer, width, height, x + 16, 16, "POSITIVE", 0xe8edf7, 1);
+    fill_rect(buffer, width, height, x, 35, x + 10, 45, NEGATIVE);
+    draw_text(buffer, width, height, x + 16, 34, "NEGATIVE", 0xe8edf7, 1);
+}
+
+fn reset_contains(x: f32, y: f32) -> bool {
+    let (left, top, right, bottom) = RESET_BOUNDS;
+    x >= left as f32 && x <= right as f32 && y >= top as f32 && y <= bottom as f32
+}
+
+fn draw_label_at(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    point: (i32, i32),
+    label: &str,
+    color: u32,
+) {
+    let label_width = label.len() * 12;
+    let x = (point.0 + 7).clamp(2, width.saturating_sub(label_width + 2) as i32) as usize;
+    let y = (point.1 - 8).clamp(2, height.saturating_sub(16) as i32) as usize;
+    draw_text(buffer, width, height, x, y, label, color, 2);
+}
+
+fn draw_line(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    start: (i32, i32),
+    end: (i32, i32),
+    color: u32,
+) {
+    let (mut x, mut y) = start;
+    let dx = (end.0 - x).abs();
+    let sx = if x < end.0 { 1 } else { -1 };
+    let dy = -(end.1 - y).abs();
+    let sy = if y < end.1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        set_pixel(buffer, width, height, x, y, color);
+        if x == end.0 && y == end.1 {
+            break;
+        }
+        let doubled = 2 * error;
+        if doubled >= dy {
+            error += dy;
+            x += sx;
+        }
+        if doubled <= dx {
+            error += dx;
+            y += sy;
+        }
+    }
+}
+
+fn fill_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+    color: u32,
+) {
+    for y in top..bottom.min(height) {
+        for x in left..right.min(width) {
+            buffer[y * width + x] = color;
+        }
+    }
+}
+
+fn stroke_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+    color: u32,
+) {
+    draw_line(
+        buffer,
+        width,
+        height,
+        (left as i32, top as i32),
+        (right as i32, top as i32),
+        color,
+    );
+    draw_line(
+        buffer,
+        width,
+        height,
+        (right as i32, top as i32),
+        (right as i32, bottom as i32),
+        color,
+    );
+    draw_line(
+        buffer,
+        width,
+        height,
+        (right as i32, bottom as i32),
+        (left as i32, bottom as i32),
+        color,
+    );
+    draw_line(
+        buffer,
+        width,
+        height,
+        (left as i32, bottom as i32),
+        (left as i32, top as i32),
+        color,
+    );
+}
+
+fn draw_text(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+    color: u32,
+    scale: usize,
+) {
+    for (character_index, character) in text.chars().enumerate() {
+        let glyph = glyph(character.to_ascii_uppercase());
+        for (row, bits) in glyph.into_iter().enumerate() {
+            for column in 0..5 {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                fill_rect(
+                    buffer,
+                    width,
+                    height,
+                    x + character_index * 6 * scale + column * scale,
+                    y + row * scale,
+                    x + character_index * 6 * scale + (column + 1) * scale,
+                    y + (row + 1) * scale,
+                    color,
+                );
+            }
+        }
+    }
+}
+
+fn glyph(character: char) -> [u8; 7] {
+    match character {
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        ' ' => [0; 7],
+        _ => [0b11111, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100],
+    }
+}
+
+fn set_pixel(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    color: u32,
+) {
+    if x >= 0 && y >= 0 && x < width as i32 && y < height as i32 {
+        buffer[y as usize * width + x as usize] = color;
+    }
+}
+
+fn scale_color(color: u32, brightness: f32) -> u32 {
+    let red = (((color >> 16) & 0xff) as f32 * brightness).round() as u8;
+    let green = (((color >> 8) & 0xff) as f32 * brightness).round() as u8;
+    let blue = ((color & 0xff) as f32 * brightness).round() as u8;
+    rgb(red, green, blue)
+}
+
+fn rgb(red: u8, green: u8, blue: u8) -> u32 {
+    (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
+}
+
+fn frame_value(data: &EventFrameData, index: usize) -> Option<f64> {
+    match data {
+        EventFrameData::U8(values) => values.get(index).map(|&value| f64::from(value)),
+        EventFrameData::U16(values) => values.get(index).map(|&value| f64::from(value)),
+        EventFrameData::U64(values) => values.get(index).map(|&value| value as f64),
+        EventFrameData::F32(values) => values.get(index).map(|&value| f64::from(value)),
+    }
+}
+
+fn float_data(frame: &EventFrame) -> Result<&[f32], String> {
+    let EventFrameData::F32(values) = frame.data() else {
+        return Err(format!("{} frame must use float32 data", frame.kind().as_str()));
+    };
+    Ok(values)
+}
+
+fn checked_plane_len(width: usize, height: usize) -> Result<usize, String> {
+    width
+        .checked_mul(height)
+        .ok_or_else(|| "frame dimensions are too large".to_owned())
+}
+
+fn frame_data_len(data: &EventFrameData) -> usize {
+    match data {
+        EventFrameData::U8(values) => values.len(),
+        EventFrameData::U16(values) => values.len(),
+        EventFrameData::U64(values) => values.len(),
+        EventFrameData::F32(values) => values.len(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CloudPoint {
+    x: f64,
+    y: f64,
+    z: f64,
+    strength: f32,
+    color: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectedPoint {
+    x: i32,
+    y: i32,
+    depth: f32,
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, time::Instant};
+    use eventcv_core::representation::{
+        Binary, Mcts, PointSet, Polarity, Representation, Tencode, TimeSurface, VoxelGrid,
+    };
 
-    use super::render_counts;
+    use super::{
+        point_set_cloud, prepare_frame, render_cloud, render_polarity_values, render_tencode,
+        reset_contains, rgb, rotate_x, scale_counts, voxel_cloud, PreparedView, DEFAULT_ANGLE,
+        VIEW_HEIGHT, VIEW_WIDTH,
+    };
 
     #[test]
-    fn renders_polarities_with_a_shared_linear_scale() {
-        let pixels = render_counts(&[2, 1, 0, 2], 2, 1, true).unwrap();
+    fn preserves_the_original_polarity_colors() {
+        let pixels = render_polarity_values(&[255, 128, 0, 255], 2, 1, true).unwrap();
 
         assert_eq!(pixels, [0xff0000, 0xb500ff]);
     }
 
     #[test]
-    fn renders_an_empty_frame_as_white() {
-        let pixels = render_counts(&[0; 4], 2, 1, true).unwrap();
-
-        assert_eq!(pixels, [0xffffff, 0xffffff]);
+    fn scales_large_counts_without_overflow() {
+        assert_eq!(scale_counts(&[u64::MAX, u64::MAX / 2], true), [255, 127]);
     }
 
     #[test]
-    fn fades_lower_counts_towards_white() {
-        let pixels = render_counts(&[2, 1, 0, 0], 2, 1, true).unwrap();
+    fn rotation_is_strictly_about_x() {
+        let rotated = rotate_x(0.75, -0.25, 0.5, DEFAULT_ANGLE);
 
-        assert_eq!(pixels, [0xff0000, 0xff4a4a]);
+        assert_eq!(rotated.0, 0.75);
+        assert_ne!(rotated.1, -0.25);
+        assert_ne!(rotated.2, 0.5);
     }
 
     #[test]
-    fn clips_raw_counts_into_uint8_space() {
-        let pixels = render_counts(&[300, 0, 0, 128], 2, 1, false).unwrap();
-
-        assert_eq!(pixels, [0xff0000, 0x7f7fff]);
+    fn reset_button_has_a_bounded_hit_area() {
+        assert!(reset_contains(20.0, 20.0));
+        assert!(!reset_contains(120.0, 20.0));
     }
 
     #[test]
-    fn rejects_an_invalid_polarity_frame() {
-        let error = render_counts(&[0; 3], 2, 1, true).unwrap_err();
+    fn packs_rgb_channels_in_display_order() {
+        assert_eq!(rgb(255, 128, 64), 0xff8040);
+    }
 
-        assert_eq!(error, "polarity frame must have two channels");
+    #[test]
+    fn renders_tencode_as_a_three_channel_image() {
+        let data = eventcv_core::representation::EventFrameData::U8(vec![
+            255, 0, 170, 0, 0, 255,
+        ]);
+
+        let pixels = render_tencode(&data, 2, 1, true).unwrap();
+
+        assert_eq!(pixels, [0xffaa00, 0x0000ff]);
+    }
+
+    #[test]
+    fn prepares_every_representation_without_opening_a_window() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/test/example.npz");
+        let stream = eventcv_core::load(path).unwrap();
+
+        for frame in [
+            Binary.generate(&stream).unwrap(),
+            Polarity::default().generate(&stream).unwrap(),
+            Tencode::default().generate(&stream).unwrap(),
+        ] {
+            assert!(matches!(
+                prepare_frame(&frame, true).unwrap(),
+                PreparedView::Image { .. }
+            ));
+        }
+        for frame in [
+            VoxelGrid::default().generate(&stream).unwrap(),
+            TimeSurface::default().generate(&stream).unwrap(),
+            Mcts::default().generate(&stream).unwrap(),
+        ] {
+            assert!(matches!(
+                prepare_frame(&frame, true).unwrap(),
+                PreparedView::Cloud { .. }
+            ));
+        }
+        assert!(!point_set_cloud(&PointSet.generate(&stream).unwrap()).is_empty());
     }
 
     #[test]
     #[ignore = "manual performance benchmark"]
-    fn benchmark_polarity_colorization() {
-        let data = vec![1_u16; 2 * 640 * 480];
-        let iterations = 20;
-        let start = Instant::now();
+    fn benchmark_cpu_cloud_rendering() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/test/example.npz");
+        let stream = eventcv_core::load(path).unwrap();
+        let frame = VoxelGrid::default().generate(&stream).unwrap();
+        let points = voxel_cloud(&frame).unwrap();
+        let start = std::time::Instant::now();
 
-        for _ in 0..iterations {
-            black_box(render_counts(black_box(&data), 640, 480, true).unwrap());
-        }
+        let pixels = render_cloud(&points, "TIME BIN", VIEW_WIDTH, VIEW_HEIGHT, DEFAULT_ANGLE);
 
+        assert_eq!(pixels.len(), VIEW_WIDTH * VIEW_HEIGHT);
         eprintln!(
-            "polarity colorization: {:?} per frame",
-            start.elapsed() / iterations
+            "CPU cloud rendering: {} points in {:?}",
+            points.len(),
+            start.elapsed()
         );
     }
 }

@@ -60,6 +60,153 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(events.max(), np.iinfo(np.uint8).max)
         np.testing.assert_array_equal(events, explicit)
 
+    def test_generates_binary_occupancy(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        binary = stream.flatten(binary=True, normalize=False)
+        expected = np.any(stream.flatten(normalize=False).numpy() > 0, axis=0)
+
+        self.assertEqual(binary.kind, "binary")
+        self.assertEqual(binary.shape, (1, 480, 640))
+        self.assertEqual(binary.channel_names, ("event",))
+        self.assertEqual(binary.numpy().dtype, np.uint8)
+        np.testing.assert_array_equal(binary.numpy()[0], expected)
+        np.testing.assert_array_equal(
+            binary.numpy(), stream.flatten(binary=True, normalize=True).numpy()
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            stream.flatten(eventcv.Polarity(), binary=True)
+
+    def test_generates_common_owned_representations(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+        original = stream.numpy()
+
+        voxel = stream.voxel()
+        surface = stream.tsurf()
+        points = stream.pset()
+        tencode = stream.tencode()
+        mcts = stream.mcts()
+
+        self.assertEqual(stream.timestamp_scale_ms, 0.001)
+        self.assertEqual((voxel.kind, voxel.shape), ("voxel", (9, 480, 640)))
+        self.assertEqual(voxel.numpy().dtype, np.float32)
+        self.assertEqual(
+            (surface.kind, surface.shape), ("tsurf", (2, 480, 640))
+        )
+        self.assertEqual(surface.channel_names, ("positive", "negative"))
+        self.assertEqual(surface.numpy().dtype, np.float32)
+        self.assertIsInstance(points, eventcv.EventPointSet)
+        self.assertEqual(points.shape, (len(stream), 4))
+        self.assertEqual(points.columns, ("x", "y", "t", "p"))
+        self.assertEqual(points.numpy().dtype, np.float32)
+        self.assertEqual((tencode.kind, tencode.shape), ("tencode", (3, 480, 640)))
+        self.assertEqual(tencode.channel_names, ("positive", "age", "negative"))
+        self.assertEqual(tencode.numpy().dtype, np.uint8)
+        self.assertEqual((mcts.kind, mcts.shape), ("mcts", (10, 480, 640)))
+        self.assertTrue(all(name.startswith("negative_") for name in mcts.channel_names[:5]))
+        self.assertTrue(all(name.startswith("positive_") for name in mcts.channel_names[5:]))
+        self.assertEqual(mcts.numpy().dtype, np.float32)
+        self.assertTrue(callable(voxel.view))
+        self.assertTrue(callable(surface.view))
+        self.assertTrue(callable(points.view))
+        self.assertTrue(callable(tencode.view))
+        self.assertTrue(callable(mcts.view))
+
+        voxel_values = voxel.numpy()
+        voxel_values.fill(0)
+        self.assertNotEqual(stream.voxel().numpy().sum(), 0)
+        np.testing.assert_array_equal(stream.numpy(), original)
+
+    def test_validates_representation_parameters(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        for generate in (
+            lambda: stream.voxel(bins=0),
+            lambda: stream.voxel(window_ms=float("nan")),
+            lambda: stream.tsurf(tau_ms=0),
+            lambda: stream.tencode(window_ms=float("inf")),
+            lambda: stream.mcts(max_window_ms=0.5),
+        ):
+            with self.subTest(generate=generate):
+                with self.assertRaises(ValueError):
+                    generate()
+
+    def test_empty_stream_representations_have_stable_shapes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "empty.npz"
+            np.savez(path, event_data=np.array([], dtype=EVENT_DTYPE))
+            stream = eventcv.load(str(path))
+
+            self.assertEqual(stream.flatten(binary=True).shape, (1, 480, 640))
+            self.assertEqual(stream.voxel().shape, (9, 480, 640))
+            self.assertEqual(stream.tsurf().shape, (2, 480, 640))
+            self.assertEqual(stream.tencode().shape, (3, 480, 640))
+            self.assertEqual(stream.mcts().shape, (10, 480, 640))
+            self.assertEqual(stream.pset().shape, (0, 4))
+
+    def test_resizes_polarity_representation(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+        frame = stream.flatten()
+
+        resized = frame.resize(256, 256)
+        events = resized.numpy()
+
+        self.assertIsInstance(resized, eventcv.EventFrame)
+        self.assertEqual(resized.shape, (2, 256, 256))
+        self.assertEqual(resized.channel_names, frame.channel_names)
+        self.assertEqual(events.dtype, np.uint8)
+        self.assertEqual(frame.shape, (2, 480, 640))
+
+    def test_resizes_float_representations(self):
+        voxel = eventcv.load(str(EXAMPLE_PATH)).voxel()
+
+        average = voxel.resize(256, 256)
+        summed = voxel.resize(256, 256, pooling="sum")
+
+        self.assertEqual(average.shape, (9, 256, 256))
+        self.assertEqual(average.numpy().dtype, np.float32)
+        self.assertEqual(summed.numpy().dtype, np.float32)
+        self.assertEqual(average.kind, "voxel")
+        self.assertEqual(average.channel_names, voxel.channel_names)
+
+    def test_rejects_resizing_an_event_stream(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        with self.assertRaisesRegex(
+            TypeError, r"data\.flatten\(\)\.resize\(width, height\)"
+        ):
+            stream.resize(256, 256).flatten()
+
+    def test_sum_resize_preserves_raw_event_count(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        events = stream.flatten(normalize=False).resize(
+            256, 256, pooling="sum"
+        ).numpy()
+
+        self.assertEqual(events.dtype, np.uint64)
+        self.assertEqual(events.shape, (2, 256, 256))
+        self.assertEqual(events.sum(), len(stream))
+
+    def test_resizes_with_bilinear_enlargement(self):
+        frame = eventcv.load(str(EXAMPLE_PATH)).flatten(normalize=False)
+
+        events = frame.resize(800, 600).numpy()
+
+        self.assertEqual(events.dtype, np.uint16)
+        self.assertEqual(events.shape, (2, 600, 800))
+
+    def test_rejects_invalid_resize_arguments(self):
+        frame = eventcv.load(str(EXAMPLE_PATH)).flatten()
+
+        with self.assertRaisesRegex(ValueError, "dimensions must be positive"):
+            frame.resize(0, 256)
+        with self.assertRaisesRegex(ValueError, "dimensions must be positive"):
+            frame.resize(-1, 256)
+        with self.assertRaisesRegex(ValueError, "unsupported pooling method"):
+            frame.resize(256, 256, pooling="maximum")
+
     def test_rejects_unknown_representation(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 

@@ -1,31 +1,68 @@
 use std::{error::Error, fmt};
 
-use crate::EventStream;
+use crate::{Event, EventStream};
 
-const POLARITY_CHANNELS: [&str; 2] = ["positive", "negative"];
+mod binary;
+mod mcts;
+mod point_set;
+mod polarity;
+mod tencode;
+mod time_surface;
+mod voxel;
+
+pub use binary::Binary;
+pub use mcts::Mcts;
+pub use point_set::{EventPointSet, PointSet};
+pub use polarity::Polarity;
+pub use tencode::Tencode;
+pub use time_surface::TimeSurface;
+pub use voxel::VoxelGrid;
 
 pub trait Representation {
-    fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError>;
+    type Output;
+
+    fn generate(&self, stream: &EventStream) -> Result<Self::Output, RepresentationError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepresentationKind {
+    Binary,
+    Mcts,
     Polarity,
+    Tencode,
+    TimeSurface,
+    Voxel,
+}
+
+impl RepresentationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Mcts => "mcts",
+            Self::Polarity => "polarity",
+            Self::Tencode => "tencode",
+            Self::TimeSurface => "tsurf",
+            Self::Voxel => "voxel",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct EventFrame {
-    data: EventFrameData,
-    channels: usize,
-    width: usize,
-    height: usize,
-    kind: RepresentationKind,
+    pub(crate) data: EventFrameData,
+    pub(crate) channels: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) kind: RepresentationKind,
+    pub(crate) channel_names: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EventFrameData {
     U8(Vec<u8>),
     U16(Vec<u16>),
+    U64(Vec<u64>),
+    F32(Vec<f32>),
 }
 
 impl EventFrame {
@@ -37,10 +74,8 @@ impl EventFrame {
         (self.channels, self.height, self.width)
     }
 
-    pub fn channel_names(&self) -> &'static [&'static str] {
-        match self.kind {
-            RepresentationKind::Polarity => &POLARITY_CHANNELS,
-        }
+    pub fn channel_names(&self) -> &[String] {
+        &self.channel_names
     }
 
     pub fn kind(&self) -> RepresentationKind {
@@ -48,80 +83,49 @@ impl EventFrame {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Polarity {
-    normalize: bool,
+pub(crate) fn frame_len(
+    stream: &EventStream,
+    channels: usize,
+) -> Result<(usize, usize, usize), RepresentationError> {
+    let (width, height) = stream.sensor_size();
+    let plane_len = width
+        .checked_mul(height)
+        .ok_or(RepresentationError::SizeOverflow)?;
+    let length = plane_len
+        .checked_mul(channels)
+        .ok_or(RepresentationError::SizeOverflow)?;
+    Ok((width, height, length))
 }
 
-impl Polarity {
-    pub fn new(normalize: bool) -> Self {
-        Self { normalize }
-    }
-
-    pub fn is_normalized(&self) -> bool {
-        self.normalize
-    }
-}
-
-impl Representation for Polarity {
-    fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
-        let (width, height) = stream.sensor_size();
-        let plane_len = width
-            .checked_mul(height)
-            .ok_or(RepresentationError::SizeOverflow)?;
-        let frame_len = plane_len
-            .checked_mul(POLARITY_CHANNELS.len())
-            .ok_or(RepresentationError::SizeOverflow)?;
-        let mut counts = vec![0_u16; frame_len];
-
-        for event in stream.iter() {
-            if event.x >= width || event.y >= height {
-                return Err(RepresentationError::EventOutOfBounds {
-                    x: event.x,
-                    y: event.y,
-                    width,
-                    height,
-                });
-            }
-            let channel_offset = if event.polarity { 0 } else { plane_len };
-            let count = &mut counts[channel_offset + event.y * width + event.x];
-            *count = count
-                .checked_add(1)
-                .ok_or(RepresentationError::CountOverflow {
-                    x: event.x,
-                    y: event.y,
-                })?;
-        }
-
-        let data = if self.normalize {
-            EventFrameData::U8(normalize_u8(counts))
-        } else {
-            EventFrameData::U16(counts)
-        };
-
-        Ok(EventFrame {
-            data,
-            channels: POLARITY_CHANNELS.len(),
+pub(crate) fn event_index(
+    event: Event,
+    width: usize,
+    height: usize,
+) -> Result<usize, RepresentationError> {
+    if event.x >= width || event.y >= height {
+        return Err(RepresentationError::EventOutOfBounds {
+            x: event.x,
+            y: event.y,
             width,
             height,
-            kind: RepresentationKind::Polarity,
-        })
+        });
     }
+    Ok(event.y * width + event.x)
 }
 
-fn normalize_u8(counts: Vec<u16>) -> Vec<u8> {
-    let maximum = counts.iter().copied().max().unwrap_or(0);
-    if maximum == 0 {
-        return vec![0; counts.len()];
+pub(crate) fn validate_positive(value: f64, name: &'static str) -> Result<(), RepresentationError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(RepresentationError::InvalidParameter(name));
     }
+    Ok(())
+}
 
-    counts
-        .into_iter()
-        .map(|count| {
-            let scaled = u32::from(count) * u32::from(u8::MAX);
-            ((scaled + u32::from(maximum) / 2) / u32::from(maximum)) as u8
-        })
-        .collect()
+pub(crate) fn reference_time(stream: &EventStream) -> Option<u64> {
+    stream.iter().map(|event| event.timestamp).max()
+}
+
+pub(crate) fn age_ms(stream: &EventStream, reference: u64, timestamp: u64) -> f64 {
+    reference.saturating_sub(timestamp) as f64 * stream.timestamp_scale_ms()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +141,7 @@ pub enum RepresentationError {
         width: usize,
         height: usize,
     },
+    InvalidParameter(&'static str),
 }
 
 impl fmt::Display for RepresentationError {
@@ -155,6 +160,15 @@ impl fmt::Display for RepresentationError {
                 formatter,
                 "event coordinate ({x}, {y}) exceeds sensor size {width}x{height}"
             ),
+            Self::InvalidParameter(name) => {
+                match *name {
+                    "bins" => formatter.write_str("bins must be at least 1"),
+                    "max_window_ms" => {
+                        formatter.write_str("max_window_ms must be finite and at least 1")
+                    }
+                    _ => write!(formatter, "{name} must be finite and positive"),
+                }
+            }
         }
     }
 }
@@ -163,156 +177,68 @@ impl Error for RepresentationError {}
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, time::Instant};
+    use ndarray::Array2;
 
-    use ndarray::array;
-
-    use super::{EventFrameData, Polarity, Representation};
+    use super::{
+        Binary, EventFrameData, Mcts, PointSet, Representation, RepresentationError, Tencode,
+        TimeSurface, VoxelGrid,
+    };
     use crate::EventStream;
 
-    #[test]
-    fn accumulates_positive_and_negative_events() {
-        let stream = EventStream {
-            events: array![[1, 0, 10, 1], [1, 0, 11, 1], [0, 1, 12, 0]],
-            width: 2,
-            height: 2,
-        };
-
-        let frame = Polarity::default().generate(&stream).unwrap();
-
-        assert_eq!(frame.shape(), (2, 2, 2));
-        assert_eq!(frame.channel_names(), ["positive", "negative"]);
-        assert_eq!(
-            frame.data(),
-            &EventFrameData::U16(vec![0, 2, 0, 0, 0, 0, 1, 0])
-        );
-    }
-
-    #[test]
-    fn normalizes_both_polarities_with_one_scale() {
-        let stream = EventStream {
-            events: array![[0, 0, 10, 1], [0, 0, 11, 1], [1, 0, 12, 0]],
-            width: 2,
-            height: 1,
-        };
-
-        let frame = Polarity::new(true).generate(&stream).unwrap();
-
-        assert_eq!(
-            frame.data(),
-            &EventFrameData::U8(vec![255, 0, 0, 128])
-        );
-    }
-
-    #[test]
-    fn empty_stream_produces_an_empty_histogram() {
-        let stream = EventStream {
-            events: ndarray::Array2::zeros((0, 4)),
-            width: 2,
-            height: 2,
-        };
-
-        let frame = Polarity::default().generate(&stream).unwrap();
-
-        assert_eq!(frame.data(), &EventFrameData::U16(vec![0; 8]));
-    }
-
-    #[test]
-    fn rejects_out_of_bounds_events() {
-        let stream = EventStream {
-            events: array![[2, 0, 10, 1]],
-            width: 2,
-            height: 2,
-        };
-
-        let error = Polarity::default().generate(&stream).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "event coordinate (2, 0) exceeds sensor size 2x2"
-        );
-    }
-
-    #[test]
-    fn rejects_counts_that_exceed_uint16() {
-        let event_count = usize::from(u16::MAX) + 1;
-        let stream = EventStream {
-            events: ndarray::Array2::from_shape_fn((event_count, 4), |(index, column)| {
-                match column {
-                    2 => index as u64,
-                    3 => 1,
-                    _ => 0,
-                }
-            }),
-            width: 1,
-            height: 1,
-        };
-
-        let error = Polarity::default().generate(&stream).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "event count at (0, 0) exceeds uint16 capacity"
-        );
-    }
-
-    #[test]
-    #[ignore = "manual performance benchmark"]
-    fn benchmark_polarity_generation() {
-        let sample_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../data/test/example.npz");
-        let sample = crate::load(sample_path).unwrap();
-        let sample_iterations = 1_000;
-        black_box(Polarity::default().generate(&sample).unwrap());
-        let sample_start = Instant::now();
-
-        for _ in 0..sample_iterations {
-            black_box(Polarity::default().generate(black_box(&sample)).unwrap());
+    fn empty_stream(width: usize, height: usize) -> EventStream {
+        EventStream {
+            events: Array2::zeros((0, 4)),
+            width,
+            height,
+            timestamp_scale_ms: 0.001,
         }
+    }
 
-        eprintln!(
-            "sample polarity generation: {:?} per frame",
-            sample_start.elapsed() / sample_iterations
+    #[test]
+    fn empty_streams_produce_zero_outputs() {
+        let stream = empty_stream(2, 3);
+
+        for frame in [
+            Binary.generate(&stream).unwrap(),
+            VoxelGrid::default().generate(&stream).unwrap(),
+            TimeSurface::default().generate(&stream).unwrap(),
+            Tencode::default().generate(&stream).unwrap(),
+            Mcts::default().generate(&stream).unwrap(),
+        ] {
+            match frame.data() {
+                EventFrameData::U8(values) => assert!(values.iter().all(|&value| value == 0)),
+                EventFrameData::F32(values) => assert!(values.iter().all(|&value| value == 0.0)),
+                _ => panic!("unexpected empty representation dtype"),
+            }
+        }
+        assert_eq!(PointSet.generate(&stream).unwrap().shape(), (0, 4));
+    }
+
+    #[test]
+    fn rejects_invalid_parameters_and_size_overflow() {
+        let stream = empty_stream(2, 3);
+
+        assert_eq!(
+            VoxelGrid::new(0, 30.0).generate(&stream).unwrap_err(),
+            RepresentationError::InvalidParameter("bins")
+        );
+        assert_eq!(
+            TimeSurface::new(f64::NAN).generate(&stream).unwrap_err(),
+            RepresentationError::InvalidParameter("tau_ms")
+        );
+        assert_eq!(
+            Tencode::new(0.0).generate(&stream).unwrap_err(),
+            RepresentationError::InvalidParameter("window_ms")
+        );
+        assert_eq!(
+            Mcts::new(0.5).generate(&stream).unwrap_err(),
+            RepresentationError::InvalidParameter("max_window_ms")
         );
 
-        let normalized = Polarity::new(true);
-        black_box(normalized.generate(&sample).unwrap());
-        let normalized_start = Instant::now();
-
-        for _ in 0..sample_iterations {
-            black_box(normalized.generate(black_box(&sample)).unwrap());
-        }
-
-        eprintln!(
-            "normalized sample polarity generation: {:?} per frame",
-            normalized_start.elapsed() / sample_iterations
-        );
-
-        let event_count = 1_000_000;
-        let stream = EventStream {
-            events: ndarray::Array2::from_shape_fn((event_count, 4), |(index, column)| {
-                match column {
-                    0 => (index % 640) as u64,
-                    1 => (index / 640 % 480) as u64,
-                    2 => index as u64,
-                    _ => (index % 2) as u64,
-                }
-            }),
-            width: 640,
-            height: 480,
-        };
-        let iterations = 10;
-        black_box(Polarity::default().generate(&stream).unwrap());
-        let start = Instant::now();
-
-        for _ in 0..iterations {
-            black_box(Polarity::default().generate(black_box(&stream)).unwrap());
-        }
-
-        let elapsed = start.elapsed();
-        eprintln!(
-            "one-million-event polarity generation: {:.1} million events/s",
-            event_count as f64 * iterations as f64 / elapsed.as_secs_f64() / 1_000_000.0
+        let oversized = empty_stream(usize::MAX, 2);
+        assert_eq!(
+            Binary.generate(&oversized).unwrap_err(),
+            RepresentationError::SizeOverflow
         );
     }
 }

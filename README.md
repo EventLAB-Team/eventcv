@@ -1,2 +1,25 @@
-# eventcv
-Open source event-based computer vision library.
+# EventCV: Open source event-based computer vision library
+![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![PyPI - Version](https://img.shields.io/pypi/v/eventcv)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/eventcv.svg?label=PyPI%20downloads)](
+https://pypi.org/project/eventcv/)
+[![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/eventcv.svg?label=Conda%20downloads)](
+https://anaconda.org/conda-forge/eventcv)
+
+EventCV is "OpenCV" for event-based data and computer vision applications.
+
+## Resources
+- **Documentation**
+
+## Installation
+```console
+# pip
+pip install eventcv
+
+# conda
+conda install eventcv
+
+# pixi
+pixi add eventcv
+```
