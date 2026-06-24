@@ -1,5 +1,7 @@
 [build-system]
-requires = ["maturin>=1.8,<2"]
+# cmake builds the bundled libhdf5 from source so `.h5`/`.hdf5` support is compiled
+# into the wheel; end users install nothing extra.
+requires = ["maturin>=1.8,<2", "cmake>=3.18"]
 build-backend = "maturin"
 
 [project]
@@ -16,8 +18,15 @@ dependencies = [
     "numpy>=1.24,<2"
 ]
 
+# Test-only tools (writing/inspecting HDF5 fixtures). Not needed to use eventcv —
+# the Rust reader links its own libhdf5.
+[project.optional-dependencies]
+test = ["h5py>=3", "hdf5plugin"]
+
 [tool.maturin]
 bindings = "pyo3"
 manifest-path = "crates/eventcv-py/Cargo.toml"
 python-source = "python"
 module-name = "eventcv._rust"
+# Compile HDF5 reading into every wheel.
+features = ["hdf5"]

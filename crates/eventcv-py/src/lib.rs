@@ -2,15 +2,14 @@ mod viewer;
 
 use eventcv_core::{
     image::{PoolingMethod, ResizeError},
+    io::{ColumnOrder, IoError, LoadOptions, TimeUnit},
     representation::{
         Binary, EventFrame, EventFrameData, EventPointSet, Mcts, PointSet, Polarity,
         Representation, RepresentationError, Tencode, TimeSurface, VoxelGrid,
     },
 };
 use numpy::{IntoPyArray, PyArray2};
-use pyo3::exceptions::{
-    PyFileNotFoundError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyTuple};
 
@@ -27,7 +26,7 @@ impl PyEventStream {
 
     #[getter]
     fn shape(&self) -> (usize, usize) {
-        self.inner.as_array().dim()
+        (self.inner.len(), 4)
     }
 
     #[getter]
@@ -46,7 +45,7 @@ impl PyEventStream {
     }
 
     fn numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u64>> {
-        self.inner.as_array().to_owned().into_pyarray(py)
+        self.inner.to_array2().into_pyarray(py)
     }
 
     #[pyo3(signature = (*args, **kwargs))]
@@ -88,8 +87,8 @@ impl PyEventStream {
 
     #[pyo3(signature = (*, bins=9, window_ms=30.0))]
     fn voxel(&self, py: Python<'_>, bins: i64, window_ms: f64) -> PyResult<PyEventFrame> {
-        let bins = usize::try_from(bins)
-            .map_err(|_| PyValueError::new_err("bins must be at least 1"))?;
+        let bins =
+            usize::try_from(bins).map_err(|_| PyValueError::new_err("bins must be at least 1"))?;
         py.detach(|| VoxelGrid::new(bins, window_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
@@ -147,7 +146,7 @@ impl PyEventStream {
         if representation.extract::<PyRef<'_, PyPolarity>>().is_ok() {
             self.generate_polarity(py, Polarity::new(normalize))
         } else {
-            let name = representation.get_type().name()?.to_str()?.to_owned();
+            let name = representation.get_type().name()?.extract::<String>()?;
             Err(PyTypeError::new_err(format!(
                 "unsupported representation: {name}"
             )))
@@ -186,10 +185,7 @@ impl PyEventFrame {
 
     #[getter]
     fn channel_names<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(
-            py,
-            self.inner.channel_names().iter().map(String::as_str),
-        )
+        PyTuple::new(py, self.inner.channel_names().iter().map(String::as_str))
     }
 
     #[getter]
@@ -199,34 +195,30 @@ impl PyEventFrame {
 
     fn numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
         match self.inner.data() {
-            EventFrameData::U8(data) => numpy::ndarray::Array3::from_shape_vec(
-                self.inner.shape(),
-                data.clone(),
-            )
-            .expect("EventFrame shape must match its data")
-            .into_pyarray(py)
-            .into_any(),
-            EventFrameData::U16(data) => numpy::ndarray::Array3::from_shape_vec(
-                self.inner.shape(),
-                data.clone(),
-            )
-            .expect("EventFrame shape must match its data")
-            .into_pyarray(py)
-            .into_any(),
-            EventFrameData::U64(data) => numpy::ndarray::Array3::from_shape_vec(
-                self.inner.shape(),
-                data.clone(),
-            )
-            .expect("EventFrame shape must match its data")
-            .into_pyarray(py)
-            .into_any(),
-            EventFrameData::F32(data) => numpy::ndarray::Array3::from_shape_vec(
-                self.inner.shape(),
-                data.clone(),
-            )
-            .expect("EventFrame shape must match its data")
-            .into_pyarray(py)
-            .into_any(),
+            EventFrameData::U8(data) => {
+                numpy::ndarray::Array3::from_shape_vec(self.inner.shape(), data.clone())
+                    .expect("EventFrame shape must match its data")
+                    .into_pyarray(py)
+                    .into_any()
+            }
+            EventFrameData::U16(data) => {
+                numpy::ndarray::Array3::from_shape_vec(self.inner.shape(), data.clone())
+                    .expect("EventFrame shape must match its data")
+                    .into_pyarray(py)
+                    .into_any()
+            }
+            EventFrameData::U64(data) => {
+                numpy::ndarray::Array3::from_shape_vec(self.inner.shape(), data.clone())
+                    .expect("EventFrame shape must match its data")
+                    .into_pyarray(py)
+                    .into_any()
+            }
+            EventFrameData::F32(data) => {
+                numpy::ndarray::Array3::from_shape_vec(self.inner.shape(), data.clone())
+                    .expect("EventFrame shape must match its data")
+                    .into_pyarray(py)
+                    .into_any()
+            }
         }
     }
 
@@ -295,19 +287,70 @@ impl PyEventPointSet {
 }
 
 #[pyfunction]
-fn load(path: &str) -> PyResult<PyEventStream> {
-    eventcv_core::load(path)
+#[pyo3(signature = (path, *, sensor_size=None, time_unit="seconds", order="txyp", topic=None, max_events=None))]
+fn load(
+    py: Python<'_>,
+    path: &str,
+    sensor_size: Option<(i64, i64)>,
+    time_unit: &str,
+    order: &str,
+    topic: Option<String>,
+    max_events: Option<i64>,
+) -> PyResult<PyEventStream> {
+    let sensor_size = sensor_size
+        .map(|(width, height)| {
+            Ok::<_, PyErr>((
+                usize::try_from(width)
+                    .map_err(|_| PyValueError::new_err("sensor width must be positive"))?,
+                usize::try_from(height)
+                    .map_err(|_| PyValueError::new_err("sensor height must be positive"))?,
+            ))
+        })
+        .transpose()?;
+    let time_unit = match time_unit {
+        "seconds" | "s" => TimeUnit::Seconds,
+        "milliseconds" | "ms" => TimeUnit::Milliseconds,
+        "microseconds" | "us" => TimeUnit::Microseconds,
+        "nanoseconds" | "ns" => TimeUnit::Nanoseconds,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported time_unit: {other}"
+            )))
+        }
+    };
+    let order = match order {
+        "txyp" => ColumnOrder::Txyp,
+        "xytp" => ColumnOrder::Xytp,
+        other => return Err(PyValueError::new_err(format!("unsupported order: {other}"))),
+    };
+    let max_events = max_events
+        .map(|count| {
+            usize::try_from(count)
+                .map_err(|_| PyValueError::new_err("max_events must be non-negative"))
+        })
+        .transpose()?;
+    let options = LoadOptions {
+        sensor_size,
+        time_unit,
+        order,
+        topic,
+        max_events,
+    };
+    py.detach(|| eventcv_core::io::load(path, options))
         .map(|inner| PyEventStream { inner })
-        .map_err(map_load_error)
+        .map_err(map_io_error)
 }
 
-fn map_load_error(error: eventcv_core::LoadError) -> PyErr {
+fn map_io_error(error: IoError) -> PyErr {
     match error {
-        eventcv_core::LoadError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        IoError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
             PyFileNotFoundError::new_err(error.to_string())
         }
-        eventcv_core::LoadError::Io(error) => PyOSError::new_err(error.to_string()),
-        eventcv_core::LoadError::InvalidFormat(message) => PyValueError::new_err(message),
+        IoError::Io(error) => PyOSError::new_err(error.to_string()),
+        IoError::Parse { .. }
+        | IoError::Format(_)
+        | IoError::InvalidSensorSize
+        | IoError::Unsupported(_) => PyValueError::new_err(error.to_string()),
     }
 }
 

@@ -34,8 +34,16 @@ impl Representation for PointSet {
             .checked_mul(4)
             .ok_or(RepresentationError::SizeOverflow)?;
         let mut data = Vec::with_capacity(capacity);
-        let minimum_time = stream.iter().map(|event| event.timestamp).min().unwrap_or(0);
-        let maximum_time = stream.iter().map(|event| event.timestamp).max().unwrap_or(0);
+        let minimum_time = stream
+            .iter()
+            .map(|event| event.timestamp)
+            .min()
+            .unwrap_or(0);
+        let maximum_time = stream
+            .iter()
+            .map(|event| event.timestamp)
+            .max()
+            .unwrap_or(0);
         let duration = maximum_time - minimum_time;
 
         for event in stream.iter() {
@@ -76,12 +84,12 @@ mod tests {
 
     #[test]
     fn normalizes_points_without_reordering_events() {
-        let stream = EventStream {
-            events: array![[1, 0, 30, 0], [0, 2, 10, 1], [1, 1, 20, 1]],
-            width: 2,
-            height: 3,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(
+            array![[1, 0, 30, 0], [0, 2, 10, 1], [1, 1, 20, 1]],
+            2,
+            3,
+            0.001,
+        );
 
         let points = PointSet.generate(&stream).unwrap();
 
@@ -94,12 +102,7 @@ mod tests {
 
     #[test]
     fn zero_duration_streams_have_zero_normalized_time() {
-        let stream = EventStream {
-            events: array![[0, 0, 10, 1], [1, 0, 10, 0]],
-            width: 2,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(array![[0, 0, 10, 1], [1, 0, 10, 0]], 2, 1, 0.001);
 
         let points = PointSet.generate(&stream).unwrap();
 

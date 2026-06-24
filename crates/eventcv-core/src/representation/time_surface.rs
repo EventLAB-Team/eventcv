@@ -31,8 +31,8 @@ impl Representation for TimeSurface {
         let mut latest = vec![None; length];
 
         for event in stream.iter() {
-            let index = event_index(event, width, height)?
-                + if event.polarity { 0 } else { plane_len };
+            let index =
+                event_index(event, width, height)? + if event.polarity { 0 } else { plane_len };
             if latest[index].is_none_or(|timestamp| event.timestamp > timestamp) {
                 latest[index] = Some(event.timestamp);
             }
@@ -67,12 +67,12 @@ mod tests {
 
     #[test]
     fn uses_latest_event_per_pixel_and_polarity() {
-        let stream = EventStream {
-            events: array![[0, 0, 30_000, 1], [1, 0, 20_000, 0], [0, 0, 10_000, 1]],
-            width: 2,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(
+            array![[0, 0, 30_000, 1], [1, 0, 20_000, 0], [0, 0, 10_000, 1]],
+            2,
+            1,
+            0.001,
+        );
 
         let frame = TimeSurface::new(10.0).generate(&stream).unwrap();
         let EventFrameData::F32(values) = frame.data() else {

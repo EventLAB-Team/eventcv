@@ -30,12 +30,12 @@ impl Representation for Polarity {
         for event in stream.iter() {
             let index = event_index(event, width, height)?;
             let channel_offset = if event.polarity { 0 } else { plane_len };
-            counts[channel_offset + index] = counts[channel_offset + index]
-                .checked_add(1)
-                .ok_or(RepresentationError::CountOverflow {
+            counts[channel_offset + index] = counts[channel_offset + index].checked_add(1).ok_or(
+                RepresentationError::CountOverflow {
                     x: event.x,
                     y: event.y,
-                })?;
+                },
+            )?;
         }
 
         let data = if self.normalize {
@@ -79,31 +79,23 @@ mod tests {
 
     #[test]
     fn accumulates_and_normalizes_polarities() {
-        let stream = EventStream {
-            events: array![[0, 0, 10, 1], [0, 0, 11, 1], [1, 0, 12, 0]],
-            width: 2,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(
+            array![[0, 0, 10, 1], [0, 0, 11, 1], [1, 0, 12, 0]],
+            2,
+            1,
+            0.001,
+        );
 
         let raw = Polarity::default().generate(&stream).unwrap();
         let normalized = Polarity::new(true).generate(&stream).unwrap();
 
         assert_eq!(raw.data(), &EventFrameData::U16(vec![2, 0, 0, 1]));
-        assert_eq!(
-            normalized.data(),
-            &EventFrameData::U8(vec![255, 0, 0, 128])
-        );
+        assert_eq!(normalized.data(), &EventFrameData::U8(vec![255, 0, 0, 128]));
     }
 
     #[test]
     fn rejects_out_of_bounds_events() {
-        let stream = EventStream {
-            events: array![[2, 0, 10, 1]],
-            width: 2,
-            height: 2,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(array![[2, 0, 10, 1]], 2, 2, 0.001);
 
         let error = Polarity::default().generate(&stream).unwrap_err();
 
@@ -116,18 +108,16 @@ mod tests {
     #[test]
     fn rejects_counts_that_exceed_uint16() {
         let event_count = usize::from(u16::MAX) + 1;
-        let stream = EventStream {
-            events: ndarray::Array2::from_shape_fn((event_count, 4), |(index, column)| {
-                match column {
-                    2 => index as u64,
-                    3 => 1,
-                    _ => 0,
-                }
+        let stream = EventStream::from_array2(
+            ndarray::Array2::from_shape_fn((event_count, 4), |(index, column)| match column {
+                2 => index as u64,
+                3 => 1,
+                _ => 0,
             }),
-            width: 1,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+            1,
+            1,
+            0.001,
+        );
 
         let error = Polarity::default().generate(&stream).unwrap_err();
 

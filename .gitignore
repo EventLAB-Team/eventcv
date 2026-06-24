@@ -222,6 +222,12 @@ __marimo__/
 
 /target
 
+# Local-only agent docs / planning
 AGENTS.md
+CLAUDE.md
+TASKS.md
 *.DS_Store
 tests/quickview.py
+
+# Large local development fixtures (multi-GB; keep local, never commit)
+data/development/

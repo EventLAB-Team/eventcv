@@ -37,12 +37,12 @@ mod tests {
 
     #[test]
     fn records_single_channel_occupancy() {
-        let stream = EventStream {
-            events: array![[0, 0, 1, 1], [0, 0, 2, 0], [1, 1, 3, 1]],
-            width: 2,
-            height: 2,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(
+            array![[0, 0, 1, 1], [0, 0, 2, 0], [1, 1, 3, 1]],
+            2,
+            2,
+            0.001,
+        );
 
         let frame = Binary.generate(&stream).unwrap();
 

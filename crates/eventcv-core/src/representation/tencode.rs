@@ -52,10 +52,10 @@ impl Representation for Tencode {
                     } else {
                         values[2 * plane_len + index] = u8::MAX;
                     }
-                    values[plane_len + index] =
-                        (255.0 * age_ms(stream, reference, timestamp) / self.window_ms)
-                            .round()
-                            .clamp(0.0, 255.0) as u8;
+                    values[plane_len + index] = (255.0 * age_ms(stream, reference, timestamp)
+                        / self.window_ms)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -84,12 +84,12 @@ mod tests {
 
     #[test]
     fn encodes_latest_polarity_and_age() {
-        let stream = EventStream {
-            events: array![[0, 0, 10_000, 1], [1, 0, 30_000, 1], [1, 0, 30_000, 0]],
-            width: 2,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(
+            array![[0, 0, 10_000, 1], [1, 0, 30_000, 1], [1, 0, 30_000, 0]],
+            2,
+            1,
+            0.001,
+        );
 
         let frame = Tencode::new(30.0).generate(&stream).unwrap();
 

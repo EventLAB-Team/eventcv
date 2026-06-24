@@ -79,12 +79,12 @@ mod tests {
 
     #[test]
     fn interpolates_signed_events_between_time_bins() {
-        let stream = EventStream {
-            events: array![[0, 0, 0, 1], [0, 0, 15_000, 0], [1, 0, 30_000, 1]],
-            width: 2,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(
+            array![[0, 0, 0, 1], [0, 0, 15_000, 0], [1, 0, 30_000, 1]],
+            2,
+            1,
+            0.001,
+        );
 
         let frame = VoxelGrid::new(3, 30.0).generate(&stream).unwrap();
 
@@ -96,12 +96,7 @@ mod tests {
 
     #[test]
     fn equal_timestamps_use_the_final_bin() {
-        let stream = EventStream {
-            events: array![[0, 0, 10, 1], [0, 0, 10, 1]],
-            width: 1,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(array![[0, 0, 10, 1], [0, 0, 10, 1]], 1, 1, 0.001);
 
         let frame = VoxelGrid::new(3, 30.0).generate(&stream).unwrap();
 
@@ -110,12 +105,7 @@ mod tests {
 
     #[test]
     fn opposing_events_cancel_in_the_same_bins() {
-        let stream = EventStream {
-            events: array![[0, 0, 10, 1], [0, 0, 10, 0]],
-            width: 1,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream = EventStream::from_array2(array![[0, 0, 10, 1], [0, 0, 10, 0]], 1, 1, 0.001);
 
         let frame = VoxelGrid::new(3, 30.0).generate(&stream).unwrap();
 

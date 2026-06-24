@@ -85,12 +85,8 @@ mod tests {
 
     #[test]
     fn builds_logarithmic_windows_for_each_polarity() {
-        let stream = EventStream {
-            events: array![[0, 0, 14_000, 0], [0, 0, 16_000, 1]],
-            width: 1,
-            height: 1,
-            timestamp_scale_ms: 0.001,
-        };
+        let stream =
+            EventStream::from_array2(array![[0, 0, 14_000, 0], [0, 0, 16_000, 1]], 1, 1, 0.001);
 
         let frame = Mcts::new(16.0).generate(&stream).unwrap();
 

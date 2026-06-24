@@ -1,3 +1,7 @@
+<h1 align="center">
+<img src="assets/logo.svg" width="200">
+</h1><br>
+
 # EventCV: Open source event-based computer vision library
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)

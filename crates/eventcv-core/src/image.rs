@@ -66,14 +66,7 @@ impl EventFrame {
                 self.channels,
             )?),
             (EventFrameData::F32(data), PoolingMethod::Sum) => EventFrameData::F32(
-                resize_float_sum(
-                    data,
-                    self.width,
-                    self.height,
-                    width,
-                    height,
-                    self.channels,
-                ),
+                resize_float_sum(data, self.width, self.height, width, height, self.channels),
             ),
         };
 
@@ -285,6 +278,7 @@ fn sum_float_bins(
     resized
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resize_weighted<T: ResizeValue>(
     data: &[T],
     source_width: usize,
@@ -305,8 +299,7 @@ fn resize_weighted<T: ResizeValue>(
                 let mut value = 0.0;
                 for &(source_y, y_weight) in y_sample {
                     for &(source_x, x_weight) in x_sample {
-                        value += data[channel_offset + source_y * source_width + source_x]
-                            .to_f64()
+                        value += data[channel_offset + source_y * source_width + source_x].to_f64()
                             * x_weight
                             * y_weight;
                     }
@@ -363,7 +356,7 @@ fn axis_ranges(source_length: usize, length: usize) -> Vec<(usize, usize)> {
 
 fn proportional_boundary(index: usize, source_length: usize, length: usize) -> usize {
     let numerator = index as u128 * source_length as u128;
-    ((numerator + length as u128 - 1) / length as u128) as usize
+    numerator.div_ceil(length as u128) as usize
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -406,10 +399,7 @@ mod tests {
         assert_eq!(resized.shape(), (2, 1, 2));
         assert_eq!(resized.channel_names(), ["positive", "negative"]);
         assert_eq!(resized.kind(), RepresentationKind::Polarity);
-        assert_eq!(
-            resized.data(),
-            &EventFrameData::U8(vec![2, 5, 4, 2])
-        );
+        assert_eq!(resized.data(), &EventFrameData::U8(vec![2, 5, 4, 2]));
         assert_eq!(frame.shape(), (2, 1, 5));
     }
 
@@ -426,10 +416,7 @@ mod tests {
 
         let resized = frame.resize(2, 1, PoolingMethod::Sum).unwrap();
 
-        assert_eq!(
-            resized.data(),
-            &EventFrameData::U64(vec![6, 9, 12, 3])
-        );
+        assert_eq!(resized.data(), &EventFrameData::U64(vec![6, 9, 12, 3]));
         let EventFrameData::U64(values) = resized.data() else {
             panic!("sum pooling must return uint64 data");
         };
@@ -459,7 +446,10 @@ mod tests {
     fn supports_mixed_pooling_and_interpolation() {
         let frame = EventFrame {
             data: EventFrameData::U16(
-                [vec![7_u16; 8], vec![9_u16; 8]].into_iter().flatten().collect(),
+                [vec![7_u16; 8], vec![9_u16; 8]]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             ),
             channels: 2,
             width: 2,
@@ -475,13 +465,19 @@ mod tests {
         assert_eq!(
             resized.data(),
             &EventFrameData::U16(
-                [vec![7_u16; 8], vec![9_u16; 8]].into_iter().flatten().collect()
+                [vec![7_u16; 8], vec![9_u16; 8]]
+                    .into_iter()
+                    .flatten()
+                    .collect()
             )
         );
         assert_eq!(
             summed.data(),
             &EventFrameData::U64(
-                [vec![14_u64; 8], vec![18_u64; 8]].into_iter().flatten().collect()
+                [vec![14_u64; 8], vec![18_u64; 8]]
+                    .into_iter()
+                    .flatten()
+                    .collect()
             )
         );
     }

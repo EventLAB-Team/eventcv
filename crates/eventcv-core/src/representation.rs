@@ -149,7 +149,10 @@ impl fmt::Display for RepresentationError {
         match self {
             Self::SizeOverflow => formatter.write_str("representation dimensions are too large"),
             Self::CountOverflow { x, y } => {
-                write!(formatter, "event count at ({x}, {y}) exceeds uint16 capacity")
+                write!(
+                    formatter,
+                    "event count at ({x}, {y}) exceeds uint16 capacity"
+                )
             }
             Self::EventOutOfBounds {
                 x,
@@ -160,15 +163,13 @@ impl fmt::Display for RepresentationError {
                 formatter,
                 "event coordinate ({x}, {y}) exceeds sensor size {width}x{height}"
             ),
-            Self::InvalidParameter(name) => {
-                match *name {
-                    "bins" => formatter.write_str("bins must be at least 1"),
-                    "max_window_ms" => {
-                        formatter.write_str("max_window_ms must be finite and at least 1")
-                    }
-                    _ => write!(formatter, "{name} must be finite and positive"),
+            Self::InvalidParameter(name) => match *name {
+                "bins" => formatter.write_str("bins must be at least 1"),
+                "max_window_ms" => {
+                    formatter.write_str("max_window_ms must be finite and at least 1")
                 }
-            }
+                _ => write!(formatter, "{name} must be finite and positive"),
+            },
         }
     }
 }
@@ -186,12 +187,7 @@ mod tests {
     use crate::EventStream;
 
     fn empty_stream(width: usize, height: usize) -> EventStream {
-        EventStream {
-            events: Array2::zeros((0, 4)),
-            width,
-            height,
-            timestamp_scale_ms: 0.001,
-        }
+        EventStream::from_array2(Array2::zeros((0, 4)), width, height, 0.001)
     }
 
     #[test]

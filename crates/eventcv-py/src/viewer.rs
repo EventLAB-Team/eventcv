@@ -1,6 +1,4 @@
-use eventcv_core::representation::{
-    EventFrame, EventFrameData, EventPointSet, RepresentationKind,
-};
+use eventcv_core::representation::{EventFrame, EventFrameData, EventPointSet, RepresentationKind};
 use minifb::{Key, MouseButton, MouseMode, Scale, Window, WindowOptions};
 
 const VIEW_WIDTH: usize = 960;
@@ -93,12 +91,7 @@ fn prepare_frame(frame: &EventFrame, normalize: bool) -> Result<PreparedView, St
     }
 }
 
-fn show_image(
-    pixels: &[u32],
-    width: usize,
-    height: usize,
-    name: &str,
-) -> Result<(), String> {
+fn show_image(pixels: &[u32], width: usize, height: usize, name: &str) -> Result<(), String> {
     let mut window = Window::new(
         &format!("eventcv - {name}"),
         width,
@@ -249,8 +242,7 @@ where
     data.iter()
         .map(|&value| {
             let value = u128::from(value.into());
-            ((value * u128::from(u8::MAX) + u128::from(maximum) / 2)
-                / u128::from(maximum)) as u8
+            ((value * u128::from(u8::MAX) + u128::from(maximum) / 2) / u128::from(maximum)) as u8
         })
         .collect()
 }
@@ -290,11 +282,7 @@ fn render_polarity_values(
         .collect())
 }
 
-fn render_binary(
-    data: &EventFrameData,
-    width: usize,
-    height: usize,
-) -> Result<Vec<u32>, String> {
+fn render_binary(data: &EventFrameData, width: usize, height: usize) -> Result<Vec<u32>, String> {
     let plane_len = checked_plane_len(width, height)?;
     if frame_data_len(data) != plane_len {
         return Err("binary frame must have one channel".to_owned());
@@ -327,7 +315,11 @@ fn render_tencode(
     } else {
         255.0
     };
-    let scale = if maximum > 255.0 { 255.0 / maximum } else { 1.0 };
+    let scale = if maximum > 255.0 {
+        255.0 / maximum
+    } else {
+        1.0
+    };
 
     Ok((0..plane_len)
         .map(|index| {
@@ -415,7 +407,11 @@ fn mcts_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
                     height,
                     z,
                     value,
-                    if channel < windows { NEGATIVE } else { POSITIVE },
+                    if channel < windows {
+                        NEGATIVE
+                    } else {
+                        POSITIVE
+                    },
                 ));
             }
         }
@@ -565,14 +561,7 @@ fn draw_depth_point(
     }
 }
 
-fn draw_axes(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    pitch: f32,
-    yaw: f32,
-    z_label: &str,
-) {
+fn draw_axes(buffer: &mut [u32], width: usize, height: usize, pitch: f32, yaw: f32, z_label: &str) {
     let origin = axis_project(-1.0, -1.0, -1.0, pitch, yaw, width, height);
     let x_end = axis_project(1.0, -1.0, -1.0, pitch, yaw, width, height);
     let y_end = axis_project(-1.0, 1.0, -1.0, pitch, yaw, width, height);
@@ -634,7 +623,16 @@ fn draw_reset(buffer: &mut [u32], width: usize, height: usize) {
     let (left, top, right, bottom) = RESET_BOUNDS;
     fill_rect(buffer, width, height, left, top, right, bottom, 0x26324d);
     stroke_rect(buffer, width, height, left, top, right, bottom, 0xd7e3ff);
-    draw_text(buffer, width, height, left + 12, top + 9, "RESET", 0xffffff, 2);
+    draw_text(
+        buffer,
+        width,
+        height,
+        left + 12,
+        top + 9,
+        "RESET",
+        0xffffff,
+        2,
+    );
 }
 
 fn draw_legend(buffer: &mut [u32], width: usize, height: usize) {
@@ -695,6 +693,7 @@ fn draw_line(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_rect(
     buffer: &mut [u32],
     width: usize,
@@ -712,6 +711,7 @@ fn fill_rect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stroke_rect(
     buffer: &mut [u32],
     width: usize,
@@ -756,6 +756,7 @@ fn stroke_rect(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     buffer: &mut [u32],
     width: usize,
@@ -790,38 +791,71 @@ fn draw_text(
 
 fn glyph(character: char) -> [u8; 7] {
     match character {
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
-        'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
         ' ' => [0; 7],
-        _ => [0b11111, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100],
+        _ => [
+            0b11111, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
     }
 }
 
-fn set_pixel(
-    buffer: &mut [u32],
-    width: usize,
-    height: usize,
-    x: i32,
-    y: i32,
-    color: u32,
-) {
+fn set_pixel(buffer: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: u32) {
     if x >= 0 && y >= 0 && x < width as i32 && y < height as i32 {
         buffer[y as usize * width + x as usize] = color;
     }
@@ -849,7 +883,10 @@ fn frame_value(data: &EventFrameData, index: usize) -> Option<f64> {
 
 fn float_data(frame: &EventFrame) -> Result<&[f32], String> {
     let EventFrameData::F32(values) = frame.data() else {
-        return Err(format!("{} frame must use float32 data", frame.kind().as_str()));
+        return Err(format!(
+            "{} frame must use float32 data",
+            frame.kind().as_str()
+        ));
     };
     Ok(values)
 }
@@ -965,9 +1002,7 @@ mod tests {
 
     #[test]
     fn renders_tencode_as_a_three_channel_image() {
-        let data = eventcv_core::representation::EventFrameData::U8(vec![
-            255, 0, 170, 0, 0, 255,
-        ]);
+        let data = eventcv_core::representation::EventFrameData::U8(vec![255, 0, 170, 0, 0, 255]);
 
         let pixels = render_tencode(&data, 2, 1, true).unwrap();
 
@@ -978,7 +1013,8 @@ mod tests {
     fn prepares_every_representation_without_opening_a_window() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../data/test/example.npz");
-        let stream = eventcv_core::load(path).unwrap();
+        let stream =
+            eventcv_core::io::load(path, eventcv_core::io::LoadOptions::default()).unwrap();
 
         for frame in [
             Binary.generate(&stream).unwrap(),
@@ -1008,7 +1044,8 @@ mod tests {
     fn benchmark_cpu_cloud_rendering() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../data/test/example.npz");
-        let stream = eventcv_core::load(path).unwrap();
+        let stream =
+            eventcv_core::io::load(path, eventcv_core::io::LoadOptions::default()).unwrap();
         let frame = VoxelGrid::default().generate(&stream).unwrap();
         let points = voxel_cloud(&frame).unwrap();
         let start = std::time::Instant::now();
