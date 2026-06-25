@@ -12,24 +12,20 @@ use crate::{EventStream, EventStreamBuilder};
 const BLOCK: usize = 1_000_000;
 
 /// Reads event datasets `x`, `y`, `t`, `p` from an HDF5 file (looked up under an
-/// `events/` group, then at the root). Timestamps are converted to microseconds via
-/// `options.time_unit` — Brisbane-Event-VPR stores nanoseconds, so pass `time_unit="ns"`.
+/// `events/` group, then at the root). `sensor_size` and `time_unit` are inferred when
+/// left `None` — the unit from the timestamp span, the size from the coordinate range.
 pub fn read_hdf5(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
-    // `file` is held (not read) to keep the dataset handles valid through `read_range`.
-    let OpenedFile {
-        sensor: (width, height),
-        file: _file,
-        datasets,
-        total,
-    } = open_validated(path.as_ref(), options)?;
-    let target = options.max_events.map_or(total, |max| max.min(total));
-    read_range(&datasets, 0..target, width, height, options.time_unit)
+    let opened = open_validated(path.as_ref())?;
+    let ((width, height), time_unit) = resolve_params(&opened, options)?;
+    let target = options
+        .max_events
+        .map_or(opened.total, |max| max.min(opened.total));
+    read_range(&opened.datasets, 0..target, width, height, time_unit)
 }
 
 /// The open file, its `x`/`y`/`t`/`p` datasets, and the event count — the shared
 /// result of opening an HDF5 file. The `file` must outlive use of the datasets.
 struct OpenedFile {
-    sensor: (usize, usize),
     file: File,
     datasets: [Dataset; 4],
     total: usize,
@@ -37,10 +33,7 @@ struct OpenedFile {
 
 /// Opens the file, locates the `x`/`y`/`t`/`p` datasets, and checks their lengths
 /// agree. Shared by the eager [`read_hdf5`] and the lazy [`Hdf5SliceSource`].
-fn open_validated(path: &Path, options: &LoadOptions) -> Result<OpenedFile, IoError> {
-    let (width, height) = options.sensor_size.ok_or_else(|| {
-        IoError::Format("HDF5 files require sensor_size = (width, height)".to_owned())
-    })?;
+fn open_validated(path: &Path) -> Result<OpenedFile, IoError> {
     if !path.exists() {
         return Err(IoError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -63,11 +56,79 @@ fn open_validated(path: &Path, options: &LoadOptions) -> Result<OpenedFile, IoEr
         }
     }
     Ok(OpenedFile {
-        sensor: (width, height),
         file,
         datasets,
         total,
     })
+}
+
+/// Resolves `(sensor_size, time_unit)`, inferring whichever the caller left `None`: the
+/// time unit from the raw timestamp span (two cheap reads), and the sensor size from the
+/// coordinate range — a full `x`/`y` scan (seconds on a multi-GB file), so passing an
+/// explicit `sensor_size` skips it.
+fn resolve_params(
+    opened: &OpenedFile,
+    options: &LoadOptions,
+) -> Result<((usize, usize), TimeUnit), IoError> {
+    let time_unit = match options.time_unit {
+        Some(unit) => unit,
+        None if opened.total == 0 => TimeUnit::Microseconds,
+        None => {
+            let first = read_integers(&opened.datasets[2], 0..1)?[0];
+            let last = read_integers(&opened.datasets[2], opened.total - 1..opened.total)?[0];
+            TimeUnit::infer_from_span(last - first)
+        }
+    };
+    let sensor = match options.sensor_size {
+        Some(size) => size,
+        None => infer_sensor_size(&opened.datasets, opened.total)?,
+    };
+    Ok((sensor, time_unit))
+}
+
+/// Infers the sensor (`max coordinate + 1`) from the first and last [`BLOCK`] events.
+/// A full scan of `x`/`y` is slow on a multi-GB LZF file, and an active sensor exercises
+/// every row/column within the first/last second, so head+tail matches the true
+/// resolution in practice; for files up to `2 * BLOCK` events it covers everything
+/// exactly. Pass `sensor_size` if a border pixel is silent at both ends of the recording.
+fn infer_sensor_size(datasets: &[Dataset; 4], total: usize) -> Result<(usize, usize), IoError> {
+    if total == 0 {
+        return Ok((1, 1));
+    }
+    let [x, y, ..] = datasets;
+    let head = 0..BLOCK.min(total);
+    let tail = total.saturating_sub(BLOCK)..total;
+    let max_x = column_max(x, head.clone())?.max(column_max(x, tail.clone())?);
+    let max_y = column_max(y, head)?.max(column_max(y, tail)?);
+    Ok((max_x + 1, max_y + 1))
+}
+
+/// Largest value in `range` of a coordinate column, reading the dataset's *native*
+/// small-int type (no widening to `i64`).
+fn column_max(dataset: &Dataset, range: Range<usize>) -> Result<usize, IoError> {
+    let descriptor = dataset
+        .dtype()
+        .and_then(|dtype| dtype.to_descriptor())
+        .map_err(map_hdf5_error)?;
+    let max = match descriptor {
+        TypeDescriptor::Unsigned(IntSize::U1) => read_block::<u8>(dataset, range)?
+            .iter()
+            .map(|&v| usize::from(v))
+            .max(),
+        TypeDescriptor::Unsigned(IntSize::U2) => read_block::<u16>(dataset, range)?
+            .iter()
+            .map(|&v| usize::from(v))
+            .max(),
+        TypeDescriptor::Unsigned(IntSize::U4) => read_block::<u32>(dataset, range)?
+            .iter()
+            .map(|&v| v as usize)
+            .max(),
+        _ => read_integers(dataset, range)?
+            .iter()
+            .map(|&v| v.max(0) as usize)
+            .max(),
+    };
+    Ok(max.unwrap_or(0))
 }
 
 /// Block-reads the `[x, y, t, p]` datasets over `range`, converting timestamps to
@@ -117,35 +178,37 @@ pub struct Hdf5SliceSource {
     span: (i64, i64),
 }
 
-/// Opens an HDF5 file for lazy slicing, reading just the first/last timestamps for the
-/// time span and sampling the column to confirm it is time-ordered.
+/// Opens an HDF5 file for lazy slicing: confirms the timestamps are time-ordered,
+/// resolves the sensor size and time unit (inferring whichever was left unset), and
+/// reads the first/last timestamps for the time span.
 pub fn open_hdf5_slice(
     path: impl AsRef<Path>,
     options: &LoadOptions,
 ) -> Result<Hdf5SliceSource, IoError> {
+    let opened = open_validated(path.as_ref())?;
+    assert_sorted(&opened.datasets[2], opened.total)?;
+    let ((width, height), time_unit) = resolve_params(&opened, options)?;
+    let span = if opened.total == 0 {
+        (0, 0)
+    } else {
+        let first = read_integers(&opened.datasets[2], 0..1)?[0];
+        let last = read_integers(&opened.datasets[2], opened.total - 1..opened.total)?[0];
+        (
+            time_unit.microseconds_from_int(first),
+            time_unit.microseconds_from_int(last),
+        )
+    };
     let OpenedFile {
-        sensor: (width, height),
         file,
         datasets,
         total,
-    } = open_validated(path.as_ref(), options)?;
-    assert_sorted(&datasets[2], total)?;
-    let span = if total == 0 {
-        (0, 0)
-    } else {
-        let first = read_integers(&datasets[2], 0..1)?[0];
-        let last = read_integers(&datasets[2], total - 1..total)?[0];
-        (
-            options.time_unit.microseconds_from_int(first),
-            options.time_unit.microseconds_from_int(last),
-        )
-    };
+    } = opened;
     Ok(Hdf5SliceSource {
         _file: file,
         datasets,
         width,
         height,
-        time_unit: options.time_unit,
+        time_unit,
         total,
         span,
     })
@@ -374,7 +437,7 @@ mod tests {
     fn options(width: usize, height: usize, time_unit: TimeUnit) -> LoadOptions {
         LoadOptions {
             sensor_size: Some((width, height)),
-            time_unit,
+            time_unit: Some(time_unit),
             ..LoadOptions::default()
         }
     }
@@ -451,9 +514,56 @@ mod tests {
     }
 
     #[test]
-    fn requires_sensor_size() {
+    fn missing_file_is_reported() {
         let error = read_hdf5("missing.h5", &LoadOptions::default()).unwrap_err();
-        assert!(matches!(error, IoError::Format(_)));
+        assert!(matches!(error, IoError::Io(_)));
+    }
+
+    #[test]
+    fn infers_sensor_size_and_time_unit_when_unset() {
+        // Realistic magnitudes: x,y up to 5 -> 6x6; t span 5e6 (5 s) -> microseconds.
+        let dir = std::env::temp_dir().join(format!("eventcv-h5infer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.h5");
+        {
+            let file = File::create(&path).unwrap();
+            file.new_dataset_builder()
+                .with_data(&[0u64, 1, 2, 3, 4, 5][..])
+                .create("x")
+                .unwrap();
+            file.new_dataset_builder()
+                .with_data(&[0u64, 1, 2, 3, 4, 5][..])
+                .create("y")
+                .unwrap();
+            file.new_dataset_builder()
+                .with_data(
+                    &[
+                        1_000_000u64,
+                        2_000_000,
+                        3_000_000,
+                        4_000_000,
+                        5_000_000,
+                        6_000_000,
+                    ][..],
+                )
+                .create("t")
+                .unwrap();
+            file.new_dataset_builder()
+                .with_data(&[true, false, true, false, true, false][..])
+                .create("p")
+                .unwrap();
+        }
+
+        let stream = read_hdf5(&path, &LoadOptions::default()).unwrap();
+
+        assert_eq!(stream.sensor_size(), (6, 6)); // max coord 5 -> 6, nothing dropped
+        assert_eq!(stream.len(), 6);
+        // span 5e6 -> microseconds (µs leaves the values unchanged)
+        assert_eq!(
+            stream.ts(),
+            &[1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Writes six in-bounds events with strictly increasing microsecond timestamps

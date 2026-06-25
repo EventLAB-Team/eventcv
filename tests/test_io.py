@@ -72,9 +72,17 @@ class TextLoadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "line 2"):
             eventcv.load(path, sensor_size=(4, 4))
 
-    def test_text_requires_sensor_size(self):
-        with self.assertRaisesRegex(ValueError, "sensor_size"):
-            eventcv.load("recording.txt")
+    def test_infers_sensor_size_and_time_unit(self):
+        # Integer µs (span 5 s -> microseconds); coords up to (3, 2) -> 4x3.
+        path = self._write("1000000 0 0 1\n3000000 3 1 0\n6000000 1 2 1\n")
+        stream = eventcv.load(path)  # no sensor_size, no time_unit -> both inferred
+        self.assertEqual(stream.sensor_size, (4, 3))
+        np.testing.assert_array_equal(stream.numpy()[:, 2], [1000000, 3000000, 6000000])
+
+    def test_fractional_text_infers_seconds(self):
+        path = self._write("0.0 0 0 1\n0.5 1 1 0\n")
+        stream = eventcv.load(path, sensor_size=(8, 8))  # unit inferred from the decimal
+        np.testing.assert_array_equal(stream.numpy()[:, 2], [0, 500000])  # 0.5 s -> µs
 
     def test_invalid_time_unit(self):
         path = self._write("0.0 0 0 1\n")
@@ -102,10 +110,14 @@ class DispatchTests(unittest.TestCase):
             eventcv.load("recording.mp4")
 
     def test_hdf5_extension_recognised(self):
-        # Either dispatched (needs sensor_size) or reported as not built in — both
-        # are ValueErrors that mention HDF5.
-        with self.assertRaisesRegex(ValueError, "HDF5"):
-            eventcv.load("recording.h5")
+        # `.h5` is recognised: with the feature a missing file reaches the reader
+        # (FileNotFoundError); without it, a ValueError that mentions HDF5.
+        if _hdf5_supported():
+            with self.assertRaises(FileNotFoundError):
+                eventcv.load("recording.h5")
+        else:
+            with self.assertRaisesRegex(ValueError, "HDF5"):
+                eventcv.load("recording.h5")
 
 
 @unittest.skipUnless(_hdf5_supported() and h5py is not None, "built without hdf5 feature")
@@ -149,11 +161,19 @@ class Hdf5Tests(unittest.TestCase):
         stream = eventcv.load(path, sensor_size=(8, 8), time_unit="ns", max_events=2)
         self.assertEqual(len(stream), 2)
 
-    def test_requires_sensor_size(self):
+    def test_infers_sensor_size_and_time_unit(self):
         path = str(Path(tempfile.mkdtemp()) / "events.h5")
-        self._write_lzf(path)
-        with self.assertRaisesRegex(ValueError, "sensor_size"):
-            eventcv.load(path, time_unit="ns")
+        with h5py.File(path, "w") as handle:
+            group = handle.create_group("events")
+            group["x"] = np.array([0, 10, 345], dtype=np.uint16)
+            group["y"] = np.array([0, 5, 259], dtype=np.uint16)
+            # nanoseconds spanning 2 s -> inferred as ns (a sub-second span is ambiguous).
+            group["t"] = np.array([0, 1_000_000_000, 2_000_000_000], dtype=np.uint64)
+            group["p"] = np.array([1, 0, 1], dtype=bool)
+
+        stream = eventcv.load(path)  # no sensor_size, no time_unit -> both inferred
+        self.assertEqual(stream.sensor_size, (346, 260))  # max (345, 259) -> +1
+        np.testing.assert_array_equal(stream.numpy()[:, 2], [0, 1_000_000, 2_000_000])  # ns -> µs
 
     def test_open_slices_hdf5_in_place(self):
         path = str(Path(tempfile.mkdtemp()) / "events.h5")

@@ -303,18 +303,20 @@ fn parse_sensor_size(sensor_size: Option<(i64, i64)>) -> PyResult<Option<(usize,
         .transpose()
 }
 
-fn parse_time_unit(time_unit: &str) -> PyResult<TimeUnit> {
-    Ok(match time_unit {
-        "seconds" | "s" => TimeUnit::Seconds,
-        "milliseconds" | "ms" => TimeUnit::Milliseconds,
-        "microseconds" | "us" => TimeUnit::Microseconds,
-        "nanoseconds" | "ns" => TimeUnit::Nanoseconds,
-        other => {
+/// `None` or `"auto"` means infer the unit from the data; anything else is explicit.
+fn parse_time_unit(time_unit: Option<&str>) -> PyResult<Option<TimeUnit>> {
+    Ok(Some(match time_unit {
+        None | Some("auto") => return Ok(None),
+        Some("seconds") | Some("s") => TimeUnit::Seconds,
+        Some("milliseconds") | Some("ms") => TimeUnit::Milliseconds,
+        Some("microseconds") | Some("us") => TimeUnit::Microseconds,
+        Some("nanoseconds") | Some("ns") => TimeUnit::Nanoseconds,
+        Some(other) => {
             return Err(PyValueError::new_err(format!(
                 "unsupported time_unit: {other}"
             )))
         }
-    })
+    }))
 }
 
 fn parse_order(order: &str) -> PyResult<ColumnOrder> {
@@ -334,12 +336,12 @@ fn us_to_ms(us: i64) -> f64 {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, sensor_size=None, time_unit="seconds", order="txyp", topic=None, max_events=None))]
+#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None))]
 fn load(
     py: Python<'_>,
     path: &str,
     sensor_size: Option<(i64, i64)>,
-    time_unit: &str,
+    time_unit: Option<&str>,
     order: &str,
     topic: Option<String>,
     max_events: Option<i64>,
@@ -382,13 +384,13 @@ fn slice_total(n_events: usize, span: (i64, i64), dt: i64) -> usize {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, sensor_size=None, time_unit="seconds", order="txyp", topic=None))]
+#[pyo3(signature = (path, *, dt_ms=None, sensor_size=None, time_unit=None, order="txyp", topic=None))]
 fn open(
     py: Python<'_>,
     path: &str,
     dt_ms: Option<f64>,
     sensor_size: Option<(i64, i64)>,
-    time_unit: &str,
+    time_unit: Option<&str>,
     order: &str,
     topic: Option<String>,
 ) -> PyResult<PyEventReader> {

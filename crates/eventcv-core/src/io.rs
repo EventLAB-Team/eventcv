@@ -55,30 +55,21 @@ pub fn read_capped(
 
 /// Options for the unified [`load`] entry point. Most fields apply to a single
 /// format; readers ignore the ones they do not need.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
-    /// `(width, height)`. Required for text files; an optional override elsewhere.
+    /// `(width, height)`. `None` infers it from the data (coordinate range), or from the
+    /// message for rosbag. An explicit value overrides and, for HDF5, skips the scan.
     pub sensor_size: Option<(usize, usize)>,
-    /// Text timestamp unit.
-    pub time_unit: TimeUnit,
+    /// Timestamp unit. `None` infers it (HDF5/text): a fractional text value means
+    /// seconds, otherwise the unit is chosen from the recording span (see
+    /// [`TimeUnit::infer_from_span`]). Ignored for rosbag (always ROS `sec`+`nsec`).
+    pub time_unit: Option<TimeUnit>,
     /// Text column order.
     pub order: ColumnOrder,
     /// Rosbag topic to read (defaults to `/davis/left/events`).
     pub topic: Option<String>,
     /// Cap on the number of events to read.
     pub max_events: Option<usize>,
-}
-
-impl Default for LoadOptions {
-    fn default() -> Self {
-        Self {
-            sensor_size: None,
-            time_unit: TimeUnit::Seconds,
-            order: ColumnOrder::Txyp,
-            topic: None,
-            max_events: None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,18 +109,7 @@ pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream,
     let path = path.as_ref();
     match detect_format(path)? {
         Format::Npz => npz::read_npz(path, options.sensor_size),
-        Format::Text => {
-            let (width, height) = options.sensor_size.ok_or_else(|| {
-                IoError::Format("text files require sensor_size = (width, height)".to_owned())
-            })?;
-            let text_options = TextOptions {
-                width,
-                height,
-                time_unit: options.time_unit,
-                order: options.order,
-            };
-            read_capped(text::open(path, text_options)?, options.max_events)
-        }
+        Format::Text => text::load_text(path, &options),
         Format::Rosbag => bag::read_bag(path, &options),
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
@@ -306,11 +286,11 @@ mod tests {
 
     #[test]
     fn hdf5_extension_dispatches_per_feature() {
-        // `.h5` is always recognised; with the feature it reaches the reader (which
-        // needs sensor_size), without it the dispatch reports missing support.
+        // `.h5` is always recognised; with the feature it reaches the reader (a missing
+        // file is then an IO error), without it the dispatch reports missing support.
         let error = load("recording.h5", LoadOptions::default()).unwrap_err();
         #[cfg(feature = "hdf5")]
-        assert!(matches!(error, IoError::Format(_)));
+        assert!(matches!(error, IoError::Io(_)));
         #[cfg(not(feature = "hdf5"))]
         match error {
             IoError::Unsupported(message) => assert!(message.contains("HDF5")),
@@ -319,12 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn text_without_sensor_size_is_rejected() {
+    fn text_missing_file_is_reported() {
+        // Text no longer requires sensor_size (it infers); a missing file is an IO error.
         let error = load("events.txt", LoadOptions::default()).unwrap_err();
-        match error {
-            IoError::Format(message) => assert!(message.contains("sensor_size")),
-            other => panic!("expected format error, got {other:?}"),
-        }
+        assert!(matches!(error, IoError::Io(_)));
     }
 
     fn sample_source() -> MemorySliceSource {

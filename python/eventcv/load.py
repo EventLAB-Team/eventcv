@@ -13,7 +13,7 @@ def load(
     path: str,
     *,
     sensor_size: tuple[int, int] | None = None,
-    time_unit: str = "seconds",
+    time_unit: str | None = None,
     order: str = "txyp",
     topic: str | None = None,
     max_events: int | None = None,
@@ -21,13 +21,16 @@ def load(
     """Load events from any supported file, detected by its extension.
 
     Supported today: ``.npz`` (N-ImageNet), ``.txt``/``.csv`` (e.g. EV-IMO
-    ``t x y p``), and ``.bag`` (ROS ``dvs_msgs/EventArray``).
+    ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), and ``.hdf5``/``.h5``.
 
-    ``sensor_size`` is ``(width, height)`` and is required for text files.
-    ``time_unit`` (``seconds``/``milliseconds``/``microseconds``/``nanoseconds``)
-    and ``order`` (``txyp``/``xytp``) apply to text files. ``topic`` selects the
-    rosbag topic (default ``/davis/left/events``). ``max_events`` caps how many
-    events are read, which is handy for previewing very large files.
+    ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted and only act
+    as overrides: rosbags carry both in the message; HDF5/text infer the time unit
+    from the timestamps (a fractional text value means seconds) and the resolution
+    from the coordinate range. Passing ``sensor_size`` for HDF5 also skips that scan.
+    ``time_unit`` is ``seconds``/``milliseconds``/``microseconds``/``nanoseconds`` (or
+    ``auto``); ``order`` (``txyp``/``xytp``) applies to text. ``topic`` selects the
+    rosbag topic (default ``/davis/left/events``). ``max_events`` caps how many events
+    are read, handy for previewing very large files.
     """
     return _rust.load(
         path,
@@ -44,7 +47,7 @@ def open(
     *,
     dt_ms: float | None = None,
     sensor_size: tuple[int, int] | None = None,
-    time_unit: str = "seconds",
+    time_unit: str | None = None,
     order: str = "txyp",
     topic: str | None = None,
 ) -> EventReader:
@@ -63,19 +66,20 @@ def open(
     never deal with absolute timestamps (which may be epoch-based). Without ``dt_ms``,
     slice by explicit time/count window instead.
 
-    ``sensor_size``/``time_unit``/``order``/``topic`` mean the same as in :func:`load`.
+    ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted (see
+    :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
+    ``sensor_size`` to skip the one-time coordinate scan resolution inference needs.
 
     Example::
 
-        r = eventcv.open("rec.hdf5", dt_ms=30, sensor_size=(346, 260), time_unit="ns")
-        r.n_slices                       # how many 30 ms frames
-        r.slice(50).mcts().view()        # the 50th 30 ms frame
-        for frame in r.windows():        # walk every frame (step defaults to dt_ms)
+        r = eventcv.open("rec.hdf5", dt_ms=30)   # resolution + time unit auto-detected
+        r.n_slices                               # how many 30 ms frames
+        r.slice(50).mcts().view()                # the 50th 30 ms frame
+        for frame in r.windows():                # walk every frame (step defaults to dt_ms)
             voxel = frame.voxel()
 
-        # Or slice by an explicit window when no dt_ms is set:
-        r2 = eventcv.open("rec.hdf5", sensor_size=(346, 260), time_unit="ns")
-        r2.slice(t0_ms=r2.time_span_ms[0] + 1000, t1_ms=r2.time_span_ms[0] + 1030)
+        # Pass sensor_size to skip the coordinate scan on a huge HDF5:
+        r2 = eventcv.open("rec.hdf5", dt_ms=30, sensor_size=(346, 260))
     """
     return _rust.open(
         path,
