@@ -1,3 +1,19 @@
-from .load import EventFrame, EventPointSet, EventStream, Polarity, load
+from .load import (
+    EventFrame,
+    EventPointSet,
+    EventReader,
+    EventStream,
+    Polarity,
+    load,
+    open,
+)
 
-__all__ = ["EventFrame", "EventPointSet", "EventStream", "Polarity", "load"]
+__all__ = [
+    "EventFrame",
+    "EventPointSet",
+    "EventReader",
+    "EventStream",
+    "Polarity",
+    "load",
+    "open",
+]

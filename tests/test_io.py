@@ -155,6 +155,112 @@ class Hdf5Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sensor_size"):
             eventcv.load(path, time_unit="ns")
 
+    def test_open_slices_hdf5_in_place(self):
+        path = str(Path(tempfile.mkdtemp()) / "events.h5")
+        self._write_lzf(path)  # t = [1, 2, 3, 4, 5] ms; sensor (8, 8) keeps all 5
+
+        reader = eventcv.open(path, sensor_size=(8, 8), time_unit="ns")
+        self.assertIsInstance(reader, eventcv.EventReader)
+        self.assertEqual(reader.n_events, 5)
+        self.assertEqual(len(reader), 5)
+        self.assertEqual(reader.sensor_size, (8, 8))
+        self.assertAlmostEqual(reader.duration_ms, 4.0)  # (5000 - 1000) us
+
+        # Half-open [2 ms, 4 ms) -> timestamps 2000, 3000 us.
+        window = reader.slice(t0_ms=2.0, t1_ms=4.0).numpy()
+        np.testing.assert_array_equal(window[:, 2], [2000, 3000])
+
+        # slice_count matches the matching rows of a full eager load.
+        full = eventcv.load(path, sensor_size=(8, 8), time_unit="ns").numpy()
+        np.testing.assert_array_equal(reader.slice_count(1, 4).numpy(), full[1:4])
+
+        # No-arg slice returns the whole stream; windows tile it without overlap.
+        np.testing.assert_array_equal(reader.slice().numpy(), full)
+        self.assertEqual(sum(len(w) for w in reader.windows(step_ms=1.0)), reader.n_events)
+
+    def test_indexed_frames_hdf5(self):
+        path = str(Path(tempfile.mkdtemp()) / "events.h5")
+        self._write_lzf(path)  # t = [1, 2, 3, 4, 5] ms; sensor (8, 8) keeps all 5
+
+        e = eventcv.open(path, dt_ms=1.0, sensor_size=(8, 8), time_unit="ns")
+        self.assertEqual(e.n_slices, 5)
+        np.testing.assert_array_equal(e.slice(0).numpy()[:, 2], [1000])  # us
+        np.testing.assert_array_equal(e[4].numpy()[:, 2], [5000])
+        self.assertEqual(sum(len(e.slice(n)) for n in range(e.n_slices)), e.n_events)
+
+
+class OpenReaderTests(unittest.TestCase):
+    """`open()` works on every format via the in-memory fallback (here: text)."""
+
+    def _reader(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        return eventcv.open(str(path), sensor_size=(8, 8), time_unit="us")
+
+    def _frames(self):
+        # dt_ms = 0.01 ms = 10 us -> events at t = 0, 10, 20, 30 us land in frames 0..3.
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        return eventcv.open(str(path), dt_ms=0.01, sensor_size=(8, 8), time_unit="us")
+
+    def test_reports_metadata(self):
+        reader = self._reader()
+        self.assertEqual(reader.n_events, 4)
+        self.assertEqual(reader.sensor_size, (8, 8))
+        self.assertEqual(reader.time_span_ms, (0.0, 0.03))
+        self.assertAlmostEqual(reader.duration_ms, 0.03)
+
+    def test_slice_by_time_and_count(self):
+        reader = self._reader()
+        np.testing.assert_array_equal(reader.slice(t0_ms=0.01, t1_ms=0.03).numpy()[:, 2], [10, 20])
+        np.testing.assert_array_equal(reader.slice_count(1, 3).numpy()[:, 2], [10, 20])
+        self.assertEqual(len(reader.slice()), 4)  # no bounds -> whole stream
+
+    def test_windows_are_lazy_and_tile(self):
+        reader = self._reader()
+        windows = list(reader.windows(step_ms=0.01))
+        self.assertEqual(len(windows), 4)
+        self.assertTrue(all(isinstance(w, eventcv.EventStream) for w in windows))
+        self.assertEqual(sum(len(w) for w in windows), reader.n_events)
+
+    def test_rejects_non_positive_step(self):
+        with self.assertRaises(ValueError):
+            self._reader().windows(step_ms=0.0)
+
+    def test_indexed_frames(self):
+        e = self._frames()
+        self.assertEqual(e.dt_ms, 0.01)
+        self.assertEqual(e.n_slices, 4)
+        for n in range(e.n_slices):  # frame n holds the event at t = n*10 us
+            np.testing.assert_array_equal(e.slice(n).numpy()[:, 2], [n * 10])
+        np.testing.assert_array_equal(e[2].numpy()[:, 2], [20])  # __getitem__ alias
+        np.testing.assert_array_equal(e.slice(-1).numpy()[:, 2], [30])  # negative index
+        self.assertEqual(sum(len(e.slice(n)) for n in range(e.n_slices)), e.n_events)
+
+    def test_windows_default_to_dt(self):
+        e = self._frames()
+        self.assertEqual(sum(len(w) for w in e.windows()), e.n_events)
+
+    def test_index_out_of_range_raises(self):
+        e = self._frames()
+        with self.assertRaises(IndexError):
+            e.slice(e.n_slices)
+        with self.assertRaises(IndexError):
+            e.slice(-e.n_slices - 1)
+
+    def test_integer_index_requires_dt(self):
+        r = self._reader()  # opened without dt_ms
+        with self.assertRaisesRegex(ValueError, "dt_ms"):
+            r.slice(0)
+        with self.assertRaisesRegex(ValueError, "dt_ms"):
+            _ = r.n_slices
+        with self.assertRaisesRegex(ValueError, "dt_ms"):
+            r.windows()  # no step_ms and no dt_ms
+
+    def test_index_and_time_bounds_are_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "not both"):
+            self._frames().slice(0, t1_ms=5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

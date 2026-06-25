@@ -42,7 +42,7 @@ class LoadTests(unittest.TestCase):
         self.assertIsInstance(frame, eventcv.EventFrame)
         self.assertEqual(frame.shape, (2, 480, 640))
         self.assertEqual(frame.channel_names, ("positive", "negative"))
-        self.assertEqual(events.dtype, np.uint16)
+        self.assertEqual(events.dtype, np.uint64)
         self.assertEqual(events.shape, frame.shape)
         self.assertEqual(events.sum(), len(stream))
 
@@ -194,7 +194,7 @@ class LoadTests(unittest.TestCase):
 
         events = frame.resize(800, 600).numpy()
 
-        self.assertEqual(events.dtype, np.uint16)
+        self.assertEqual(events.dtype, np.uint64)
         self.assertEqual(events.shape, (2, 600, 800))
 
     def test_rejects_invalid_resize_arguments(self):

@@ -1,5 +1,5 @@
 <h1 align="center">
-<img src="assets/logo.svg" width="400">
+<img src="assets/logo.svg" width="200">
 </h1><br>
 
 # EventCV: Open source event-based computer vision library

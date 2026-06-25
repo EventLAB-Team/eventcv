@@ -25,23 +25,20 @@ impl Representation for Polarity {
     fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
         let (width, height, frame_len) = frame_len(stream, 2)?;
         let plane_len = width * height;
-        let mut counts = vec![0_u16; frame_len];
+        // Counts are accumulated as `u64`: a hot pixel on a multi-second recording (or a
+        // busy slice of one) easily exceeds `u16` — see TASKS.md known issues.
+        let mut counts = vec![0_u64; frame_len];
 
         for event in stream.iter() {
             let index = event_index(event, width, height)?;
             let channel_offset = if event.polarity { 0 } else { plane_len };
-            counts[channel_offset + index] = counts[channel_offset + index].checked_add(1).ok_or(
-                RepresentationError::CountOverflow {
-                    x: event.x,
-                    y: event.y,
-                },
-            )?;
+            counts[channel_offset + index] += 1;
         }
 
         let data = if self.normalize {
             EventFrameData::U8(normalize_u8(counts))
         } else {
-            EventFrameData::U16(counts)
+            EventFrameData::U64(counts)
         };
 
         Ok(EventFrame {
@@ -55,7 +52,7 @@ impl Representation for Polarity {
     }
 }
 
-fn normalize_u8(counts: Vec<u16>) -> Vec<u8> {
+fn normalize_u8(counts: Vec<u64>) -> Vec<u8> {
     let maximum = counts.iter().copied().max().unwrap_or(0);
     if maximum == 0 {
         return vec![0; counts.len()];
@@ -64,8 +61,8 @@ fn normalize_u8(counts: Vec<u16>) -> Vec<u8> {
     counts
         .into_iter()
         .map(|count| {
-            let scaled = u32::from(count) * u32::from(u8::MAX);
-            ((scaled + u32::from(maximum) / 2) / u32::from(maximum)) as u8
+            let scaled = count * u64::from(u8::MAX);
+            ((scaled + maximum / 2) / maximum) as u8
         })
         .collect()
 }
@@ -89,7 +86,7 @@ mod tests {
         let raw = Polarity::default().generate(&stream).unwrap();
         let normalized = Polarity::new(true).generate(&stream).unwrap();
 
-        assert_eq!(raw.data(), &EventFrameData::U16(vec![2, 0, 0, 1]));
+        assert_eq!(raw.data(), &EventFrameData::U64(vec![2, 0, 0, 1]));
         assert_eq!(normalized.data(), &EventFrameData::U8(vec![255, 0, 0, 128]));
     }
 
@@ -106,8 +103,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_counts_that_exceed_uint16() {
-        let event_count = usize::from(u16::MAX) + 1;
+    fn counts_above_uint16_are_preserved() {
+        let event_count = usize::from(u16::MAX) + 1; // 65536 — would overflow a u16 counter
         let stream = EventStream::from_array2(
             ndarray::Array2::from_shape_fn((event_count, 4), |(index, column)| match column {
                 2 => index as u64,
@@ -119,11 +116,11 @@ mod tests {
             0.001,
         );
 
-        let error = Polarity::default().generate(&stream).unwrap_err();
+        let raw = Polarity::default().generate(&stream).unwrap();
 
         assert_eq!(
-            error.to_string(),
-            "event count at (0, 0) exceeds uint16 capacity"
+            raw.data(),
+            &EventFrameData::U64(vec![event_count as u64, 0])
         );
     }
 }
