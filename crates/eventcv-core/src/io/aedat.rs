@@ -5,7 +5,9 @@
 //!
 //! DAVIS address layout (verified against a real DAVIS346 recording): a record is a DVS
 //! event when bit 31 (APS/ADC sample) and bit 10 (IMU/type) are both clear; then
-//! `y = bits 22..30 (9b)`, `x = bits 12..21 (10b)`, `polarity = bit 11`.
+//! `y = bits 22..30 (9b)`, `x = bits 12..21 (10b)`, `polarity = bit 11`. jAER's y origin is
+//! the bottom-left, so we flip rows (`y = height-1 - y`) to the top-left image convention
+//! the other readers use — otherwise frames render upside down.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind};
@@ -102,9 +104,14 @@ impl<R: BufRead> EventSource for AedatSource<R> {
             if address & (APS_SAMPLE_FLAG | TYPE_FLAG) != 0 {
                 continue; // skip APS / IMU samples
             }
+            // jAER stores y with the origin at the bottom-left; flip to the top-left image
+            // convention the other readers use (out-of-range rows are left for the builder
+            // to drop). x is unchanged.
+            let y_raw = ((address >> 22) & 0x1FF) as usize;
+            let y = self.height.checked_sub(1 + y_raw).unwrap_or(self.height) as u16;
             return Ok(Some(RawEvent {
                 x: ((address >> 12) & 0x3FF) as u16,
-                y: ((address >> 22) & 0x1FF) as u16,
+                y,
                 t: i64::from(timestamp),
                 p: address & (1 << 11) != 0,
             }));
@@ -178,7 +185,7 @@ mod tests {
         assert_eq!(stream.sensor_size(), (346, 260)); // inferred from the Davis346 chip line
         assert_eq!(stream.len(), 2);
         assert_eq!(stream.xs(), &[100, 200]);
-        assert_eq!(stream.ys(), &[50, 10]);
+        assert_eq!(stream.ys(), &[209, 249]); // raw 50/10 flipped to top-left (259 - y)
         assert_eq!(stream.ts(), &[1_000, 1_005]);
         assert_eq!(stream.ps(), &[true, false]);
     }
@@ -203,6 +210,21 @@ mod tests {
         let stream = read(&data, &options).unwrap();
         assert_eq!(stream.len(), 1);
         assert_eq!(stream.xs(), &[1]);
+    }
+
+    #[test]
+    fn rows_are_flipped_to_the_top_left_image_convention() {
+        // Raw bottom row (y=0) maps to the top (height-1); raw top row maps to 0.
+        let data = file_with(&[
+            record(dvs_address(0, 0, true), 1),
+            record(dvs_address(1, 3, true), 2),
+        ]);
+        let options = LoadOptions {
+            sensor_size: Some((4, 4)),
+            ..LoadOptions::default()
+        };
+        let stream = read(&data, &options).unwrap();
+        assert_eq!(stream.ys(), &[3, 0]);
     }
 
     #[test]
