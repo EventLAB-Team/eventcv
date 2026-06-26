@@ -21,7 +21,8 @@ def load(
     """Load events from any supported file, detected by its extension.
 
     Supported today: ``.npz`` (N-ImageNet), ``.txt``/``.csv`` (e.g. EV-IMO
-    ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), and ``.hdf5``/``.h5``.
+    ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), ``.hdf5``/``.h5``,
+    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), and ``.dat`` (Prophesee CD events).
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted and only act
     as overrides: rosbags carry both in the message; HDF5/text infer the time unit

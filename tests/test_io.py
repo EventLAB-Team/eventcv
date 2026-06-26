@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +6,9 @@ from pathlib import Path
 import numpy as np
 
 import eventcv
+
+_MVSEC_BAG = "data/development/outdoor_day1_data.bag"
+_AEDAT2 = "data/development/+0+2+0_l_qry.aedat"
 
 try:
     import h5py
@@ -280,6 +284,72 @@ class OpenReaderTests(unittest.TestCase):
     def test_index_and_time_bounds_are_exclusive(self):
         with self.assertRaisesRegex(ValueError, "not both"):
             self._frames().slice(0, t1_ms=5.0)
+
+
+@unittest.skipUnless(os.path.exists(_MVSEC_BAG), "MVSEC bag fixture not present")
+class BagSliceTests(unittest.TestCase):
+    """In-place rosbag slicing via the chunk index (gated on the real 8.6 GB MVSEC bag)."""
+
+    def test_open_and_time_slice_in_place(self):
+        reader = eventcv.open(_MVSEC_BAG, dt_ms=30)
+        self.assertEqual(reader.sensor_size, (346, 260))
+        self.assertGreater(reader.n_slices, 0)
+
+        frame = reader.slice(reader.n_slices // 2)  # a mid-file frame, no full read
+        self.assertIsInstance(frame, eventcv.EventStream)
+        timestamps = frame.numpy()[:, 2]
+        if len(timestamps):
+            start = reader.time_span_ms[0]
+            lo = round((start + (reader.n_slices // 2) * 30) * 1000)
+            hi = round((start + (reader.n_slices // 2 + 1) * 30) * 1000)
+            self.assertTrue((timestamps >= lo).all() and (timestamps < hi).all())
+
+
+class PropheseeDatTests(unittest.TestCase):
+    """Synthetic Prophesee .dat round-trip (byte layout exercised without a real fixture)."""
+
+    def _write(self, events) -> str:
+        # Header (%-comment lines), then [event_type, event_size], then 8-byte LE records:
+        # uint32 timestamp, uint32 (x | y<<14 | p<<28).
+        import struct
+
+        path = Path(tempfile.mkdtemp()) / "events.dat"
+        with open(path, "wb") as handle:
+            handle.write(b"% Date 2024-01-01 00:00:00\n% Width 640\n% Height 480\n% Version 2\n")
+            handle.write(bytes([0x00, 0x08]))
+            for t, x, y, p in events:
+                handle.write(struct.pack("<II", t, (x & 0x3FFF) | ((y & 0x3FFF) << 14) | (p << 28)))
+        return str(path)
+
+    def test_round_trip(self):
+        events = [(100, 10, 20, 1), (105, 600, 400, 0), (110, 0, 0, 1)]
+        path = self._write(events)
+        stream = eventcv.load(path).numpy()
+
+        self.assertEqual(len(stream), 3)
+        np.testing.assert_array_equal(stream[:, 0], [10, 600, 0])
+        np.testing.assert_array_equal(stream[:, 1], [20, 400, 0])
+        np.testing.assert_array_equal(stream[:, 2], [100, 105, 110])
+        np.testing.assert_array_equal(stream[:, 3], [1, 0, 1])
+
+    def test_sensor_size_inferred_from_header(self):
+        reader = eventcv.open(self._write([(1, 1, 1, 1)]))
+        self.assertEqual(reader.sensor_size, (640, 480))
+
+
+@unittest.skipUnless(os.path.exists(_AEDAT2), "AEDAT 2.0 fixture not present")
+class Aedat2Tests(unittest.TestCase):
+    """AEDAT 2.0 reader on the real DAVIS346 recording (gated on the local fixture)."""
+
+    def test_decodes_dvs_events(self):
+        stream = eventcv.load(_AEDAT2, max_events=1_000_000)
+        events = stream.numpy()
+        self.assertEqual(stream.sensor_size, (346, 260))  # from the Davis346 chip header
+        self.assertEqual(len(events), 1_000_000)
+        self.assertTrue((events[:, 0] < 346).all())
+        self.assertTrue((events[:, 1] < 260).all())
+        self.assertTrue(set(np.unique(events[:, 3])).issubset({0, 1}))
+        self.assertTrue((np.diff(events[:, 2].astype(np.int64)) >= 0).all())  # µs, monotonic
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::str::{FromStr, SplitWhitespace};
 
-use super::{read_all, read_capped, EventSource, IoError, LoadOptions, RawEvent};
+use super::{read_all, read_capped, EventSource, IoError, LoadOptions, RawEvent, SliceSource};
 use crate::{EventStream, EventStreamBuilder};
 
 /// Unit of the timestamp column. Events are stored internally in microseconds, so
@@ -273,6 +273,41 @@ fn infer_time_unit(rows: &[RawRow]) -> TimeUnit {
     }
 }
 
+/// Parses one non-blank line into a [`RawRow`] (no unit conversion or bounds check).
+/// Shared by the buffered [`load_text`] and the [`TextSliceSource`] index scan.
+fn parse_raw_row(trimmed: &str, order: ColumnOrder, number: usize) -> Result<RawRow, IoError> {
+    let mut fields = trimmed.split_whitespace();
+    let mut next = |name: &str| {
+        fields.next().ok_or(IoError::Parse {
+            line: number,
+            message: format!("missing {name}"),
+        })
+    };
+    let (t, x, y, p) = match order {
+        ColumnOrder::Txyp => {
+            let t = next("t")?;
+            (t, next("x")?, next("y")?, next("p")?)
+        }
+        ColumnOrder::Xytp => {
+            let x = next("x")?;
+            let y = next("y")?;
+            (next("t")?, x, y, next("p")?)
+        }
+    };
+    let parse = |value: &str, field: &str| {
+        value.parse::<f64>().map_err(|_| IoError::Parse {
+            line: number,
+            message: format!("invalid {field}: {value:?}"),
+        })
+    };
+    Ok(RawRow {
+        x: parse(x, "x")? as u16,
+        y: parse(y, "y")? as u16,
+        t: parse(t, "t")?,
+        p: parse(p, "p")? > 0.0,
+    })
+}
+
 fn read_raw_rows(path: &Path, order: ColumnOrder) -> Result<Vec<RawRow>, IoError> {
     let reader = BufReader::new(File::open(path)?);
     let mut rows = Vec::new();
@@ -282,47 +317,230 @@ fn read_raw_rows(path: &Path, order: ColumnOrder) -> Result<Vec<RawRow>, IoError
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let number = index + 1;
-        let mut fields = trimmed.split_whitespace();
-        let mut next = |name: &str| {
-            fields.next().ok_or(IoError::Parse {
-                line: number,
-                message: format!("missing {name}"),
-            })
-        };
-        let (t, x, y, p) = match order {
-            ColumnOrder::Txyp => {
-                let t = next("t")?;
-                (t, next("x")?, next("y")?, next("p")?)
-            }
-            ColumnOrder::Xytp => {
-                let x = next("x")?;
-                let y = next("y")?;
-                (next("t")?, x, y, next("p")?)
-            }
-        };
-        let parse = |value: &str, field: &str| {
-            value.parse::<f64>().map_err(|_| IoError::Parse {
-                line: number,
-                message: format!("invalid {field}: {value:?}"),
-            })
-        };
-        rows.push(RawRow {
-            x: parse(x, "x")? as u16,
-            y: parse(y, "y")? as u16,
-            t: parse(t, "t")?,
-            p: parse(p, "p")? > 0.0,
-        });
+        rows.push(parse_raw_row(trimmed, order, index + 1)?);
     }
     Ok(rows)
+}
+
+/// Number of events between sparse index samples — a slice reads at most this many extra
+/// rows past a sample before reaching its window.
+const TEXT_INDEX_STRIDE: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct TextIndexEntry {
+    offset: u64,
+    count: usize,
+    t_us: i64,
+}
+
+/// In-place [`SliceSource`] for text files. Text isn't seekable by content, so `open`
+/// scans once to build a sparse `(byte offset, event count, timestamp)` index (one entry
+/// per [`TEXT_INDEX_STRIDE`] events); slices binary-search it, seek the file, and parse
+/// forward. Bounded memory; assumes events are time-ordered (errors otherwise).
+pub struct TextSliceSource {
+    path: PathBuf,
+    order: ColumnOrder,
+    time_unit: TimeUnit,
+    sensor: (usize, usize),
+    total: usize,
+    span_us: (i64, i64),
+    index: Vec<TextIndexEntry>,
+}
+
+/// Scans the file once to build a [`TextSliceSource`], inferring `sensor_size`/`time_unit`
+/// when unset exactly as [`load_text`] does, and dropping out-of-bounds events (when the
+/// size is explicit) so the index counts the same events `load` would keep.
+pub fn open_text_slice(
+    path: impl AsRef<Path>,
+    options: &LoadOptions,
+) -> Result<TextSliceSource, IoError> {
+    let path = path.as_ref();
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut buffer = String::new();
+    let mut offset = 0u64;
+    let mut line_no = 0usize;
+    let mut kept = 0usize;
+    let mut samples: Vec<(u64, usize, f64)> = Vec::new();
+    let (mut max_x, mut max_y) = (0u16, 0u16);
+    let (mut min_t, mut max_t) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut fractional = false;
+    let mut sorted = true;
+    let mut previous_t = f64::NEG_INFINITY;
+
+    loop {
+        buffer.clear();
+        let line_start = offset;
+        let bytes = reader.read_line(&mut buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        offset += bytes as u64;
+        line_no += 1;
+        let trimmed = buffer.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let row = parse_raw_row(trimmed, options.order, line_no)?;
+        if let Some((width, height)) = options.sensor_size {
+            if usize::from(row.x) >= width || usize::from(row.y) >= height {
+                continue; // matches the OOB drop a load with this size would do
+            }
+        }
+        if kept.is_multiple_of(TEXT_INDEX_STRIDE) {
+            samples.push((line_start, kept, row.t));
+        }
+        max_x = max_x.max(row.x);
+        max_y = max_y.max(row.y);
+        min_t = min_t.min(row.t);
+        max_t = max_t.max(row.t);
+        fractional |= row.t.fract() != 0.0;
+        sorted &= row.t >= previous_t;
+        previous_t = row.t;
+        kept += 1;
+    }
+
+    let sensor = options
+        .sensor_size
+        .unwrap_or((usize::from(max_x) + 1, usize::from(max_y) + 1));
+    if sensor.0 == 0 || sensor.1 == 0 {
+        return Err(IoError::InvalidSensorSize);
+    }
+    if !sorted {
+        return Err(IoError::Format(
+            "text timestamps are not sorted; in-place slicing requires time-ordered events"
+                .to_owned(),
+        ));
+    }
+    let time_unit = options.time_unit.unwrap_or_else(|| {
+        if fractional || !min_t.is_finite() {
+            TimeUnit::Seconds
+        } else {
+            TimeUnit::infer_from_span((max_t - min_t) as i64)
+        }
+    });
+
+    let index = samples
+        .into_iter()
+        .map(|(offset, count, t)| TextIndexEntry {
+            offset,
+            count,
+            t_us: time_unit.to_microseconds(t),
+        })
+        .collect();
+    let span_us = if kept == 0 {
+        (0, 0)
+    } else {
+        (
+            time_unit.to_microseconds(min_t),
+            time_unit.to_microseconds(max_t),
+        )
+    };
+    Ok(TextSliceSource {
+        path: path.to_path_buf(),
+        order: options.order,
+        time_unit,
+        sensor,
+        total: kept,
+        span_us,
+        index,
+    })
+}
+
+impl TextSliceSource {
+    /// Opens the file again seeked to `offset`, wrapped in a [`TextReader`] for parsing.
+    fn reader_at(&self, offset: u64) -> Result<TextReader<BufReader<File>>, IoError> {
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        TextReader::new(
+            BufReader::new(file),
+            TextOptions {
+                width: self.sensor.0,
+                height: self.sensor.1,
+                time_unit: self.time_unit,
+                order: self.order,
+            },
+        )
+    }
+
+    fn keeps(&self, x: u16, y: u16) -> bool {
+        usize::from(x) < self.sensor.0 && usize::from(y) < self.sensor.1
+    }
+}
+
+impl SliceSource for TextSliceSource {
+    fn sensor_size(&self) -> (usize, usize) {
+        self.sensor
+    }
+
+    fn timestamp_scale_ms(&self) -> f64 {
+        0.001
+    }
+
+    fn n_events(&self) -> usize {
+        self.total
+    }
+
+    fn time_span(&self) -> (i64, i64) {
+        self.span_us
+    }
+
+    fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError> {
+        let i0 = i0.min(self.total);
+        let i1 = i1.clamp(i0, self.total);
+        let mut builder = EventStreamBuilder::new(self.sensor.0, self.sensor.1, 0.001);
+        if i0 == i1 || self.index.is_empty() {
+            return Ok(builder.build());
+        }
+        // index[0].count == 0, so partition_point is >= 1 and the subtraction is safe.
+        let entry = self.index[self.index.partition_point(|e| e.count <= i0) - 1];
+        let mut reader = self.reader_at(entry.offset)?;
+        let mut index = entry.count;
+        while index < i1 {
+            let Some(event) = reader.next_event()? else {
+                break;
+            };
+            if !self.keeps(event.x, event.y) {
+                continue; // dropped, not counted — keeps indices aligned with `load`
+            }
+            if index >= i0 {
+                builder.push(event.x, event.y, event.t, event.p);
+            }
+            index += 1;
+        }
+        Ok(builder.build())
+    }
+
+    fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {
+        let mut builder = EventStreamBuilder::new(self.sensor.0, self.sensor.1, 0.001);
+        if self.index.is_empty() {
+            return Ok(builder.build());
+        }
+        // Start strictly before t0: when many events share t0 and span more than
+        // TEXT_INDEX_STRIDE, several index entries carry t_us == t0, so `<= t0` would
+        // seek past the earliest ones and drop them. `< t0` lands before them all.
+        let entry = self.index[self
+            .index
+            .partition_point(|e| e.t_us < t0)
+            .saturating_sub(1)];
+        let mut reader = self.reader_at(entry.offset)?;
+        while let Some(event) = reader.next_event()? {
+            if event.t >= t1 {
+                break; // events are time-ordered (checked at open)
+            }
+            if event.t >= t0 {
+                builder.push(event.x, event.y, event.t, event.p);
+            }
+        }
+        Ok(builder.build())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use super::{load_text, ColumnOrder, TextOptions, TextReader, TimeUnit};
-    use crate::io::{read_all, IoError, LoadOptions};
+    use super::{load_text, open_text_slice, ColumnOrder, TextOptions, TextReader, TimeUnit};
+    use crate::io::{read_all, IoError, LoadOptions, SliceSource};
     use crate::EventStream;
 
     fn read(data: &str, options: TextOptions) -> Result<EventStream, IoError> {
@@ -446,6 +664,92 @@ mod tests {
 
         assert_eq!(stream.sensor_size(), (4, 4));
         assert_eq!(stream.ts(), &[7]); // explicit µs, not inferred
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn text_slice_source_matches_load() {
+        // 10 events, integer µs t = 0..9000 at distinct pixels (x = 0..9, y = i % 5).
+        let mut data = String::new();
+        for i in 0..10 {
+            data.push_str(&format!("{} {} {} {}\n", i * 1000, i, i % 5, i % 2));
+        }
+        let path = write_temp("txtslice", &data);
+        // Explicit µs so the small integer timestamps aren't inferred as milliseconds.
+        let options = LoadOptions {
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let source = open_text_slice(&path, &options).unwrap();
+        let full = load_text(&path, &options).unwrap();
+
+        assert_eq!(source.n_events(), full.len());
+        assert_eq!(source.sensor_size(), full.sensor_size()); // (10, 5)
+        assert_eq!(source.time_span(), (0, 9000));
+
+        assert_eq!(
+            source.slice_time(2000, 6000).unwrap().ts(),
+            &[2000, 3000, 4000, 5000]
+        );
+        assert_eq!(
+            source.slice_index(3, 7).unwrap().ts(),
+            &[3000, 4000, 5000, 6000]
+        );
+
+        let whole = source.slice_index(0, source.n_events()).unwrap();
+        assert_eq!(whole.xs(), full.xs());
+        assert_eq!(whole.ts(), full.ts());
+        assert_eq!(whole.ps(), full.ps());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn text_slice_rejects_unsorted_timestamps() {
+        let path = write_temp("txtunsorted", "0 0 0 1\n5000 1 1 0\n2000 2 2 1\n");
+        match open_text_slice(&path, &LoadOptions::default()) {
+            Err(IoError::Format(message)) => assert!(message.contains("not sorted")),
+            Err(other) => panic!("expected a not-sorted error, got {other:?}"),
+            Ok(_) => panic!("expected unsorted text to be rejected"),
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn text_slice_keeps_same_timestamp_events_spanning_the_index_stride() {
+        // A single timestamp t = 1000 carries more events than TEXT_INDEX_STRIDE, so the
+        // sparse index holds several entries with t_us == 1000. slice_time(1000, ..) must
+        // seek *before* all of them and keep every event at t == 1000, not just the tail.
+        let dense = super::TEXT_INDEX_STRIDE * 2 + 100;
+        let mut data = String::from("0 0 0 1\n"); // one earlier event
+        for _ in 0..dense {
+            data.push_str("1000 1 1 1\n");
+        }
+        data.push_str("2000 2 2 0\n"); // one later event
+        let path = write_temp("txtdense", &data);
+        let options = LoadOptions {
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let source = open_text_slice(&path, &options).unwrap();
+
+        assert_eq!(source.slice_time(1000, 2000).unwrap().len(), dense);
+        // Full tiling must recover every event with no drops or duplicates.
+        let tiled = source.slice_time(0, 1000).unwrap().len()
+            + source.slice_time(1000, 2000).unwrap().len()
+            + source.slice_time(2000, 3000).unwrap().len();
+        assert_eq!(tiled, source.n_events());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn text_slice_empty_file() {
+        let path = write_temp("txtsliceempty", "\n# only a comment\n");
+        let source = open_text_slice(&path, &LoadOptions::default()).unwrap();
+
+        assert_eq!(source.n_events(), 0);
+        assert_eq!(source.time_span(), (0, 0));
+        assert!(source.slice_time(0, 1000).unwrap().is_empty());
+        assert!(source.slice_index(0, 10).unwrap().is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

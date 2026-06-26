@@ -2,17 +2,21 @@ use std::{error::Error, fmt, io, path::Path};
 
 use crate::{EventStream, EventStreamBuilder};
 
+mod aedat;
 mod bag;
 #[cfg(feature = "hdf5")]
 mod h5;
 mod npz;
+mod prophesee;
 mod text;
 
-pub use bag::read_bag;
+pub use aedat::read_aedat;
+pub use bag::{open_bag_slice, read_bag, BagSliceSource};
 #[cfg(feature = "hdf5")]
 pub use h5::{open_hdf5_slice, read_hdf5, Hdf5SliceSource};
 pub use npz::read_npz;
-pub use text::{read_text, ColumnOrder, TextOptions, TextReader, TimeUnit};
+pub use prophesee::read_dat;
+pub use text::{open_text_slice, read_text, ColumnOrder, TextOptions, TextReader, TimeUnit};
 
 /// A single event as produced by a reader, before it is placed on the sensor grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +82,10 @@ enum Format {
     Text,
     Hdf5,
     Rosbag,
+    Aedat,
     Aedat4,
-    Prophesee,
+    PropheseeDat,
+    PropheseeRaw,
 }
 
 fn detect_format(path: &Path) -> Result<Format, IoError> {
@@ -92,8 +98,10 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
         Some("txt") | Some("csv") => Ok(Format::Text),
         Some("h5") | Some("hdf5") => Ok(Format::Hdf5),
         Some("bag") => Ok(Format::Rosbag),
-        Some("aedat4") | Some("aedat") => Ok(Format::Aedat4),
-        Some("dat") | Some("raw") => Ok(Format::Prophesee),
+        Some("aedat") => Ok(Format::Aedat),
+        Some("aedat4") => Ok(Format::Aedat4),
+        Some("dat") => Ok(Format::PropheseeDat),
+        Some("raw") => Ok(Format::PropheseeRaw),
         Some(other) => Err(IoError::Unsupported(format!(
             "unrecognised file extension: .{other}"
         ))),
@@ -104,7 +112,8 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
 }
 
 /// Loads events from any supported file, detected by extension — the OpenCV-style
-/// single entry point. Supported today: `.npz`, `.txt`/`.csv`, `.bag`.
+/// single entry point. Supported today: `.npz`, `.txt`/`.csv`, `.bag`, `.h5`/`.hdf5`,
+/// `.aedat` (AEDAT 2.0), and `.dat` (Prophesee CD).
 pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream, IoError> {
     let path = path.as_ref();
     match detect_format(path)? {
@@ -123,11 +132,14 @@ pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream,
                 ))
             }
         }
+        Format::Aedat => aedat::read_aedat(path, &options),
         Format::Aedat4 => Err(IoError::Unsupported(
-            "AEDAT4 (.aedat4) reading is not implemented yet".to_owned(),
+            "AEDAT4 (.aedat4, iniVation DV FlatBuffer/LZ4) reading is not implemented yet"
+                .to_owned(),
         )),
-        Format::Prophesee => Err(IoError::Unsupported(
-            "Prophesee (.dat/.raw) reading is not implemented yet".to_owned(),
+        Format::PropheseeDat => prophesee::read_dat(path, &options),
+        Format::PropheseeRaw => Err(IoError::Unsupported(
+            "Prophesee .raw (EVT2/EVT3) reading is not implemented yet".to_owned(),
         )),
     }
 }
@@ -231,6 +243,8 @@ pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoEr
                 ))
             }
         }
+        Format::Text => Ok(Box::new(text::open_text_slice(path, &options)?)),
+        Format::Rosbag => Ok(Box::new(bag::open_bag_slice(path, &options)?)),
         _ => Ok(Box::new(MemorySliceSource::new(load(path, options)?))),
     }
 }
@@ -303,6 +317,30 @@ mod tests {
         // Text no longer requires sensor_size (it infers); a missing file is an IO error.
         let error = load("events.txt", LoadOptions::default()).unwrap_err();
         assert!(matches!(error, IoError::Io(_)));
+    }
+
+    #[test]
+    fn aedat_dispatches_to_the_reader() {
+        // `.aedat` reaches the AEDAT 2.0 reader, so a missing file is an IO error.
+        let error = load("recording.aedat", LoadOptions::default()).unwrap_err();
+        assert!(matches!(error, IoError::Io(_)));
+    }
+
+    #[test]
+    fn prophesee_dat_dispatches_to_the_reader() {
+        let error = load("recording.dat", LoadOptions::default()).unwrap_err();
+        assert!(matches!(error, IoError::Io(_)));
+    }
+
+    #[test]
+    fn aedat4_and_prophesee_raw_are_unsupported() {
+        // These extensions are recognised but their formats are not implemented yet.
+        for path in ["recording.aedat4", "recording.raw"] {
+            match load(path, LoadOptions::default()) {
+                Err(IoError::Unsupported(_)) => {}
+                other => panic!("expected unsupported for {path}, got {other:?}"),
+            }
+        }
     }
 
     fn sample_source() -> MemorySliceSource {
