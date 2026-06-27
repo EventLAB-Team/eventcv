@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -9,6 +11,16 @@ use crate::{EventStream, EventStreamBuilder};
 
 const DEFAULT_TOPIC: &str = "/davis/left/events";
 const EVENT_ARRAY_TYPE: &str = "dvs_msgs/EventArray";
+/// `dvs_msgs/EventArray` md5sum (32 lowercase hex). The reader matches on topic + type,
+/// not this value, but the rosbag parser requires a well-formed md5sum on every connection.
+const EVENT_ARRAY_MD5: &str = "5e8beee5759d85e9f5a8c1f5ad1cd00b";
+/// Message definition stored on the connection (informational; any non-empty text parses).
+const EVENT_ARRAY_DEF: &str =
+    "std_msgs/Header header\nuint32 height\nuint32 width\ndvs_msgs/Event[] events\n";
+/// Events per `dvs_msgs/EventArray` message — batches keep individual message buffers bounded.
+const MESSAGE_EVENTS: usize = 1_000_000;
+/// ROS bag 2.0 magic line.
+const BAG_MAGIC: &[u8] = b"#ROSBAG V2.0\n";
 
 /// Reads a ROS1 bag, decoding `dvs_msgs/EventArray` messages on a single topic
 /// (`options.topic`, default `/davis/left/events`). Sensor size comes from the
@@ -95,6 +107,221 @@ fn decode_event_array(
         }
     }
     Ok(false)
+}
+
+/// Writes a stream as a ROS1 bag containing one connection (`topic`, default
+/// `/davis/left/events`) and a single chunk of `dvs_msgs/EventArray` messages, round-tripping
+/// through [`read_bag`] and [`open_bag_slice`]. Events are batched into messages and the
+/// timestamps split into ROS `sec`/`nsec` (so microseconds are preserved exactly). The whole
+/// chunk is buffered, so very large streams use proportional memory.
+pub fn write_bag(
+    path: impl AsRef<Path>,
+    stream: &EventStream,
+    topic: Option<&str>,
+) -> Result<(), IoError> {
+    let topic = topic.unwrap_or(DEFAULT_TOPIC);
+    let conn_id: u32 = 0;
+    let ts = stream.ts();
+
+    // Build the chunk payload: one connection record, then the batched message records.
+    // `index_entries` records each message's (start time, byte offset within the payload).
+    let mut payload: Vec<u8> =
+        make_record(&connection_fields(conn_id, topic), &connection_data(topic));
+    let mut index_entries: Vec<(i64, u32)> = Vec::new();
+    let mut start = 0;
+    while start < stream.len() {
+        let end = (start + MESSAGE_EVENTS).min(stream.len());
+        let offset = payload.len() as u32;
+        let message = serialize_event_array(stream, start, end);
+        write_record(&mut payload, &message_fields(conn_id, ts[start]), &message)
+            .expect("writing to a Vec never fails");
+        index_entries.push((ts[start], offset));
+        start = end;
+    }
+    if stream.is_empty() {
+        // Emit one empty message so `read_bag` finds a connection + data and rebuilds an
+        // empty stream (with the correct sensor size from the message header).
+        let offset = payload.len() as u32;
+        let message = serialize_event_array(stream, 0, 0);
+        write_record(&mut payload, &message_fields(conn_id, 0), &message)
+            .expect("writing to a Vec never fails");
+        index_entries.push((0, offset));
+    }
+    let message_count = index_entries.len() as u32;
+    let (start_us, end_us) = match (ts.iter().min(), ts.iter().max()) {
+        (Some(&lo), Some(&hi)) => (lo, hi),
+        _ => (0, 0),
+    };
+
+    // The bag header has a fixed length (its fields are fixed-size), so the chunk position is
+    // known before the index position is, and the header can be built once index_pos is set.
+    let bag_header_len = make_record(&bag_header_fields(0, 1, 1), &[]).len();
+    let chunk_pos = BAG_MAGIC.len() + bag_header_len;
+    let chunk_fields = chunk_fields(payload.len() as u32);
+    let mut index_data: Vec<u8> = Vec::with_capacity(index_entries.len() * 12);
+    for (time_us, offset) in &index_entries {
+        index_data.extend_from_slice(&ros_time(*time_us));
+        index_data.extend_from_slice(&offset.to_le_bytes());
+    }
+    let index_record = make_record(&index_data_fields(conn_id, message_count), &index_data);
+    let index_pos = chunk_pos + record_len(&chunk_fields, payload.len()) + index_record.len();
+
+    let mut writer = BufWriter::new(File::create(path).map_err(IoError::Io)?);
+    writer.write_all(BAG_MAGIC).map_err(IoError::Io)?;
+    write_record(&mut writer, &bag_header_fields(index_pos as u64, 1, 1), &[])
+        .map_err(IoError::Io)?;
+    write_record(&mut writer, &chunk_fields, &payload).map_err(IoError::Io)?;
+    writer.write_all(&index_record).map_err(IoError::Io)?;
+    // Footer (read by `index_records`): the connection, then the chunk info.
+    write_record(
+        &mut writer,
+        &connection_fields(conn_id, topic),
+        &connection_data(topic),
+    )
+    .map_err(IoError::Io)?;
+    let chunk_info_data = {
+        let mut data = Vec::with_capacity(8);
+        data.extend_from_slice(&conn_id.to_le_bytes());
+        data.extend_from_slice(&message_count.to_le_bytes());
+        data
+    };
+    write_record(
+        &mut writer,
+        &chunk_info_fields(chunk_pos as u64, start_us, end_us),
+        &chunk_info_data,
+    )
+    .map_err(IoError::Io)?;
+    writer.flush().map_err(IoError::Io)
+}
+
+/// Splits a microsecond timestamp into the ROS `sec`/`nsec` pair (8 bytes, little-endian) the
+/// reader recombines into nanoseconds — exact for microsecond data. Negative times clamp to 0.
+fn ros_time(t_us: i64) -> [u8; 8] {
+    let t_us = t_us.max(0);
+    let seconds = (t_us / 1_000_000) as u32;
+    let nanoseconds = ((t_us % 1_000_000) * 1000) as u32;
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&seconds.to_le_bytes());
+    bytes[4..].copy_from_slice(&nanoseconds.to_le_bytes());
+    bytes
+}
+
+/// Serializes events `[start, end)` as a `dvs_msgs/EventArray` body matching [`decode_event_array`].
+fn serialize_event_array(stream: &EventStream, start: usize, end: usize) -> Vec<u8> {
+    let (width, height) = stream.sensor_size();
+    let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+    let stamp = ts.get(start).copied().unwrap_or(0);
+    let mut message = Vec::with_capacity(24 + (end - start) * 13);
+    message.extend_from_slice(&0u32.to_le_bytes()); // header.seq
+    message.extend_from_slice(&ros_time(stamp)); // header.stamp
+    message.extend_from_slice(&0u32.to_le_bytes()); // header.frame_id (empty string)
+    message.extend_from_slice(&(height as u32).to_le_bytes());
+    message.extend_from_slice(&(width as u32).to_le_bytes());
+    message.extend_from_slice(&((end - start) as u32).to_le_bytes());
+    for index in start..end {
+        message.extend_from_slice(&xs[index].to_le_bytes());
+        message.extend_from_slice(&ys[index].to_le_bytes());
+        message.extend_from_slice(&ros_time(ts[index]));
+        message.push(u8::from(ps[index]));
+    }
+    message
+}
+
+/// One `<len:u32><name=value>` record-header field.
+fn field(name: &str, value: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + name.len() + 1 + value.len());
+    let body_len = (name.len() + 1 + value.len()) as u32;
+    bytes.extend_from_slice(&body_len.to_le_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(b'=');
+    bytes.extend_from_slice(value);
+    bytes
+}
+
+/// Byte length of a record: `<header_len:u32><header><data_len:u32><data>`.
+fn record_len(fields: &[Vec<u8>], data_len: usize) -> usize {
+    4 + fields.iter().map(Vec::len).sum::<usize>() + 4 + data_len
+}
+
+/// Builds a complete record in memory (for the small records whose bytes/length are reused).
+fn make_record(fields: &[Vec<u8>], data: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(record_len(fields, data.len()));
+    write_record(&mut record, fields, data).expect("writing to a Vec never fails");
+    record
+}
+
+/// Streams one record to `writer` (used for the large chunk record to avoid copying the payload).
+fn write_record<W: Write>(writer: &mut W, fields: &[Vec<u8>], data: &[u8]) -> std::io::Result<()> {
+    let header_len: usize = fields.iter().map(Vec::len).sum();
+    writer.write_all(&(header_len as u32).to_le_bytes())?;
+    for field in fields {
+        writer.write_all(field)?;
+    }
+    writer.write_all(&(data.len() as u32).to_le_bytes())?;
+    writer.write_all(data)
+}
+
+fn bag_header_fields(index_pos: u64, conn_count: u32, chunk_count: u32) -> Vec<Vec<u8>> {
+    vec![
+        field("op", &[0x03]),
+        field("index_pos", &index_pos.to_le_bytes()),
+        field("conn_count", &conn_count.to_le_bytes()),
+        field("chunk_count", &chunk_count.to_le_bytes()),
+    ]
+}
+
+fn chunk_fields(uncompressed_size: u32) -> Vec<Vec<u8>> {
+    vec![
+        field("op", &[0x05]),
+        field("compression", b"none"),
+        field("size", &uncompressed_size.to_le_bytes()),
+    ]
+}
+
+fn connection_fields(conn_id: u32, topic: &str) -> Vec<Vec<u8>> {
+    vec![
+        field("op", &[0x07]),
+        field("conn", &conn_id.to_le_bytes()),
+        field("topic", topic.as_bytes()),
+    ]
+}
+
+fn connection_data(topic: &str) -> Vec<u8> {
+    let fields = [
+        field("topic", topic.as_bytes()),
+        field("type", EVENT_ARRAY_TYPE.as_bytes()),
+        field("md5sum", EVENT_ARRAY_MD5.as_bytes()),
+        field("message_definition", EVENT_ARRAY_DEF.as_bytes()),
+    ];
+    fields.concat()
+}
+
+fn message_fields(conn_id: u32, time_us: i64) -> Vec<Vec<u8>> {
+    vec![
+        field("op", &[0x02]),
+        field("conn", &conn_id.to_le_bytes()),
+        field("time", &ros_time(time_us)),
+    ]
+}
+
+fn index_data_fields(conn_id: u32, count: u32) -> Vec<Vec<u8>> {
+    vec![
+        field("op", &[0x04]),
+        field("ver", &1u32.to_le_bytes()),
+        field("conn", &conn_id.to_le_bytes()),
+        field("count", &count.to_le_bytes()),
+    ]
+}
+
+fn chunk_info_fields(chunk_pos: u64, start_us: i64, end_us: i64) -> Vec<Vec<u8>> {
+    vec![
+        field("op", &[0x06]),
+        field("ver", &1u32.to_le_bytes()),
+        field("chunk_pos", &chunk_pos.to_le_bytes()),
+        field("start_time", &ros_time(start_us)),
+        field("end_time", &ros_time(end_us)),
+        field("count", &1u32.to_le_bytes()),
+    ]
 }
 
 /// One chunk's byte offset and (microsecond) time range, copied out of the bag's index
@@ -384,7 +611,71 @@ impl<'a> ByteReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{locate_chunk, select_chunks, ChunkMeta};
+    use super::{locate_chunk, open_bag_slice, read_bag, select_chunks, write_bag, ChunkMeta};
+    use crate::io::{LoadOptions, SliceSource};
+    use crate::{EventStream, EventStreamBuilder};
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("eventcv_{tag}_{nanos}.bag"))
+    }
+
+    fn sample_stream() -> EventStream {
+        let mut builder = EventStreamBuilder::new(16, 12, 0.001);
+        for &(x, y, t, p) in &[
+            (0u16, 0u16, 5i64, true),
+            (3, 4, 1_000_001, false),
+            (15, 11, 2_500_000, true),
+            (7, 8, 2_500_000, false),
+        ] {
+            builder.push(x, y, t, p);
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn bag_round_trips_through_the_reader() {
+        let stream = sample_stream();
+        let path = temp_path("bag_rt");
+        write_bag(&path, &stream, None).unwrap();
+
+        let loaded = read_bag(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(loaded.sensor_size(), (16, 12));
+        assert_eq!(loaded.xs(), stream.xs());
+        assert_eq!(loaded.ys(), stream.ys());
+        assert_eq!(loaded.ts(), stream.ts()); // microseconds preserved exactly
+        assert_eq!(loaded.ps(), stream.ps());
+
+        // The lazy slicer reads the same file in place.
+        let reader = open_bag_slice(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(reader.sensor_size(), (16, 12));
+        assert_eq!(reader.n_events(), stream.len());
+        assert_eq!(reader.time_span(), (5, 2_500_000));
+        let window = reader.slice_time(1_000_000, 2_000_000).unwrap();
+        assert_eq!(window.ts(), &[1_000_001]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bag_round_trips_an_empty_stream() {
+        let stream = EventStreamBuilder::new(8, 6, 0.001).build();
+        let path = temp_path("bag_empty");
+        write_bag(&path, &stream, Some("/cam/events")).unwrap();
+
+        let options = LoadOptions {
+            topic: Some("/cam/events".to_owned()),
+            ..LoadOptions::default()
+        };
+        let loaded = read_bag(&path, &options).unwrap();
+        assert!(loaded.is_empty());
+        assert_eq!(loaded.sensor_size(), (8, 6));
+
+        std::fs::remove_file(&path).ok();
+    }
 
     fn meta(pos: u64, start_us: i64, end_us: i64) -> ChunkMeta {
         ChunkMeta {

@@ -45,6 +45,19 @@ impl RepresentationKind {
             Self::Voxel => "voxel",
         }
     }
+
+    /// The inverse of [`Self::as_str`] — recovers the kind tag stored by the frame writers.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "binary" => Self::Binary,
+            "mcts" => Self::Mcts,
+            "polarity" => Self::Polarity,
+            "tencode" => Self::Tencode,
+            "tsurf" => Self::TimeSurface,
+            "voxel" => Self::Voxel,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +79,25 @@ pub enum EventFrameData {
 }
 
 impl EventFrame {
+    /// Reassembles a frame from its stored parts — used by the IO frame readers. Channels
+    /// is `channel_names.len()`, and the data length must equal `channels * width * height`.
+    pub(crate) fn from_parts(
+        data: EventFrameData,
+        width: usize,
+        height: usize,
+        kind: RepresentationKind,
+        channel_names: Vec<String>,
+    ) -> Self {
+        Self {
+            data,
+            channels: channel_names.len(),
+            width,
+            height,
+            kind,
+            channel_names,
+        }
+    }
+
     pub fn data(&self) -> &EventFrameData {
         &self.data
     }
@@ -80,6 +112,18 @@ impl EventFrame {
 
     pub fn kind(&self) -> RepresentationKind {
         self.kind
+    }
+}
+
+impl EventFrameData {
+    /// Number of scalar elements (`channels * width * height` for a well-formed frame).
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::U8(values) => values.len(),
+            Self::U16(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::F32(values) => values.len(),
+        }
     }
 }
 

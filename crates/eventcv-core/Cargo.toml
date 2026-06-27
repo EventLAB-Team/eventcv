@@ -8,6 +8,9 @@ ndarray = "0.17"
 npyz = { version = "0.9", features = ["derive", "npz"] }
 rayon = "1.10"
 rosbag = "0.6.3"
+# Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.
+# Same major version npyz already pulls transitively; only `FileOptions` is named here.
+zip = { version = "0.6", default-features = false }
 # Optional: `.h5`/`.hdf5` reading. Builds libhdf5 from source (needs cmake) and
 # bundles the LZF filter used by event datasets. Enable with `--features hdf5`.
 hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-features = false, features = ["static", "lzf", "zlib"] }

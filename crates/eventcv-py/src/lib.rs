@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use eventcv_core::{
     camera::Camera,
     image::{PoolingMethod, ResizeError},
-    io::{open as open_reader, ColumnOrder, IoError, LoadOptions, Reader, TimeUnit},
+    io::{open as open_reader, ColumnOrder, IoError, LoadOptions, Reader, SaveOptions, TimeUnit},
     representation::{
         Binary, EventFrame, EventFrameData, EventPointSet, Mcts, PointSet, Polarity,
         Representation, RepresentationError, Tencode, TimeSurface, VoxelGrid,
@@ -52,6 +52,16 @@ impl PyEventStream {
 
     fn numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u64>> {
         self.inner.to_array2().into_pyarray(py)
+    }
+
+    /// Saves the stream to `path`, format chosen by extension (`.npz`/`.txt`/`.h5`/`.bag`) —
+    /// the counterpart of `eventcv.load`. npz/HDF5/rosbag round-trip exactly; `topic` names
+    /// the rosbag connection.
+    #[pyo3(signature = (path, *, topic=None))]
+    fn save(&self, py: Python<'_>, path: &str, topic: Option<String>) -> PyResult<()> {
+        let options = SaveOptions { topic };
+        py.detach(|| eventcv_core::io::save_stream(path, &self.inner, &options))
+            .map_err(map_io_error)
     }
 
     // ---- Event-domain transforms (Workstream B). Each returns a new EventStream so they
@@ -418,6 +428,13 @@ impl PyEventFrame {
                     .into_any()
             }
         }
+    }
+
+    /// Saves the frame (a computed representation) to `path` (`.npz` or `.h5`), preserving its
+    /// shape, dtype, `kind`, and `channel_names`. Reload with `eventcv.load_frame`.
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| eventcv_core::io::save_frame(path, &self.inner, &SaveOptions::default()))
+            .map_err(map_io_error)
     }
 
     /// Resize spatial dimensions using average or sum pooling on shrinking axes.
@@ -810,6 +827,79 @@ impl PyWindowIterator {
     }
 }
 
+/// Saves an `EventStream` or `EventFrame` to `path` (format by extension) — the OpenCV-style
+/// free-function form of `obj.save(path)`.
+#[pyfunction]
+#[pyo3(signature = (obj, path, *, topic=None))]
+fn save(py: Python<'_>, obj: &Bound<'_, PyAny>, path: &str, topic: Option<String>) -> PyResult<()> {
+    if let Ok(stream) = obj.extract::<PyRef<PyEventStream>>() {
+        let options = SaveOptions { topic };
+        let inner = &stream.inner; // capture a plain &EventStream, not the GIL-bound PyRef
+        return py
+            .detach(|| eventcv_core::io::save_stream(path, inner, &options))
+            .map_err(map_io_error);
+    }
+    if let Ok(frame) = obj.extract::<PyRef<PyEventFrame>>() {
+        let inner = &frame.inner;
+        return py
+            .detach(|| eventcv_core::io::save_frame(path, inner, &SaveOptions::default()))
+            .map_err(map_io_error);
+    }
+    Err(PyTypeError::new_err(
+        "save expects an EventStream or EventFrame",
+    ))
+}
+
+/// Reads an `EventFrame` previously written by `frame.save(...)` / `eventcv.save(...)`
+/// (`.npz` or `.h5`), restoring its dtype, `kind`, and `channel_names`.
+#[pyfunction]
+fn load_frame(py: Python<'_>, path: &str) -> PyResult<PyEventFrame> {
+    py.detach(|| eventcv_core::io::load_frame(path))
+        .map(|inner| PyEventFrame { inner })
+        .map_err(map_io_error)
+}
+
+/// Streams `EventFrame`s into one extendable `[N, C, H, W]` HDF5 dataset — for writing a
+/// representation window-by-window over a whole recording. The dtype and `[C, H, W]` shape
+/// are fixed by the first appended frame.
+#[cfg(feature = "hdf5")]
+#[pyclass(name = "FrameSink")]
+struct PyFrameSink {
+    inner: Option<eventcv_core::io::Hdf5FrameSink>,
+}
+
+#[cfg(feature = "hdf5")]
+#[pymethods]
+impl PyFrameSink {
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        let inner = eventcv_core::io::Hdf5FrameSink::open(path).map_err(map_io_error)?;
+        Ok(Self { inner: Some(inner) })
+    }
+
+    /// Appends one frame as the next slice; every frame must match the first's dtype + shape.
+    fn append(&mut self, frame: PyRef<PyEventFrame>) -> PyResult<()> {
+        let sink = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("FrameSink is already closed"))?;
+        sink.append(&frame.inner).map_err(map_io_error)
+    }
+
+    #[getter]
+    fn n_frames(&self) -> usize {
+        self.inner.as_ref().map_or(0, |sink| sink.n_frames())
+    }
+
+    /// Flushes and closes the file; further appends raise. Idempotent.
+    fn finish(&mut self) -> PyResult<()> {
+        match self.inner.take() {
+            Some(sink) => sink.finish().map_err(map_io_error),
+            None => Ok(()),
+        }
+    }
+}
+
 fn map_io_error(error: IoError) -> PyErr {
     match error {
         IoError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -842,5 +932,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCamera>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(save, m)?)?;
+    m.add_function(wrap_pyfunction!(load_frame, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_class::<PyFrameSink>()?;
     Ok(())
 }

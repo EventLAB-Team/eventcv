@@ -218,12 +218,15 @@ class LoadTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             eventcv.load("missing.npz")
 
-    def test_missing_event_data_raises_value_error(self):
+    def test_unrecognised_npz_layout_raises_value_error(self):
+        # An npz with neither the N-ImageNet `event_data` array nor the native `x/y/t/p`
+        # columns is not a recognisable event archive (the reader falls through to the
+        # native layout and reports the first missing column).
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing-event-data.npz"
             np.savez(path, other=np.array([], dtype=EVENT_DTYPE))
 
-            with self.assertRaisesRegex(ValueError, "missing event_data"):
+            with self.assertRaisesRegex(ValueError, "missing array"):
                 eventcv.load(str(path))
 
     def test_incompatible_dtype_raises_value_error(self):

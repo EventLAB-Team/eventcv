@@ -93,13 +93,41 @@ def open(
     )
 
 
+# `FrameSink` (streaming HDF5 representation writer) is only built when the extension
+# includes HDF5 support; published wheels do, but keep the import resilient otherwise.
+FrameSink = getattr(_rust, "FrameSink", None)
+
+
+def save(obj, path: str, *, topic: str | None = None) -> None:
+    """Save an :class:`EventStream` or :class:`EventFrame` to ``path``.
+
+    The mirror of :func:`load`: the format is chosen by the file extension. Streams go to
+    ``.npz``/``.txt``/``.h5``/``.bag`` (npz, HDF5, and rosbag round-trip exactly; txt stores
+    ``t x y p`` and recovers the sensor size/unit on load via inference or options). Frames
+    (computed representations) go to ``.npz`` or ``.h5``, preserving shape, dtype, ``kind``,
+    and ``channel_names``. ``topic`` names the rosbag connection. Equivalent to ``obj.save(path)``.
+    """
+    return _rust.save(obj, path, topic=topic)
+
+
+def load_frame(path: str) -> EventFrame:
+    """Load an :class:`EventFrame` written by :func:`save` (``.npz`` or ``.h5``).
+
+    Restores the representation's shape, dtype, ``kind``, and ``channel_names``.
+    """
+    return _rust.load_frame(path)
+
+
 __all__ = [
     "Camera",
     "EventFrame",
     "EventPointSet",
     "EventReader",
     "EventStream",
+    "FrameSink",
     "Polarity",
     "load",
+    "load_frame",
     "open",
+    "save",
 ]

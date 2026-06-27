@@ -11,12 +11,19 @@ mod prophesee;
 mod text;
 
 pub use aedat::read_aedat;
-pub use bag::{open_bag_slice, read_bag, BagSliceSource};
+pub use bag::{open_bag_slice, read_bag, write_bag, BagSliceSource};
 #[cfg(feature = "hdf5")]
-pub use h5::{open_hdf5_slice, read_hdf5, Hdf5SliceSource};
-pub use npz::read_npz;
+pub use h5::{
+    open_hdf5_slice, read_hdf5, read_hdf5_frame, write_hdf5_frame, write_hdf5_stream,
+    Hdf5FrameSink, Hdf5SliceSource,
+};
+pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream};
 pub use prophesee::read_dat;
-pub use text::{open_text_slice, read_text, ColumnOrder, TextOptions, TextReader, TimeUnit};
+pub use text::{
+    open_text_slice, read_text, write_text_stream, ColumnOrder, TextOptions, TextReader, TimeUnit,
+};
+
+use crate::representation::EventFrame;
 
 /// A single event as produced by a reader, before it is placed on the sensor grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +253,98 @@ pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoEr
         Format::Text => Ok(Box::new(text::open_text_slice(path, &options)?)),
         Format::Rosbag => Ok(Box::new(bag::open_bag_slice(path, &options)?)),
         _ => Ok(Box::new(MemorySliceSource::new(load(path, options)?))),
+    }
+}
+
+/// Options for the [`save_stream`] / [`save_frame`] writers — the symmetric mirror of
+/// [`LoadOptions`]. Most formats ignore every field; readers and writers agree on the rest.
+#[derive(Clone, Debug, Default)]
+pub struct SaveOptions {
+    /// Rosbag topic to write the `dvs_msgs/EventArray` messages on (defaults to
+    /// `/davis/left/events`, matching the reader).
+    pub topic: Option<String>,
+}
+
+/// Persists an [`EventStream`] to `path`, the format chosen by extension — the symmetric
+/// counterpart of [`load`]. npz/HDF5/rosbag round-trip exactly (metadata stored); txt
+/// stores `t x y p` and recovers sensor size / time unit on load via inference or options.
+pub fn save_stream(
+    path: impl AsRef<Path>,
+    stream: &EventStream,
+    options: &SaveOptions,
+) -> Result<(), IoError> {
+    let path = path.as_ref();
+    match detect_format(path)? {
+        Format::Npz => npz::write_npz_stream(path, stream),
+        Format::Text => text::write_text_stream(path, stream),
+        Format::Rosbag => bag::write_bag(path, stream, options.topic.as_deref()),
+        Format::Hdf5 => {
+            #[cfg(feature = "hdf5")]
+            {
+                h5::write_hdf5_stream(path, stream)
+            }
+            #[cfg(not(feature = "hdf5"))]
+            {
+                Err(IoError::Unsupported(
+                    "HDF5 support is not built in; rebuild with --features hdf5".to_owned(),
+                ))
+            }
+        }
+        other => Err(IoError::Unsupported(format!(
+            "saving an event stream as {other:?} is not supported"
+        ))),
+    }
+}
+
+/// Persists an [`EventFrame`] (a computed representation) to `path`, preserving its shape,
+/// dtype, `kind`, and `channel_names`. Supported: npz (default build) and HDF5.
+pub fn save_frame(
+    path: impl AsRef<Path>,
+    frame: &EventFrame,
+    _options: &SaveOptions,
+) -> Result<(), IoError> {
+    let path = path.as_ref();
+    match detect_format(path)? {
+        Format::Npz => npz::write_npz_frame(path, frame),
+        Format::Hdf5 => {
+            #[cfg(feature = "hdf5")]
+            {
+                h5::write_hdf5_frame(path, frame)
+            }
+            #[cfg(not(feature = "hdf5"))]
+            {
+                Err(IoError::Unsupported(
+                    "HDF5 support is not built in; rebuild with --features hdf5".to_owned(),
+                ))
+            }
+        }
+        other => Err(IoError::Unsupported(format!(
+            "saving an event frame as {other:?} is not supported"
+        ))),
+    }
+}
+
+/// Reads an [`EventFrame`] previously written by [`save_frame`], reconstructing its dtype,
+/// `kind`, and `channel_names`. Supported: npz (default build) and HDF5.
+pub fn load_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
+    let path = path.as_ref();
+    match detect_format(path)? {
+        Format::Npz => npz::read_npz_frame(path),
+        Format::Hdf5 => {
+            #[cfg(feature = "hdf5")]
+            {
+                h5::read_hdf5_frame(path)
+            }
+            #[cfg(not(feature = "hdf5"))]
+            {
+                Err(IoError::Unsupported(
+                    "HDF5 support is not built in; rebuild with --features hdf5".to_owned(),
+                ))
+            }
+        }
+        other => Err(IoError::Unsupported(format!(
+            "loading an event frame from {other:?} is not supported"
+        ))),
     }
 }
 

@@ -259,6 +259,7 @@ dependencies = [
  "npyz",
  "rayon",
  "rosbag",
+ "zip",
 ]
 
 [[package]]

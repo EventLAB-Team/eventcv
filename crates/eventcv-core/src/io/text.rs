@@ -1,10 +1,31 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::{FromStr, SplitWhitespace};
 
 use super::{read_all, read_capped, EventSource, IoError, LoadOptions, RawEvent, SliceSource};
 use crate::{EventStream, EventStreamBuilder};
+
+/// Writes a stream as whitespace-separated `t x y p` lines (the reader's default
+/// [`ColumnOrder::Txyp`]), `t` in raw microseconds and `p` as `0`/`1`. Loading it back with
+/// `time_unit="us"` reproduces the events exactly; sensor size is inferred or passed as an
+/// option (txt carries no metadata header). The frame-domain counterpart lives in npz/HDF5.
+pub fn write_text_stream(path: impl AsRef<Path>, stream: &EventStream) -> Result<(), IoError> {
+    let mut writer = BufWriter::new(File::create(path).map_err(IoError::Io)?);
+    let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+    for index in 0..stream.len() {
+        writeln!(
+            writer,
+            "{} {} {} {}",
+            ts[index],
+            xs[index],
+            ys[index],
+            u8::from(ps[index])
+        )
+        .map_err(IoError::Io)?;
+    }
+    writer.flush().map_err(IoError::Io)
+}
 
 /// Unit of the timestamp column. Events are stored internally in microseconds, so
 /// [`TextReader`] always reports `timestamp_scale_ms() == 0.001`; sub-microsecond
@@ -26,6 +47,24 @@ impl TimeUnit {
             Self::Nanoseconds => value / 1e3,
         };
         microseconds.round() as i64
+    }
+
+    /// Maps a stored `timestamp_scale_ms` (milliseconds per raw unit) back to the matching
+    /// unit, when it is one of the standard powers of 1000 — lets the HDF5 reader honour the
+    /// scale a stream was saved with instead of re-inferring it. `None` for other scales.
+    #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+    pub(crate) fn from_scale_ms(scale_ms: f64) -> Option<TimeUnit> {
+        for (unit, expected) in [
+            (TimeUnit::Nanoseconds, 1e-6),
+            (TimeUnit::Microseconds, 1e-3),
+            (TimeUnit::Milliseconds, 1.0),
+            (TimeUnit::Seconds, 1e3),
+        ] {
+            if (scale_ms - expected).abs() <= expected * 1e-9 {
+                return Some(unit);
+            }
+        }
+        None
     }
 
     /// Guesses the unit of an integer timestamp column from the recording's raw span
@@ -751,5 +790,34 @@ mod tests {
         assert!(source.slice_time(0, 1000).unwrap().is_empty());
         assert!(source.slice_index(0, 10).unwrap().is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn write_text_stream_round_trips_at_event_level() {
+        let mut builder = crate::EventStreamBuilder::new(16, 12, 0.001);
+        for &(x, y, t, p) in &[(0u16, 0u16, 5i64, true), (15, 11, 2_500_000, false)] {
+            builder.push(x, y, t, p);
+        }
+        let stream = builder.build();
+
+        let dir = std::env::temp_dir().join(format!("eventcv-txtrt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.txt");
+        super::write_text_stream(&path, &stream).unwrap();
+
+        // Loaded back as microseconds with an explicit grid, the events match exactly (txt
+        // carries no metadata header, so size/unit come from options or inference).
+        let options = LoadOptions {
+            sensor_size: Some((16, 12)),
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let loaded = load_text(&path, &options).unwrap();
+        assert_eq!(loaded.xs(), stream.xs());
+        assert_eq!(loaded.ys(), stream.ys());
+        assert_eq!(loaded.ts(), stream.ts());
+        assert_eq!(loaded.ps(), stream.ps());
+        assert_eq!(loaded.sensor_size(), (16, 12));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

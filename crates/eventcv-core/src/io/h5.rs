@@ -1,10 +1,14 @@
 use std::ops::Range;
 use std::path::Path;
 
-use hdf5::types::{IntSize, TypeDescriptor};
-use hdf5::{Dataset, File, H5Type};
+use std::str::FromStr;
+
+use hdf5::types::{IntSize, TypeDescriptor, VarLenUnicode};
+use hdf5::{Dataset, File, Group, H5Type};
+use ndarray::Array1;
 
 use super::{IoError, LoadOptions, SliceSource, TimeUnit};
+use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
 use crate::{EventStream, EventStreamBuilder};
 
 /// Events are read in blocks of this many so capping with `max_events` and reading
@@ -72,16 +76,30 @@ fn resolve_params(
 ) -> Result<((usize, usize), TimeUnit), IoError> {
     let time_unit = match options.time_unit {
         Some(unit) => unit,
-        None if opened.total == 0 => TimeUnit::Microseconds,
-        None => {
-            let first = read_integers(&opened.datasets[2], 0..1)?[0];
-            let last = read_integers(&opened.datasets[2], opened.total - 1..opened.total)?[0];
-            TimeUnit::infer_from_span(last - first)
-        }
+        // Honour a saved `timestamp_scale_ms` attribute (written by `write_hdf5_stream`);
+        // otherwise fall back to inferring the unit from the span.
+        None => match read_scalar_attr::<f64>(&opened.file, "timestamp_scale_ms")?
+            .and_then(TimeUnit::from_scale_ms)
+        {
+            Some(unit) => unit,
+            None if opened.total == 0 => TimeUnit::Microseconds,
+            None => {
+                let first = read_integers(&opened.datasets[2], 0..1)?[0];
+                let last = read_integers(&opened.datasets[2], opened.total - 1..opened.total)?[0];
+                TimeUnit::infer_from_span(last - first)
+            }
+        },
     };
     let sensor = match options.sensor_size {
         Some(size) => size,
-        None => infer_sensor_size(&opened.datasets, opened.total)?,
+        // Prefer saved `width`/`height` attributes over a coordinate-range scan.
+        None => match (
+            read_scalar_attr::<u64>(&opened.file, "width")?,
+            read_scalar_attr::<u64>(&opened.file, "height")?,
+        ) {
+            (Some(width), Some(height)) => (width as usize, height as usize),
+            _ => infer_sensor_size(&opened.datasets, opened.total)?,
+        },
     };
     Ok((sensor, time_unit))
 }
@@ -429,6 +447,258 @@ macro_rules! impl_into_i64 {
 
 impl_into_i64!(u8, u16, u32, u64, i8, i16, i32, i64);
 
+// ---- Writers (symmetric with the readers above) ----
+
+/// Persists a stream as `events/{x,y,t,p}` datasets plus `width`/`height`/`timestamp_scale_ms`
+/// root attributes, so the reader reconstructs the sensor size and time scale exactly (the `t`
+/// column is stored in the stream's own raw units — microseconds for the usual `0.001` scale).
+pub fn write_hdf5_stream(path: impl AsRef<Path>, stream: &EventStream) -> Result<(), IoError> {
+    let file = File::create(path.as_ref()).map_err(map_hdf5_error)?;
+    let events = file.create_group("events").map_err(map_hdf5_error)?;
+    write_dataset(&events, "x", stream.xs())?;
+    write_dataset(&events, "y", stream.ys())?;
+    write_dataset(&events, "t", stream.ts())?;
+    let polarities: Vec<u8> = stream.ps().iter().map(|&p| u8::from(p)).collect();
+    write_dataset(&events, "p", &polarities)?;
+    let (width, height) = stream.sensor_size();
+    write_scalar_attr(&file, "width", width as u64)?;
+    write_scalar_attr(&file, "height", height as u64)?;
+    write_scalar_attr(&file, "timestamp_scale_ms", stream.timestamp_scale_ms())?;
+    Ok(())
+}
+
+/// Persists an [`EventFrame`] as a `[C, H, W]` `frame` dataset plus `dtype`/`kind`/
+/// `channel_names`/`width`/`height` attributes, recovered by [`read_hdf5_frame`].
+pub fn write_hdf5_frame(path: impl AsRef<Path>, frame: &EventFrame) -> Result<(), IoError> {
+    let (channels, height, width) = frame.shape();
+    let file = File::create(path.as_ref()).map_err(map_hdf5_error)?;
+    match frame.data() {
+        EventFrameData::U8(values) => write_frame_dataset(&file, channels, height, width, values)?,
+        EventFrameData::U16(values) => write_frame_dataset(&file, channels, height, width, values)?,
+        EventFrameData::U64(values) => write_frame_dataset(&file, channels, height, width, values)?,
+        EventFrameData::F32(values) => write_frame_dataset(&file, channels, height, width, values)?,
+    }
+    write_string_attr(&file, "dtype", dtype_tag(frame.data()))?;
+    write_string_attr(&file, "kind", frame.kind().as_str())?;
+    write_string_attr(&file, "channel_names", &frame.channel_names().join("\n"))?;
+    write_scalar_attr(&file, "width", width as u64)?;
+    write_scalar_attr(&file, "height", height as u64)?;
+    Ok(())
+}
+
+/// Reads an [`EventFrame`] written by [`write_hdf5_frame`].
+pub fn read_hdf5_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
+    let file = File::open(path.as_ref()).map_err(map_hdf5_error)?;
+    let dataset = file.dataset("frame").map_err(map_hdf5_error)?;
+    let [_, height, width] = <[usize; 3]>::try_from(dataset.shape())
+        .map_err(|_| IoError::Format("frame dataset must be 3-D [C, H, W]".to_owned()))?;
+    let kind = read_string_attr(&file, "kind")?;
+    let kind = RepresentationKind::from_tag(&kind)
+        .ok_or_else(|| IoError::Format(format!("unknown representation kind '{kind}'")))?;
+    let names = read_string_attr(&file, "channel_names")?;
+    let channel_names = if names.is_empty() {
+        Vec::new()
+    } else {
+        names.split('\n').map(str::to_owned).collect()
+    };
+    let data = match read_string_attr(&file, "dtype")?.as_str() {
+        "u8" => EventFrameData::U8(dataset.read_raw::<u8>().map_err(map_hdf5_error)?),
+        "u16" => EventFrameData::U16(dataset.read_raw::<u16>().map_err(map_hdf5_error)?),
+        "u64" => EventFrameData::U64(dataset.read_raw::<u64>().map_err(map_hdf5_error)?),
+        "f32" => EventFrameData::F32(dataset.read_raw::<f32>().map_err(map_hdf5_error)?),
+        other => return Err(IoError::Format(format!("unknown frame dtype '{other}'"))),
+    };
+    Ok(EventFrame::from_parts(
+        data,
+        width,
+        height,
+        kind,
+        channel_names,
+    ))
+}
+
+/// Streams [`EventFrame`]s into one extendable `[N, C, H, W]` HDF5 dataset — for computing a
+/// representation window-by-window over a whole recording without buffering the result. The
+/// dataset dtype and `[C, H, W]` shape are fixed by the first appended frame.
+pub struct Hdf5FrameSink {
+    file: File,
+    dataset: Option<Dataset>,
+    code: u8,
+    shape: (usize, usize, usize),
+    count: usize,
+}
+
+impl Hdf5FrameSink {
+    /// Creates the output file; the dataset is created lazily on the first [`append`](Self::append).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, IoError> {
+        let file = File::create(path.as_ref()).map_err(map_hdf5_error)?;
+        Ok(Self {
+            file,
+            dataset: None,
+            code: 0,
+            shape: (0, 0, 0),
+            count: 0,
+        })
+    }
+
+    /// Appends one frame as the next slice along axis 0. Every frame must share the first
+    /// frame's dtype and `[C, H, W]` shape.
+    pub fn append(&mut self, frame: &EventFrame) -> Result<(), IoError> {
+        let (channels, height, width) = frame.shape();
+        let code = dtype_code(frame.data());
+        let first = self.dataset.is_none();
+        if !first && ((channels, height, width) != self.shape || code != self.code) {
+            return Err(IoError::Format(
+                "appended frame shape/dtype differs from the first frame".to_owned(),
+            ));
+        }
+        let n = self.count;
+        macro_rules! append_typed {
+            ($values:expr, $type:ty) => {{
+                if first {
+                    // Resizable extents (axis 0 unlimited) auto-chunk in the hdf5 builder.
+                    let dataset = self
+                        .file
+                        .new_dataset::<$type>()
+                        .shape((0usize.., channels, height, width))
+                        .create("frames")
+                        .map_err(map_hdf5_error)?;
+                    write_string_attr(&self.file, "dtype", dtype_tag(frame.data()))?;
+                    write_string_attr(&self.file, "kind", frame.kind().as_str())?;
+                    write_string_attr(
+                        &self.file,
+                        "channel_names",
+                        &frame.channel_names().join("\n"),
+                    )?;
+                    self.dataset = Some(dataset);
+                    self.shape = (channels, height, width);
+                    self.code = code;
+                }
+                let dataset = self.dataset.as_ref().expect("created above");
+                dataset
+                    .resize((n + 1, channels, height, width))
+                    .map_err(map_hdf5_error)?;
+                let array =
+                    ndarray::Array::from_shape_vec((1, channels, height, width), $values.to_vec())
+                        .map_err(|error| IoError::Format(error.to_string()))?;
+                dataset
+                    .write_slice(&array, ndarray::s![n..n + 1, .., .., ..])
+                    .map_err(map_hdf5_error)?;
+            }};
+        }
+        match frame.data() {
+            EventFrameData::U8(values) => append_typed!(values, u8),
+            EventFrameData::U16(values) => append_typed!(values, u16),
+            EventFrameData::U64(values) => append_typed!(values, u64),
+            EventFrameData::F32(values) => append_typed!(values, f32),
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Number of frames appended so far (the size of axis 0).
+    pub fn n_frames(&self) -> usize {
+        self.count
+    }
+
+    /// Flushes and closes the file (dropping the sink also closes it).
+    pub fn finish(self) -> Result<(), IoError> {
+        self.file.flush().map_err(map_hdf5_error)
+    }
+}
+
+fn write_dataset<T: H5Type + Clone>(group: &Group, name: &str, data: &[T]) -> Result<(), IoError> {
+    let array = Array1::from_vec(data.to_vec());
+    group
+        .new_dataset_builder()
+        .with_data(&array)
+        .create(name)
+        .map(|_| ())
+        .map_err(map_hdf5_error)
+}
+
+fn write_frame_dataset<T: H5Type + Clone>(
+    file: &File,
+    channels: usize,
+    height: usize,
+    width: usize,
+    data: &[T],
+) -> Result<(), IoError> {
+    let array = ndarray::Array::from_shape_vec((channels, height, width), data.to_vec())
+        .map_err(|error| IoError::Format(error.to_string()))?;
+    file.new_dataset_builder()
+        .with_data(&array)
+        .create("frame")
+        .map(|_| ())
+        .map_err(map_hdf5_error)
+}
+
+fn write_scalar_attr<T: H5Type>(file: &File, name: &str, value: T) -> Result<(), IoError> {
+    let attr = file
+        .new_attr::<T>()
+        .shape(())
+        .create(name)
+        .map_err(map_hdf5_error)?;
+    attr.write_scalar(&value).map_err(map_hdf5_error)
+}
+
+fn write_string_attr(file: &File, name: &str, value: &str) -> Result<(), IoError> {
+    let text =
+        VarLenUnicode::from_str(value).map_err(|error| IoError::Format(error.to_string()))?;
+    let attr = file
+        .new_attr::<VarLenUnicode>()
+        .shape(())
+        .create(name)
+        .map_err(map_hdf5_error)?;
+    attr.write_scalar(&text).map_err(map_hdf5_error)
+}
+
+fn read_scalar_attr<T: H5Type>(file: &File, name: &str) -> Result<Option<T>, IoError> {
+    if !file
+        .attr_names()
+        .map_err(map_hdf5_error)?
+        .iter()
+        .any(|attr| attr == name)
+    {
+        return Ok(None);
+    }
+    let value = file
+        .attr(name)
+        .map_err(map_hdf5_error)?
+        .as_reader()
+        .read_scalar::<T>()
+        .map_err(map_hdf5_error)?;
+    Ok(Some(value))
+}
+
+fn read_string_attr(file: &File, name: &str) -> Result<String, IoError> {
+    let text: VarLenUnicode = file
+        .attr(name)
+        .map_err(map_hdf5_error)?
+        .as_reader()
+        .read_scalar()
+        .map_err(map_hdf5_error)?;
+    Ok(text.as_str().to_owned())
+}
+
+fn dtype_tag(data: &EventFrameData) -> &'static str {
+    match data {
+        EventFrameData::U8(_) => "u8",
+        EventFrameData::U16(_) => "u16",
+        EventFrameData::U64(_) => "u64",
+        EventFrameData::F32(_) => "f32",
+    }
+}
+
+fn dtype_code(data: &EventFrameData) -> u8 {
+    match data {
+        EventFrameData::U8(_) => 0,
+        EventFrameData::U16(_) => 1,
+        EventFrameData::U64(_) => 2,
+        EventFrameData::F32(_) => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +974,79 @@ mod tests {
             Err(other) => panic!("expected a format error, got {other:?}"),
             Ok(_) => panic!("expected unsorted timestamps to be rejected"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("eventcv-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stream_round_trips_with_metadata_attrs() {
+        let mut builder = EventStreamBuilder::new(20, 15, 0.001);
+        for &(x, y, t, p) in &[(0u16, 0u16, 7i64, true), (19, 14, 2_500_000, false)] {
+            builder.push(x, y, t, p);
+        }
+        let stream = builder.build();
+
+        let dir = temp_dir("h5streamrt");
+        let path = dir.join("stream.h5");
+        write_hdf5_stream(&path, &stream).unwrap();
+
+        // No options: the size and unit come from the saved attributes, not inference.
+        let loaded = read_hdf5(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(loaded.sensor_size(), (20, 15));
+        assert_eq!(loaded.xs(), stream.xs());
+        assert_eq!(loaded.ys(), stream.ys());
+        assert_eq!(loaded.ts(), stream.ts());
+        assert_eq!(loaded.ps(), stream.ps());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn frame_round_trips_with_metadata() {
+        use crate::representation::{Representation, VoxelGrid};
+        let mut builder = EventStreamBuilder::new(8, 6, 0.001);
+        builder.push(1, 2, 100, true);
+        builder.push(7, 5, 5_000, false);
+        let frame = VoxelGrid::new(3, 30.0).generate(&builder.build()).unwrap();
+
+        let dir = temp_dir("h5framert");
+        let path = dir.join("frame.h5");
+        write_hdf5_frame(&path, &frame).unwrap();
+
+        let loaded = read_hdf5_frame(&path).unwrap();
+        assert_eq!(loaded.shape(), frame.shape());
+        assert_eq!(loaded.kind(), frame.kind());
+        assert_eq!(loaded.channel_names(), frame.channel_names());
+        assert_eq!(loaded.data(), frame.data());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn frame_sink_appends_a_stack() {
+        use crate::representation::{Binary, Representation};
+        let mut builder = EventStreamBuilder::new(4, 3, 0.001);
+        builder.push(1, 1, 0, true);
+        builder.push(2, 2, 10, false);
+        let frame = Binary.generate(&builder.build()).unwrap();
+        let (channels, height, width) = frame.shape();
+
+        let dir = temp_dir("h5sink");
+        let path = dir.join("stack.h5");
+        let mut sink = Hdf5FrameSink::open(&path).unwrap();
+        sink.append(&frame).unwrap();
+        sink.append(&frame).unwrap();
+        sink.append(&frame).unwrap();
+        assert_eq!(sink.n_frames(), 3);
+        sink.finish().unwrap();
+
+        // The stack is a [N, C, H, W] dataset readable straight back.
+        let file = File::open(&path).unwrap();
+        let dataset = file.dataset("frames").unwrap();
+        assert_eq!(dataset.shape(), vec![3, channels, height, width]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -4,9 +4,12 @@ from .load import (
     EventPointSet,
     EventReader,
     EventStream,
+    FrameSink,
     Polarity,
     load,
+    load_frame,
     open,
+    save,
 )
 
 __all__ = [
@@ -15,7 +18,10 @@ __all__ = [
     "EventPointSet",
     "EventReader",
     "EventStream",
+    "FrameSink",
     "Polarity",
     "load",
+    "load_frame",
     "open",
+    "save",
 ]
