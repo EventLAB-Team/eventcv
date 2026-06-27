@@ -170,13 +170,14 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(average.kind, "voxel")
         self.assertEqual(average.channel_names, voxel.channel_names)
 
-    def test_rejects_resizing_an_event_stream(self):
+    def test_event_domain_resize_returns_a_stream(self):
+        # stream.resize now resizes in the event domain (Workstream B), distinct from the
+        # frame-domain EventFrame.resize tested above. It returns a chainable EventStream.
         stream = eventcv.load(str(EXAMPLE_PATH))
-
-        with self.assertRaisesRegex(
-            TypeError, r"data\.flatten\(\)\.resize\(width, height\)"
-        ):
-            stream.resize(256, 256).flatten()
+        resized = stream.resize(320, 240)
+        self.assertIsInstance(resized, eventcv.EventStream)
+        self.assertEqual(resized.sensor_size, (320, 240))
+        self.assertEqual(len(resized), len(stream))  # rebinning conserves count
 
     def test_sum_resize_preserves_raw_event_count(self):
         stream = eventcv.load(str(EXAMPLE_PATH))

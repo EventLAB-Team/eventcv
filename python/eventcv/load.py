@@ -7,6 +7,7 @@ EventFrame = _rust.EventFrame
 EventPointSet = _rust.EventPointSet
 EventReader = _rust.EventReader
 Polarity = _rust.Polarity
+Camera = _rust.Camera
 
 
 def load(
@@ -93,6 +94,7 @@ def open(
 
 
 __all__ = [
+    "Camera",
     "EventFrame",
     "EventPointSet",
     "EventReader",

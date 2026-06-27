@@ -3,19 +3,21 @@ mod viewer;
 use std::sync::{Arc, Mutex};
 
 use eventcv_core::{
+    camera::Camera,
     image::{PoolingMethod, ResizeError},
     io::{open as open_reader, ColumnOrder, IoError, LoadOptions, Reader, TimeUnit},
     representation::{
         Binary, EventFrame, EventFrameData, EventPointSet, Mcts, PointSet, Polarity,
         Representation, RepresentationError, Tencode, TimeSurface, VoxelGrid,
     },
+    EventStream,
 };
-use numpy::{IntoPyArray, PyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyTuple};
+use pyo3::types::{PyAny, PyTuple};
 
 #[pyclass(name = "EventStream", frozen)]
 struct PyEventStream {
@@ -52,16 +54,139 @@ impl PyEventStream {
         self.inner.to_array2().into_pyarray(py)
     }
 
-    #[pyo3(signature = (*args, **kwargs))]
-    fn resize(
-        &self,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<()> {
-        let _ = (args, kwargs);
-        Err(PyTypeError::new_err(
-            "Resize cannot be performed directly on a stream; it must be performed on a representation first. The correct syntax is data.flatten().resize(width, height).",
-        ))
+    // ---- Event-domain transforms (Workstream B). Each returns a new EventStream so they
+    // chain; geometry is on the sparse stream itself (frame-domain resize is EventFrame.resize).
+
+    /// Keeps events inside the `w`×`h` window at `(x0, y0)`, shifted to a new origin.
+    fn crop(&self, py: Python<'_>, x0: i64, y0: i64, w: usize, h: usize) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.crop(x0, y0, w, h)))
+    }
+
+    /// Mirrors horizontally (`x → width-1-x`).
+    fn flip_x(&self, py: Python<'_>) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.flip_x()))
+    }
+
+    /// Mirrors vertically (`y → height-1-y`).
+    fn flip_y(&self, py: Python<'_>) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.flip_y()))
+    }
+
+    /// Rotates by `k * 90°` clockwise (quarter turns swap the sensor dims).
+    fn rotate90(&self, py: Python<'_>, k: i32) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.rotate90(k)))
+    }
+
+    /// Reflects across the main diagonal (`(x, y) → (y, x)`); swaps the sensor dims.
+    fn transpose(&self, py: Python<'_>) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.transpose()))
+    }
+
+    /// Translates by `(dx, dy)`; events shifted off the sensor are dropped.
+    fn translate(&self, py: Python<'_>, dx: i64, dy: i64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.translate(dx, dy)))
+    }
+
+    /// Event-domain resize to a `width`×`height` grid (rebinned, not interpolated).
+    fn resize(&self, py: Python<'_>, width: usize, height: usize) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.resize(width, height)))
+    }
+
+    /// Scales the sensor by `(sx, sy)`.
+    fn scale(&self, py: Python<'_>, sx: f64, sy: f64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.scale(sx, sy)))
+    }
+
+    /// Applies a 2×3 affine matrix `[[a,b,c],[d,e,f]]` (rounded, no interpolation).
+    fn warp_affine(&self, py: Python<'_>, matrix: [[f64; 3]; 2]) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.warp_affine(matrix)))
+    }
+
+    /// Applies a 3×3 perspective (homography) matrix.
+    fn warp_perspective(&self, py: Python<'_>, matrix: [[f64; 3]; 3]) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.warp_perspective(matrix)))
+    }
+
+    /// Rectifies events with a `Camera`'s intrinsics + distortion (lens undistortion).
+    fn undistort(&self, py: Python<'_>, camera: PyRef<'_, PyCamera>) -> PyEventStream {
+        let camera = camera.inner;
+        Self::wrap(py.detach(|| self.inner.undistort(&camera)))
+    }
+
+    /// Keeps events where the `(H, W)` boolean mask is `True`.
+    fn mask(&self, py: Python<'_>, mask: PyReadonlyArray2<bool>) -> PyEventStream {
+        let view = mask.as_array();
+        let (h, w) = (view.shape()[0], view.shape()[1]);
+        let flat: Vec<bool> = view.iter().copied().collect();
+        Self::wrap(py.detach(|| self.inner.mask(&flat, w, h)))
+    }
+
+    /// Keeps events whose timestamp lies in the half-open window `[t0, t1)` (microseconds).
+    fn time_window(&self, py: Python<'_>, t0: i64, t1: i64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.time_window(t0, t1)))
+    }
+
+    /// Shifts every timestamp by `dt` microseconds.
+    fn time_shift(&self, py: Python<'_>, dt: i64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.time_shift(dt)))
+    }
+
+    /// Scales every timestamp by `factor` (rounded).
+    fn time_scale(&self, py: Python<'_>, factor: f64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.time_scale(factor)))
+    }
+
+    /// Shifts timestamps so the earliest event starts at zero.
+    fn normalize_time(&self, py: Python<'_>) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.normalize_time()))
+    }
+
+    /// Keeps every `k`-th event by index.
+    fn decimate(&self, py: Python<'_>, k: usize) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.decimate(k)))
+    }
+
+    /// Keeps only events of the given polarity (nonzero / `True` = ON, `0` / `False` = OFF).
+    fn filter_polarity(&self, py: Python<'_>, polarity: i64) -> PyEventStream {
+        let polarity = polarity != 0;
+        Self::wrap(py.detach(|| self.inner.filter_polarity(polarity)))
+    }
+
+    /// Flips every event's polarity.
+    fn invert_polarity(&self, py: Python<'_>) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.invert_polarity()))
+    }
+
+    /// Returns a copy reordered by ascending timestamp (stable).
+    fn sort_by_time(&self, py: Python<'_>) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.sort_by_time()))
+    }
+
+    /// Concatenates this stream with `others` (argument order; sensor = element-wise max).
+    fn concat(&self, py: Python<'_>, others: Vec<PyRef<'_, PyEventStream>>) -> PyEventStream {
+        let refs: Vec<&EventStream> = others.iter().map(|other| &other.inner).collect();
+        Self::wrap(py.detach(|| self.inner.concat(&refs)))
+    }
+
+    // ---- Denoising filters (Phase 3). Each drops noise events and returns a new EventStream.
+    // The neighbourhood/dead-time filters assume ascending time (call sort_by_time first if not).
+
+    /// Background-activity (nearest-neighbour) noise filter: keeps an event only if a 3×3
+    /// neighbour fired within `dt` (raw timestamp units, e.g. microseconds).
+    fn background_activity_filter(&self, py: Python<'_>, dt: i64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.background_activity_filter(dt)))
+    }
+
+    /// Refractory-period filter: suppresses a pixel's events for `dt` after it fires.
+    fn refractory_filter(&self, py: Python<'_>, dt: i64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.refractory_filter(dt)))
+    }
+
+    /// Hot-pixel removal: drops pixels whose event count exceeds `mean + n_std·std` over the
+    /// active pixels (default `n_std=3.0`).
+    #[pyo3(signature = (n_std=3.0))]
+    fn hot_pixel_filter(&self, py: Python<'_>, n_std: f64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.hot_pixel_filter(n_std)))
     }
 
     #[pyo3(signature = (representation=None, *, normalize=true, binary=false))]
@@ -141,6 +266,11 @@ impl PyEventStream {
 }
 
 impl PyEventStream {
+    /// Wraps a core stream as a Python `EventStream` (used by the chainable transforms).
+    fn wrap(inner: EventStream) -> PyEventStream {
+        PyEventStream { inner }
+    }
+
     fn generate(
         &self,
         py: Python<'_>,
@@ -172,6 +302,70 @@ impl PyPolarity {
     #[new]
     fn new() -> Self {
         Self
+    }
+}
+
+/// Pinhole intrinsics + Brown–Conrady distortion, e.g. an EV-IMO `calib.txt`
+/// (`fx fy cx cy k1 k2 p1 p2`). Pass to `stream.undistort(camera)`.
+#[pyclass(name = "Camera", frozen)]
+struct PyCamera {
+    inner: Camera,
+}
+
+#[pymethods]
+impl PyCamera {
+    #[new]
+    #[pyo3(signature = (fx, fy, cx, cy, *, k1=0.0, k2=0.0, p1=0.0, p2=0.0, k3=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        k1: f64,
+        k2: f64,
+        p1: f64,
+        p2: f64,
+        k3: f64,
+    ) -> Self {
+        Self {
+            inner: Camera::with_distortion(fx, fy, cx, cy, k1, k2, p1, p2, k3),
+        }
+    }
+
+    #[getter]
+    fn fx(&self) -> f64 {
+        self.inner.fx
+    }
+    #[getter]
+    fn fy(&self) -> f64 {
+        self.inner.fy
+    }
+    #[getter]
+    fn cx(&self) -> f64 {
+        self.inner.cx
+    }
+    #[getter]
+    fn cy(&self) -> f64 {
+        self.inner.cy
+    }
+    #[getter]
+    fn distortion(&self) -> (f64, f64, f64, f64, f64) {
+        let c = &self.inner;
+        (c.k1, c.k2, c.p1, c.p2, c.k3)
+    }
+
+    /// Maps a distorted pixel `(u, v)` to its undistorted location.
+    fn undistort_point(&self, u: f64, v: f64) -> (f64, f64) {
+        self.inner.undistort_point(u, v)
+    }
+
+    fn __repr__(&self) -> String {
+        let c = &self.inner;
+        format!(
+            "Camera(fx={}, fy={}, cx={}, cy={}, k1={}, k2={}, p1={}, p2={}, k3={})",
+            c.fx, c.fy, c.cx, c.cy, c.k1, c.k2, c.p1, c.p2, c.k3
+        )
     }
 }
 
@@ -645,6 +839,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEventReader>()?;
     m.add_class::<PyWindowIterator>()?;
     m.add_class::<PyPolarity>()?;
+    m.add_class::<PyCamera>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     Ok(())

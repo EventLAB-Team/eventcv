@@ -1,4 +1,5 @@
 from .load import (
+    Camera,
     EventFrame,
     EventPointSet,
     EventReader,
@@ -9,6 +10,7 @@ from .load import (
 )
 
 __all__ = [
+    "Camera",
     "EventFrame",
     "EventPointSet",
     "EventReader",
