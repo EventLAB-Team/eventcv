@@ -1,3 +1,25 @@
+//! # eventcv-core
+//!
+//! The Rust core of **EventCV** — "OpenCV for event-based vision".
+//!
+//! Everything is built around [`EventStream`], a struct-of-arrays container of events
+//! (`xs`, `ys`, `ts`, `ps` columns plus sensor size and timestamp scale). Streams are
+//! constructed only through [`EventStreamBuilder`], which drops out-of-bounds events.
+//!
+//! The crate is organised into focused modules:
+//!
+//! - [`io`] — readers/writers for `.npz`, `.txt`, `.bag`, `.h5`, `.aedat`, `.dat`, plus the
+//!   [`io::load`] extension dispatcher and lazy [`io::SliceSource`] indexing for large files.
+//! - [`representation`] — event → dense tensor ([`representation::Representation`], e.g. voxel
+//!   grids and time surfaces).
+//! - [`transform`] — chainable event-domain geometry/temporal/polarity ops on streams.
+//! - [`camera`] — intrinsics and `undistort`.
+//! - [`features`], [`flow`], [`cluster`] — corner detection, optical flow, connected components.
+//! - [`filter`], [`image`], [`viz`] — hot-pixel filtering, frame-domain resize, colormapped export.
+//!
+//! The `hdf5` feature (off by default to keep `cargo test` fast) enables the `.h5`/`.hdf5`
+//! reader by building libhdf5 from source.
+
 use ndarray::Array2;
 
 pub mod camera;

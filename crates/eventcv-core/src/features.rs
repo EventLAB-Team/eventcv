@@ -64,7 +64,7 @@ impl EventStream {
     /// **eFAST** event corner detector (Mueggler et al., *Fast Event-based Corner Detection*,
     /// BMVC 2017). For each event it updates its polarity's SAE, then tests two Bresenham rings
     /// (radius 3 and 4) around the pixel: an event is a corner when, on **both** rings, the most
-    /// recent timestamps form a contiguous arc within the [`INNER_ARC`]/[`OUTER_ARC`] bounds — the
+    /// recent timestamps form a contiguous arc within the `INNER_ARC`/`OUTER_ARC` bounds — the
     /// signature of a moving corner rather than a straight edge. Events too close to the border to
     /// evaluate the outer ring are dropped. Returns the corner events as a new stream.
     pub fn efast(&self) -> EventStream {

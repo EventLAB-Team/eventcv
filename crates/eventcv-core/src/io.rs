@@ -74,7 +74,7 @@ pub struct LoadOptions {
     pub sensor_size: Option<(usize, usize)>,
     /// Timestamp unit. `None` infers it (HDF5/text): a fractional text value means
     /// seconds, otherwise the unit is chosen from the recording span (see
-    /// [`TimeUnit::infer_from_span`]). Ignored for rosbag (always ROS `sec`+`nsec`).
+    /// `TimeUnit::infer_from_span`). Ignored for rosbag (always ROS `sec`+`nsec`).
     pub time_unit: Option<TimeUnit>,
     /// Text column order.
     pub order: ColumnOrder,

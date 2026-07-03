@@ -1,0 +1,4 @@
+# Docs toolchain (Read the Docs installs these on top of the built `eventcv` extension).
+sphinx>=7,<9
+furo>=2024.1
+myst-nb>=1.1

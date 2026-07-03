@@ -386,8 +386,8 @@ pub struct TextSliceSource {
     index: Vec<TextIndexEntry>,
 }
 
-/// Scans the file once to build a [`TextSliceSource`], inferring `sensor_size`/`time_unit`
-/// when unset exactly as [`load_text`] does, and dropping out-of-bounds events (when the
+/// Scans the file once to build a `TextSliceSource`, inferring `sensor_size`/`time_unit`
+/// when unset exactly as `load_text` does, and dropping out-of-bounds events (when the
 /// size is explicit) so the index counts the same events `load` would keep.
 pub fn open_text_slice(
     path: impl AsRef<Path>,

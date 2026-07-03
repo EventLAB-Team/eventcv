@@ -14,7 +14,8 @@ https://anaconda.org/conda-forge/eventcv)
 EventCV is "OpenCV" for event-based data and computer vision applications.
 
 ## Resources
-- **Documentation**
+- **[Documentation](https://eventcv.readthedocs.io)** — Python API, quickstart, and tutorials
+- **[Rust core API](https://docs.rs/eventcv-core)** — `eventcv-core` reference on docs.rs
 - **YouTube Tutorials**
 
 ## Contributing

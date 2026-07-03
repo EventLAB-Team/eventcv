@@ -30,3 +30,14 @@ python-source = "python"
 module-name = "eventcv._rust"
 # Compile HDF5 reading into every wheel.
 features = ["hdf5"]
+# Keep the docs source, fixtures, and dev-only files out of the sdist (the wheel already
+# only contains `python/eventcv/` + the compiled extension). Docs are hosted on Read the
+# Docs, so shipping them to PyPI would only bloat the download.
+exclude = [
+    "docs/**",
+    ".readthedocs.yaml",
+    "data/**",
+    "assets/**",
+    "TASKS.md",
+    "AGENTS.md",
+]

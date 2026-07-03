@@ -16,3 +16,9 @@ png = "0.17"
 # Optional: `.h5`/`.hdf5` reading. Builds libhdf5 from source (needs cmake) and
 # bundles the LZF filter used by event datasets. Enable with `--features hdf5`.
 hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-features = false, features = ["static", "lzf", "zlib"] }
+
+# docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
+# from source — the API surface is identical, and the build stays fast and network-free.
+[package.metadata.docs.rs]
+features = []
+rustdoc-args = ["--cfg", "docsrs"]
