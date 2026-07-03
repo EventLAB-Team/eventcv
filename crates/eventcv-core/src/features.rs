@@ -97,18 +97,15 @@ impl EventStream {
         builder.build()
     }
 
-    /// **Harris corner score on the time surface.** Maintains a per-polarity SAE, and for each
-    /// event forms a 9×9 exponential time-surface patch (`exp(-age/τ)`, `τ = tau_ms`) from that
-    /// polarity's SAE, then computes the Harris response `det(M) - k·trace(M)²` of the local
-    /// structure tensor `M`. Events whose response exceeds `threshold` are kept. `tau_ms` must be
-    /// finite and positive (falls back to 30 ms otherwise). Returns the corner events as a new
-    /// stream. A nice-to-have complement to [`Self::efast`] that yields a tunable score.
-    pub fn harris_corners(&self, threshold: f64, tau_ms: f64) -> EventStream {
-        let tau_ms = if tau_ms.is_finite() && tau_ms > 0.0 {
-            tau_ms
-        } else {
-            30.0
-        };
+    /// **Harris corner score on the Surface of Active Events.** For each event it updates a
+    /// merged SAE of raw latest timestamps, then computes the Harris response
+    /// `det(M) - k·trace(M)²` of the structure tensor `M = Σ ∇T ∇Tᵀ` of the SAE's spatial
+    /// gradient over a 9×9 window. Because the SAE is a local time *ramp*, a straight moving edge
+    /// has a constant gradient direction (rank-1 `M`, `R < 0`) while a corner mixes gradient
+    /// directions (rank-2 `M`, `R > 0`) — so the default `threshold = 0` keeps corners and rejects
+    /// edges. Raise `threshold` to be stricter. Returns the corner events as a new stream; a
+    /// score-based complement to [`Self::efast`].
+    pub fn harris_corners(&self, threshold: f64) -> EventStream {
         let (width, height) = self.sensor_size();
         let (xs, ys, ts, ps) = (self.xs(), self.ys(), self.ts(), self.ps());
         let scale = self.timestamp_scale_ms();
@@ -118,18 +115,17 @@ impl EventStream {
         if width < 2 * margin + 1 || height < 2 * margin + 1 {
             return builder.build();
         }
-        let mut sae_on = vec![i64::MIN; width * height];
-        let mut sae_off = vec![i64::MIN; width * height];
+        // One merged ramp — flow/corner geometry is independent of contrast polarity.
+        let mut sae = vec![i64::MIN; width * height];
 
         for index in 0..self.len() {
             let (x, y, t, p) = (xs[index] as usize, ys[index] as usize, ts[index], ps[index]);
-            let sae = if p { &mut sae_on } else { &mut sae_off };
             sae[y * width + x] = t;
 
             if x < margin || y < margin || x + margin >= width || y + margin >= height {
                 continue;
             }
-            if harris_response(sae, x, y, width, t, scale, tau_ms) > threshold {
+            if harris_response(&sae, x, y, width, scale) > threshold {
                 builder.push(xs[index], ys[index], t, p);
             }
         }
@@ -176,46 +172,42 @@ fn ring_is_corner(
     false
 }
 
-/// Harris response of the local time surface. Builds the exponential surface `exp(-age/τ)` over the
-/// `(2R+1)²` window around `(cx, cy)`, then sums the structure tensor of its central-difference
-/// gradients and returns `det - k·trace²`.
-fn harris_response(
-    sae: &[i64],
-    cx: usize,
-    cy: usize,
-    width: usize,
-    now: i64,
-    scale: f64,
-    tau_ms: f64,
-) -> f64 {
-    let side = 2 * HARRIS_RADIUS + 1;
-    let surface = |x: usize, y: usize| -> f64 {
+/// Minimum number of valid gradient samples in the window for a Harris score to be meaningful.
+const HARRIS_MIN_SAMPLES: usize = 3;
+
+/// Harris response of the raw SAE ramp over the `(2R+1)²` window around `(cx, cy)`. Reads the SAE
+/// as a time surface `T` (in ms), takes central-difference gradients wherever both neighbours have
+/// fired, and returns `det(M) - k·trace(M)²` for the structure tensor `M = Σ ∇T ∇Tᵀ`. Unfired
+/// pixels are skipped (their gradient is undefined), so a window with too little structure returns
+/// `-∞` (never a corner). The caller guarantees the window lies `HARRIS_RADIUS + 1` inside every
+/// border, so the `x ± 1` / `y ± 1` reads are in bounds.
+fn harris_response(sae: &[i64], cx: usize, cy: usize, width: usize, scale: f64) -> f64 {
+    let t_at = |x: usize, y: usize| -> Option<f64> {
         let t = sae[y * width + x];
-        if t == i64::MIN {
-            0.0
-        } else {
-            (-(now.saturating_sub(t) as f64) * scale / tau_ms).exp()
-        }
+        (t != i64::MIN).then_some(t as f64 * scale)
     };
-    // Sample the window plus a one-pixel border so central differences are defined everywhere.
-    let mut patch = vec![0.0_f64; (side + 2) * (side + 2)];
-    for j in 0..side + 2 {
-        for i in 0..side + 2 {
-            let x = cx + i - (HARRIS_RADIUS + 1);
-            let y = cy + j - (HARRIS_RADIUS + 1);
-            patch[j * (side + 2) + i] = surface(x, y);
-        }
-    }
+    // Gradient at a fired pixel from central differences, needing both neighbours on each axis.
+    let gradient = |x: usize, y: usize| -> Option<(f64, f64)> {
+        t_at(x, y)?; // the pixel itself must have fired
+        let gx = (t_at(x + 1, y)? - t_at(x - 1, y)?) / 2.0;
+        let gy = (t_at(x, y + 1)? - t_at(x, y - 1)?) / 2.0;
+        Some((gx, gy))
+    };
 
     let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
-    for j in 1..=side {
-        for i in 1..=side {
-            let ix = (patch[j * (side + 2) + i + 1] - patch[j * (side + 2) + i - 1]) / 2.0;
-            let iy = (patch[(j + 1) * (side + 2) + i] - patch[(j - 1) * (side + 2) + i]) / 2.0;
-            sxx += ix * ix;
-            syy += iy * iy;
-            sxy += ix * iy;
+    let mut samples = 0;
+    for y in cy - HARRIS_RADIUS..=cy + HARRIS_RADIUS {
+        for x in cx - HARRIS_RADIUS..=cx + HARRIS_RADIUS {
+            if let Some((ix, iy)) = gradient(x, y) {
+                sxx += ix * ix;
+                syy += iy * iy;
+                sxy += ix * iy;
+                samples += 1;
+            }
         }
+    }
+    if samples < HARRIS_MIN_SAMPLES {
+        return f64::NEG_INFINITY;
     }
     let det = sxx * syy - sxy * sxy;
     let trace = sxx + syy;
@@ -315,19 +307,43 @@ mod tests {
 
         let corners = stream.efast();
         assert!(corners.len() <= stream.len());
-        let harris = stream.harris_corners(0.0, 30.0);
+        let harris = stream.harris_corners(0.0);
         assert!(harris.len() <= stream.len());
     }
 
     #[test]
     fn harris_empty_and_tiny_sensor_are_empty() {
-        assert_eq!(empty(20, 20).harris_corners(0.0, 30.0).len(), 0);
+        assert_eq!(empty(20, 20).harris_corners(0.0).len(), 0);
         // Sensor smaller than the Harris window → nothing evaluable.
         assert_eq!(
             EventStream::from_array2(array![[1, 1, 5, 1]], 4, 4, 0.001)
-                .harris_corners(-1.0, 30.0)
+                .harris_corners(0.0)
                 .len(),
             0
+        );
+    }
+
+    /// A straight edge sweeping across the sensor is rank-1 on the SAE ramp (`R < 0`), so the
+    /// `threshold = 0` Harris keeps almost nothing — the property that makes it a corner detector
+    /// rather than an edge detector.
+    #[test]
+    fn harris_rejects_a_straight_moving_edge() {
+        let mut rows = Vec::new();
+        let mut t = 0_u64;
+        for step in 0..30u64 {
+            for y in 2..28u64 {
+                rows.push([5 + step, y, t, 1]); // vertical edge column advancing in +x
+            }
+            t += 100;
+        }
+        let events = Array2::from_shape_vec((rows.len(), 4), rows.concat()).unwrap();
+        let stream = EventStream::from_array2(events, 40, 30, 0.001);
+        let kept = stream.harris_corners(0.0).len();
+        // Far below 5% of the edge events survive (no true corner is present).
+        assert!(
+            kept * 20 < stream.len(),
+            "straight edge should yield ~no corners, got {kept}/{}",
+            stream.len()
         );
     }
 }

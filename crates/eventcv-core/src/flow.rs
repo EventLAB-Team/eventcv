@@ -20,6 +20,9 @@ use crate::EventStream;
 const COND_RATIO: f64 = 1e-3;
 /// `trace(M)` (summed squared gradient) below this is a flat, event-free window — no flow.
 const FLAT_EPSILON: f64 = 1e-12;
+/// Minimum gradient coherence (`|Σ∇T|² / (n·Σ|∇T|²)`, in `[0, 1]`) to trust a normal-flow estimate.
+/// Below this the window's gradients disagree (noise), and normal flow would blow up.
+const NORMAL_FLOW_MIN_COHERENCE: f64 = 0.35;
 
 impl EventStream {
     /// Estimates dense optical flow by Lucas-Kanade on the time surface. `window` is the
@@ -124,7 +127,15 @@ impl EventStream {
                     // Well-conditioned corner — full Lucas-Kanade.
                     ((syy * bx - sxy * by) / det, (sxx * by - sxy * bx) / det)
                 } else {
-                    // Single edge (aperture problem) — normal flow along the mean gradient.
+                    // Single edge (aperture problem) — normal flow along the mean gradient. Guard
+                    // against near-cancelling (incoherent) gradients: `coherence = |Σ∇T|² /
+                    // (n·Σ|∇T|²)` is 1 for a clean edge and →0 for noise, and `‖normal flow‖ =
+                    // 1/|mean ∇T|` blows up as the mean shrinks. Skip low-coherence windows so
+                    // noisy patches don't emit huge spurious vectors.
+                    let coherence = (bx * bx + by * by) / (count * trace);
+                    if coherence < NORMAL_FLOW_MIN_COHERENCE {
+                        continue;
+                    }
                     let (gx_bar, gy_bar) = (bx / count, by / count);
                     let mag2 = gx_bar * gx_bar + gy_bar * gy_bar;
                     (gx_bar / mag2, gy_bar / mag2)

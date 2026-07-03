@@ -1,7 +1,8 @@
 //! Frame → pixels rendering: the shared 2-D visualisation path used by PNG export and the
-//! interactive viewer's image representations. Every [`EventFrame`] reduces to a per-pixel
+//! interactive viewer's image representations. Most [`EventFrame`]s reduce to a per-pixel
 //! scalar field (signed for polarity/voxel/time-surface reprs, unsigned for count/binary),
-//! which a [`Colormap`] turns into RGB. Tencode is passed through as its own RGB encoding.
+//! which a [`Colormap`] turns into RGB. Two kinds have their own RGB path: Tencode (already an RGB
+//! encoding) and Flow (Middlebury colour coding — direction → hue, speed → saturation).
 
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
 
@@ -52,6 +53,14 @@ pub fn render_frame(frame: &EventFrame, colormap: Colormap, normalize: bool) -> 
             pixels: render_tencode(frame, plane_len, normalize),
         };
     }
+    // Flow has its own RGB path: Middlebury colour coding (direction → hue, speed → saturation).
+    if frame.kind() == RepresentationKind::Flow {
+        return Rgb8Image {
+            width,
+            height,
+            pixels: render_flow(frame, plane_len, normalize),
+        };
+    }
 
     let (field, signed) = scalar_field(frame, plane_len);
     let scale = field_scale(&field, signed, is_float(frame.data()), normalize);
@@ -83,13 +92,8 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
         RepresentationKind::Binary | RepresentationKind::Count | RepresentationKind::Labels => {
             ((0..plane_len).map(|i| value_at(data, i)).collect(), false)
         }
-        // Two flow channels — display speed (magnitude), unsigned.
-        RepresentationKind::Flow => (
-            (0..plane_len)
-                .map(|i| value_at(data, i).hypot(value_at(data, plane_len + i)))
-                .collect(),
-            false,
-        ),
+        // Flow is handled by render_flow before this call (Middlebury colour coding).
+        RepresentationKind::Flow => (vec![0.0; plane_len], false),
         // Positive/negative planes — their difference (signed).
         RepresentationKind::Polarity
         | RepresentationKind::TimeSurface
@@ -131,14 +135,13 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
     }
 }
 
-/// The reciprocal of the field's display maximum, so `value * scale` lands in `[0, 1]`
-/// (unsigned) or `[-1, 1]` (signed).
+/// The reciprocal of the field's display extent, so `value * scale` lands in `[0, 1]` (unsigned)
+/// or `[-1, 1]` (signed). The extent is a **high percentile** of the non-zero magnitudes rather
+/// than the raw max, so a handful of outliers (e.g. spurious large flow vectors) don't crush the
+/// rest of the field to black; values above the percentile clamp to the top colour.
 fn field_scale(field: &[f64], signed: bool, is_float: bool, normalize: bool) -> f64 {
     if normalize {
-        let extent = field
-            .iter()
-            .map(|v| if signed { v.abs() } else { *v })
-            .fold(0.0_f64, f64::max);
+        let extent = robust_extent(field, signed);
         if extent > 0.0 {
             1.0 / extent
         } else {
@@ -149,6 +152,101 @@ fn field_scale(field: &[f64], signed: bool, is_float: bool, normalize: bool) -> 
     } else {
         1.0 / 255.0 // integer counts read as 8-bit intensities
     }
+}
+
+/// The 99th percentile of the field's non-zero magnitudes — a display max robust to a few
+/// outliers. Falls back to the raw max when there are too few non-zero samples for a percentile
+/// to be meaningful (e.g. a sparse count image), preserving the "busiest pixel → top" behaviour.
+fn robust_extent(field: &[f64], signed: bool) -> f64 {
+    let mut mags: Vec<f64> = field
+        .iter()
+        .map(|&v| if signed { v.abs() } else { v })
+        .filter(|&v| v > 0.0)
+        .collect();
+    if mags.len() < 100 {
+        return mags.iter().copied().fold(0.0_f64, f64::max);
+    }
+    let index = (((mags.len() as f64) * 0.99).ceil() as usize - 1).min(mags.len() - 1);
+    mags.select_nth_unstable_by(index, f64::total_cmp);
+    mags[index]
+}
+
+/// Renders a two-channel flow frame with the **Middlebury** colour coding (Baker et al.): the flow
+/// *direction* selects a hue from a fixed colour wheel, and the *speed* sets saturation — zero flow
+/// is white, faster flow is more vivid. Speed is normalised by a robust percentile of the field
+/// (or `1.0` when `normalize` is false, treating values as already in px/ms ≈ [0, 1]).
+/// Gamma applied to normalised flow speed before colour-coding, to lift the skewed low end.
+const FLOW_GAMMA: f64 = 0.5;
+
+fn render_flow(frame: &EventFrame, plane_len: usize, normalize: bool) -> Vec<u8> {
+    let data = frame.data();
+    let magnitude = |i: usize| value_at(data, i).hypot(value_at(data, plane_len + i));
+    let scale = if normalize {
+        let mags: Vec<f64> = (0..plane_len).map(magnitude).collect();
+        let extent = robust_extent(&mags, false);
+        if extent > 0.0 {
+            1.0 / extent
+        } else {
+            0.0
+        }
+    } else {
+        1.0
+    };
+
+    let wheel = flow_color_wheel();
+    let ncols = wheel.len();
+    let mut pixels = Vec::with_capacity(plane_len * 3);
+    for i in 0..plane_len {
+        let (fx, fy) = (value_at(data, i), value_at(data, plane_len + i));
+        // Perceptual gamma on the normalised speed: event flow is heavily skewed toward small
+        // magnitudes, so a plain linear scale leaves almost everything near white. `√` expands the
+        // low end so slow flow is still visible while the top stays vivid.
+        let rad = (magnitude(i) * scale).powf(FLOW_GAMMA);
+        // Direction → position on the colour wheel (Baker et al. use atan2(-v, -u)).
+        let angle = (-fy).atan2(-fx) / std::f64::consts::PI; // [-1, 1]
+        let fk = (angle + 1.0) / 2.0 * (ncols as f64 - 1.0);
+        let k0 = fk.floor() as usize;
+        let k1 = (k0 + 1) % ncols;
+        let f = fk - k0 as f64;
+        let mut rgb = [0_u8; 3];
+        for (channel, slot) in rgb.iter_mut().enumerate() {
+            let base = (1.0 - f) * wheel[k0][channel] + f * wheel[k1][channel];
+            // Saturate with speed: rad=0 → white, rad=1 → full colour, rad>1 → darkened.
+            let col = if rad <= 1.0 {
+                1.0 - rad * (1.0 - base)
+            } else {
+                base * 0.75
+            };
+            *slot = (255.0 * col).round().clamp(0.0, 255.0) as u8;
+        }
+        pixels.extend_from_slice(&rgb);
+    }
+    pixels
+}
+
+/// The canonical 55-entry Middlebury flow colour wheel (values in `[0, 1]`), stepping through
+/// red→yellow→green→cyan→blue→magenta→red so that each flow direction maps to a distinct hue.
+fn flow_color_wheel() -> Vec<[f64; 3]> {
+    const SEGMENTS: [(usize, [f64; 3], [f64; 3]); 6] = [
+        (15, [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]), // red → yellow
+        (6, [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]),  // yellow → green
+        (4, [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]),  // green → cyan
+        (11, [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]), // cyan → blue
+        (13, [0.0, 0.0, 1.0], [1.0, 0.0, 1.0]), // blue → magenta
+        (6, [1.0, 0.0, 1.0], [1.0, 0.0, 0.0]),  // magenta → red
+    ];
+    let mut wheel = Vec::with_capacity(55);
+    for (count, from, to) in SEGMENTS {
+        for step in 0..count {
+            let t = step as f64 / count as f64;
+            wheel.push([
+                from[0] + t * (to[0] - from[0]),
+                from[1] + t * (to[1] - from[1]),
+                from[2] + t * (to[2] - from[2]),
+            ]);
+        }
+    }
+    wheel
 }
 
 fn render_tencode(frame: &EventFrame, plane_len: usize, normalize: bool) -> Vec<u8> {
@@ -270,7 +368,10 @@ const TURBO: [[u8; 3]; 11] = [
 #[cfg(test)]
 mod tests {
     use super::{render_frame, Colormap, Rgb8Image};
-    use crate::representation::{AveragedTimeSurface, Binary, EventCount, Representation, Tencode};
+    use crate::representation::{
+        AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, Representation,
+        RepresentationKind, Tencode,
+    };
     use crate::EventStream;
     use ndarray::array;
 
@@ -296,6 +397,61 @@ mod tests {
         // Pixel (0,0) has the max count (2) → white; (1,0) has 1 → mid grey.
         assert_eq!(pixel(&image, 0, 0), [255, 255, 255]);
         assert_eq!(pixel(&image, 1, 0), [128, 128, 128]);
+    }
+
+    #[test]
+    fn a_single_outlier_does_not_black_out_the_rest_of_the_field() {
+        // A 12×12 count frame: 143 pixels at 10, one spurious outlier at 1000. With
+        // max-normalisation the typical pixels would render near-black; the robust (p99) extent
+        // keeps them bright.
+        let plane = 12 * 12;
+        let mut data = vec![10_u64; plane];
+        data[0] = 1000; // the outlier
+        let frame = EventFrame::from_parts(
+            EventFrameData::U64(data),
+            12,
+            12,
+            RepresentationKind::Count,
+            vec!["count".to_owned()],
+        );
+
+        let image = render_frame(&frame, Colormap::Grayscale, true);
+
+        // A typical (10) pixel maps to the top of the range, not the floor.
+        assert!(
+            pixel(&image, 5, 5)[0] > 200,
+            "typical value must stay visible"
+        );
+    }
+
+    #[test]
+    fn flow_middlebury_encodes_direction_as_hue_and_zero_as_white() {
+        // A 12×12 flow frame: left half flows +x, right half flows -x, plus one zero pixel.
+        let plane = 12 * 12;
+        let mut data = vec![0.0_f32; plane * 2];
+        for y in 0..12 {
+            for x in 0..12 {
+                data[y * 12 + x] = if x < 6 { 1.0 } else { -1.0 }; // flow_x; flow_y stays 0
+            }
+        }
+        data[0] = 0.0; // a zero-flow pixel at the top-left
+        let frame = EventFrame::from_parts(
+            EventFrameData::F32(data),
+            12,
+            12,
+            RepresentationKind::Flow,
+            vec!["flow_x".to_owned(), "flow_y".to_owned()],
+        );
+
+        let image = render_frame(&frame, Colormap::Viridis, true);
+
+        // Opposite directions get different colours; zero flow renders white.
+        assert_ne!(
+            pixel(&image, 3, 5),
+            pixel(&image, 9, 5),
+            "opposite flow directions must differ in colour"
+        );
+        assert_eq!(pixel(&image, 0, 0), [255, 255, 255], "zero flow is white");
     }
 
     #[test]

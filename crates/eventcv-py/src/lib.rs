@@ -214,11 +214,13 @@ impl PyEventStream {
         Self::wrap(py.detach(|| self.inner.efast()))
     }
 
-    /// Harris corner score on the local time surface: keeps events whose Harris response
-    /// `det - k·trace²` exceeds `threshold`. `tau_ms` sets the time-surface decay (default 30 ms).
-    #[pyo3(signature = (threshold, *, tau_ms=30.0))]
-    fn harris_corners(&self, py: Python<'_>, threshold: f64, tau_ms: f64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.harris_corners(threshold, tau_ms)))
+    /// Harris corner score on the Surface of Active Events: keeps events whose Harris response
+    /// `det - k·trace²` of the SAE-ramp structure tensor exceeds `threshold`. The default
+    /// `threshold=0` keeps corners (rank-2, R>0) and rejects straight edges (rank-1, R<0); raise
+    /// it to be stricter.
+    #[pyo3(signature = (threshold=0.0))]
+    fn harris_corners(&self, py: Python<'_>, threshold: f64) -> PyEventStream {
+        Self::wrap(py.detach(|| self.inner.harris_corners(threshold)))
     }
 
     /// Dense Lucas-Kanade optical flow on the time surface. Returns a two-channel `(flow_x,
@@ -309,6 +311,9 @@ impl PyEventStream {
             .map_err(map_representation_error)
     }
 
+    /// Opens the interactive viewer on this stream. Pass a representation **name** to choose what
+    /// to show — `stream.view("flow")`, `stream.view("count")`, `stream.view("voxel")`, … — or
+    /// omit it for the default polarity image. (Equivalent to `stream.<repr>().view()`.)
     #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=true))]
     fn view(
         &self,
@@ -338,13 +343,21 @@ impl PyEventStream {
         normalize: bool,
     ) -> PyResult<PyEventFrame> {
         if representation.extract::<PyRef<'_, PyPolarity>>().is_ok() {
-            self.generate_polarity(py, Polarity::new(normalize))
-        } else {
-            let name = representation.get_type().name()?.extract::<String>()?;
-            Err(PyTypeError::new_err(format!(
-                "unsupported representation: {name}"
-            )))
+            return self.generate_polarity(py, Polarity::new(normalize));
         }
+        // A representation *name* ("count", "flow", "voxel", …) renders that repr with its
+        // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
+        if let Ok(name) = representation.extract::<String>() {
+            let spec = ReprSpec::new(&name, None, None, None, None, None, normalize)?;
+            return py
+                .detach(|| spec.generate(&self.inner))
+                .map(|inner| PyEventFrame { inner })
+                .map_err(map_representation_error);
+        }
+        let name = representation.get_type().name()?.extract::<String>()?;
+        Err(PyTypeError::new_err(format!(
+            "unsupported representation: {name}"
+        )))
     }
 
     fn generate_polarity(&self, py: Python<'_>, polarity: Polarity) -> PyResult<PyEventFrame> {
@@ -701,21 +714,24 @@ struct PyEventReader {
 #[derive(Clone, Copy)]
 enum SliceOp {
     Efast,
-    Harris { threshold: f64, tau_ms: f64 },
+    Harris { threshold: f64 },
 }
 
 impl SliceOp {
     fn apply(self, stream: &EventStream) -> EventStream {
         match self {
             Self::Efast => stream.efast(),
-            Self::Harris { threshold, tau_ms } => stream.harris_corners(threshold, tau_ms),
+            Self::Harris { threshold } => stream.harris_corners(threshold),
         }
     }
 }
 
 /// Applies a reader's per-slice op (if any) to a freshly fetched slice.
 fn apply_slice_op(op: Option<SliceOp>, stream: EventStream) -> EventStream {
-    op.map_or(stream, |op| op.apply(&stream))
+    match op {
+        Some(op) => op.apply(&stream),
+        None => stream,
+    }
 }
 
 #[pymethods]
@@ -826,6 +842,7 @@ impl PyEventReader {
     /// params take their method defaults). The dataset-mode counterpart of `open(repr=…)`,
     /// but with per-representation options: e.g. `reader.with_repr("voxel", bins=5)`.
     #[pyo3(signature = (repr, *, bins=None, window_ms=None, tau_ms=None, max_window_ms=None, window=None, normalize=true))]
+    #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
         repr: &str,
@@ -836,7 +853,15 @@ impl PyEventReader {
         window: Option<i64>,
         normalize: bool,
     ) -> PyResult<PyEventReader> {
-        let spec = ReprSpec::new(repr, bins, window_ms, tau_ms, max_window_ms, window, normalize)?;
+        let spec = ReprSpec::new(
+            repr,
+            bins,
+            window_ms,
+            tau_ms,
+            max_window_ms,
+            window,
+            normalize,
+        )?;
         Ok(PyEventReader {
             inner: Arc::clone(&self.inner),
             dt_us: self.dt_us,
@@ -858,9 +883,9 @@ impl PyEventReader {
     }
 
     /// Returns a new reader whose every slice is passed through [`EventStream::harris_corners`].
-    #[pyo3(signature = (threshold, *, tau_ms=30.0))]
-    fn harris_corners(&self, threshold: f64, tau_ms: f64) -> PyEventReader {
-        self.with_slice_op(SliceOp::Harris { threshold, tau_ms })
+    #[pyo3(signature = (threshold=0.0))]
+    fn harris_corners(&self, threshold: f64) -> PyEventReader {
+        self.with_slice_op(SliceOp::Harris { threshold })
     }
 
     /// Renders slice `indices` into one dense `[B, C, H, W]` array — the explicit-batch path
@@ -958,6 +983,7 @@ impl PyEventReader {
             step_us,
             span_us,
             end: if empty { i64::MIN } else { hi },
+            slice_op: self.slice_op,
         })
     }
 }
@@ -977,6 +1003,16 @@ impl PyEventReader {
         })
         .map(|inner| PyEventStream { inner })
         .map_err(map_io_error)
+    }
+
+    /// A new reader over the same file (and `dt`/`repr`) that applies `op` to every slice.
+    fn with_slice_op(&self, op: SliceOp) -> PyEventReader {
+        PyEventReader {
+            inner: Arc::clone(&self.inner),
+            dt_us: self.dt_us,
+            repr: self.repr,
+            slice_op: Some(op),
+        }
     }
 
     fn require_dt(&self) -> PyResult<i64> {
@@ -1014,6 +1050,7 @@ struct PyWindowIterator {
     step_us: i64,
     span_us: i64,
     end: i64,
+    slice_op: Option<SliceOp>,
 }
 
 #[pymethods]
@@ -1030,8 +1067,15 @@ impl PyWindowIterator {
         let t1 = t0.saturating_add(self.span_us);
         self.cursor = self.cursor.saturating_add(self.step_us);
         let reader = Arc::clone(&self.reader);
+        let op = self.slice_op;
         let stream = py
-            .detach(move || reader.lock().unwrap().slice_time(t0, t1))
+            .detach(move || {
+                reader
+                    .lock()
+                    .unwrap()
+                    .slice_time(t0, t1)
+                    .map(|stream| apply_slice_op(op, stream))
+            })
             .map_err(map_io_error)?;
         Ok(Some(PyEventStream { inner: stream }))
     }
@@ -1234,6 +1278,7 @@ enum ReprSpec {
     AveragedTimeSurface { tau_ms: f64 },
     Tencode { window_ms: f64 },
     Mcts { max_window_ms: f64 },
+    Flow { window: usize },
 }
 
 impl ReprSpec {
@@ -1245,6 +1290,7 @@ impl ReprSpec {
         window_ms: Option<f64>,
         tau_ms: Option<f64>,
         max_window_ms: Option<f64>,
+        window: Option<i64>,
         normalize: bool,
     ) -> PyResult<Self> {
         Ok(match name {
@@ -1273,6 +1319,17 @@ impl ReprSpec {
             "mcts" => Self::Mcts {
                 max_window_ms: max_window_ms.unwrap_or(30.0),
             },
+            "flow" => Self::Flow {
+                window: window
+                    .map(|value| {
+                        usize::try_from(value)
+                            .ok()
+                            .filter(|&w| w >= 1)
+                            .ok_or_else(|| PyValueError::new_err("window must be at least 1"))
+                    })
+                    .transpose()?
+                    .unwrap_or(3),
+            },
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown representation: {other}"
@@ -1291,6 +1348,7 @@ impl ReprSpec {
             Self::AveragedTimeSurface { .. } => "atsurf",
             Self::Tencode { .. } => "tencode",
             Self::Mcts { .. } => "mcts",
+            Self::Flow { .. } => "flow",
         }
     }
 
@@ -1306,6 +1364,10 @@ impl ReprSpec {
             }
             Self::Tencode { window_ms } => Tencode::new(window_ms).generate(stream),
             Self::Mcts { max_window_ms } => Mcts::new(max_window_ms).generate(stream),
+            Self::Flow { window } => stream.optical_flow(window).map_err(|error| match error {
+                FlowError::SizeOverflow => RepresentationError::SizeOverflow,
+                FlowError::InvalidParameter(name) => RepresentationError::InvalidParameter(name),
+            }),
         }
     }
 }
