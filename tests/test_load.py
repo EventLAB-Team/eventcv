@@ -118,6 +118,29 @@ class LoadTests(unittest.TestCase):
         self.assertNotEqual(stream.voxel().numpy().sum(), 0)
         np.testing.assert_array_equal(stream.numpy(), original)
 
+    def test_generates_count_and_averaged_time_surface(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        count = stream.count(normalize=False)
+        count_norm = stream.count()
+        atsurf = stream.atsurf()
+
+        self.assertEqual((count.kind, count.shape), ("count", (1, 480, 640)))
+        self.assertEqual(count.channel_names, ("count",))
+        self.assertEqual(count.numpy().dtype, np.uint64)
+        # Total events land somewhere on the single count plane (polarities summed).
+        self.assertEqual(count.numpy().sum(), len(stream))
+        self.assertEqual(count_norm.numpy().dtype, np.uint8)
+        self.assertEqual(count_norm.numpy().max(), 255)
+
+        self.assertEqual((atsurf.kind, atsurf.shape), ("atsurf", (2, 480, 640)))
+        self.assertEqual(atsurf.channel_names, ("positive", "negative"))
+        self.assertEqual(atsurf.numpy().dtype, np.float32)
+        # Averaged responses are bounded by 1 (a mean of exp(-age/tau) values).
+        self.assertLessEqual(atsurf.numpy().max(), 1.0 + 1e-6)
+        self.assertTrue(callable(count.view))
+        self.assertTrue(callable(atsurf.view))
+
     def test_validates_representation_parameters(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
@@ -125,6 +148,7 @@ class LoadTests(unittest.TestCase):
             lambda: stream.voxel(bins=0),
             lambda: stream.voxel(window_ms=float("nan")),
             lambda: stream.tsurf(tau_ms=0),
+            lambda: stream.atsurf(tau_ms=0),
             lambda: stream.tencode(window_ms=float("inf")),
             lambda: stream.mcts(max_window_ms=0.5),
         ):
@@ -139,8 +163,10 @@ class LoadTests(unittest.TestCase):
             stream = eventcv.load(str(path))
 
             self.assertEqual(stream.flatten(binary=True).shape, (1, 480, 640))
+            self.assertEqual(stream.count().shape, (1, 480, 640))
             self.assertEqual(stream.voxel().shape, (9, 480, 640))
             self.assertEqual(stream.tsurf().shape, (2, 480, 640))
+            self.assertEqual(stream.atsurf().shape, (2, 480, 640))
             self.assertEqual(stream.tencode().shape, (3, 480, 640))
             self.assertEqual(stream.mcts().shape, (10, 480, 640))
             self.assertEqual(stream.pset().shape, (0, 4))

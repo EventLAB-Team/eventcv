@@ -24,6 +24,7 @@ pub use text::{
 };
 
 use crate::representation::EventFrame;
+use crate::viz::{render_frame, Colormap};
 
 /// A single event as produced by a reader, before it is placed on the sensor grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +94,7 @@ enum Format {
     Aedat4,
     PropheseeDat,
     PropheseeRaw,
+    Png,
 }
 
 fn detect_format(path: &Path) -> Result<Format, IoError> {
@@ -109,6 +111,7 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
         Some("aedat4") => Ok(Format::Aedat4),
         Some("dat") => Ok(Format::PropheseeDat),
         Some("raw") => Ok(Format::PropheseeRaw),
+        Some("png") => Ok(Format::Png),
         Some(other) => Err(IoError::Unsupported(format!(
             "unrecognised file extension: .{other}"
         ))),
@@ -147,6 +150,9 @@ pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream,
         Format::PropheseeDat => prophesee::read_dat(path, &options),
         Format::PropheseeRaw => Err(IoError::Unsupported(
             "Prophesee .raw (EVT2/EVT3) reading is not implemented yet".to_owned(),
+        )),
+        Format::Png => Err(IoError::Unsupported(
+            "PNG is a frame export format, not an event stream; use save_frame".to_owned(),
         )),
     }
 }
@@ -263,6 +269,10 @@ pub struct SaveOptions {
     /// Rosbag topic to write the `dvs_msgs/EventArray` messages on (defaults to
     /// `/davis/left/events`, matching the reader).
     pub topic: Option<String>,
+    /// PNG frame export only: the colour map (default [`Colormap::Viridis`]).
+    pub colormap: Colormap,
+    /// PNG frame export only: auto-contrast the field to its data range. `None` = `true`.
+    pub normalize: Option<bool>,
 }
 
 /// Persists an [`EventStream`] to `path`, the format chosen by extension — the symmetric
@@ -301,7 +311,7 @@ pub fn save_stream(
 pub fn save_frame(
     path: impl AsRef<Path>,
     frame: &EventFrame,
-    _options: &SaveOptions,
+    options: &SaveOptions,
 ) -> Result<(), IoError> {
     let path = path.as_ref();
     match detect_format(path)? {
@@ -318,10 +328,29 @@ pub fn save_frame(
                 ))
             }
         }
+        Format::Png => write_png_frame(path, frame, options),
         other => Err(IoError::Unsupported(format!(
             "saving an event frame as {other:?} is not supported"
         ))),
     }
+}
+
+/// Renders a frame through [`render_frame`] (colormapped 2-D view) and encodes it as an
+/// 8-bit RGB PNG. Unlike npz/HDF5 this is a *view*, not a round-trippable dump.
+fn write_png_frame(path: &Path, frame: &EventFrame, options: &SaveOptions) -> Result<(), IoError> {
+    let image = render_frame(frame, options.colormap, options.normalize.unwrap_or(true));
+    let file = std::fs::File::create(path)?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, image.width as u32, image.height as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(&image.pixels))
+        .map_err(|error| match error {
+            png::EncodingError::IoError(error) => IoError::Io(error),
+            other => IoError::Format(other.to_string()),
+        })
 }
 
 /// Reads an [`EventFrame`] previously written by [`save_frame`], reconstructing its dtype,

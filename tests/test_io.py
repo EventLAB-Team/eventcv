@@ -286,6 +286,78 @@ class OpenReaderTests(unittest.TestCase):
             self._frames().slice(0, t1_ms=5.0)
 
 
+class DatasetReaderTests(unittest.TestCase):
+    """`EventReader` as a PyTorch-style map dataset (Workstream D2)."""
+
+    def _dataset(self, repr="count"):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        return eventcv.open(str(path), dt_ms=0.01, repr=repr, sensor_size=(8, 8), time_unit="us")
+
+    def test_len_is_n_slices_in_dataset_mode(self):
+        reader = self._dataset()
+        self.assertEqual(reader.repr, "count")
+        self.assertEqual(len(reader), reader.n_slices)  # 4
+        self.assertEqual(len(reader), 4)
+
+    def test_len_stays_event_count_without_dt(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n")
+        reader = eventcv.open(str(path), sensor_size=(8, 8), time_unit="us")
+        self.assertIsNone(reader.repr)
+        self.assertEqual(len(reader), 2)
+
+    def test_getitem_returns_dense_frame_when_repr_set(self):
+        reader = self._dataset()
+        frame = reader[0]
+        self.assertIsInstance(frame, np.ndarray)
+        self.assertEqual(frame.shape, (1, 8, 8))  # count = 1 channel
+        self.assertEqual(frame.dtype, np.uint8)   # normalized by default
+        # Frame 0 holds exactly the event at (0,0).
+        self.assertEqual(frame.sum(), frame[0, 0, 0])
+
+    def test_getitem_stays_stream_without_repr(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        reader = eventcv.open(str(path), dt_ms=0.01, sensor_size=(8, 8), time_unit="us")
+        self.assertIsInstance(reader[0], eventcv.EventStream)
+
+    def test_with_repr_sets_parameters(self):
+        reader = self._dataset(repr=None).with_repr("voxel", bins=5)
+        self.assertEqual(reader.repr, "voxel")
+        self.assertEqual(reader[0].shape, (5, 8, 8))
+        self.assertEqual(reader[0].dtype, np.float32)
+
+    def test_batch_stacks_indices(self):
+        reader = self._dataset()
+        batch = reader.batch([0, 2, 3])
+        self.assertEqual(batch.shape, (3, 1, 8, 8))
+        self.assertEqual(batch.dtype, np.uint8)
+        # Each row matches the corresponding single-index render.
+        for row, index in enumerate([0, 2, 3]):
+            np.testing.assert_array_equal(batch[row], reader[index])
+
+    def test_batch_accepts_range_and_is_empty_safe(self):
+        reader = self._dataset()
+        self.assertEqual(reader.batch(range(reader.n_slices)).shape, (4, 1, 8, 8))
+        self.assertEqual(reader.batch([]).shape, (0, 1, 8, 8))
+
+    def test_batch_without_repr_raises(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n")
+        reader = eventcv.open(str(path), dt_ms=0.01, sensor_size=(8, 8), time_unit="us")
+        with self.assertRaisesRegex(ValueError, "representation"):
+            reader.batch([0])
+
+    def test_dataloader_style_iteration_tiles_every_slice(self):
+        # The "automatic" path: __len__ + __getitem__ let a sampler walk all frames.
+        reader = self._dataset()
+        seen = [reader[i] for i in range(len(reader))]
+        self.assertEqual(len(seen), 4)
+        total_events = sum(int(frame.sum()) for frame in seen)  # normalized counts
+        self.assertGreater(total_events, 0)
+
+
 @unittest.skipUnless(os.path.exists(_MVSEC_BAG), "MVSEC bag fixture not present")
 class BagSliceTests(unittest.TestCase):
     """In-place rosbag slicing via the chunk index (gated on the real 8.6 GB MVSEC bag)."""

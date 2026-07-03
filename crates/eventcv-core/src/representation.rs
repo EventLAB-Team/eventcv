@@ -2,7 +2,9 @@ use std::{error::Error, fmt};
 
 use crate::{Event, EventStream};
 
+mod averaged_time_surface;
 mod binary;
+mod count;
 mod mcts;
 mod point_set;
 mod polarity;
@@ -10,7 +12,9 @@ mod tencode;
 mod time_surface;
 mod voxel;
 
+pub use averaged_time_surface::AveragedTimeSurface;
 pub use binary::Binary;
+pub use count::EventCount;
 pub use mcts::Mcts;
 pub use point_set::{EventPointSet, PointSet};
 pub use polarity::Polarity;
@@ -26,7 +30,11 @@ pub trait Representation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepresentationKind {
+    AveragedTimeSurface,
     Binary,
+    Count,
+    Flow,
+    Labels,
     Mcts,
     Polarity,
     Tencode,
@@ -37,7 +45,11 @@ pub enum RepresentationKind {
 impl RepresentationKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AveragedTimeSurface => "atsurf",
             Self::Binary => "binary",
+            Self::Count => "count",
+            Self::Flow => "flow",
+            Self::Labels => "labels",
             Self::Mcts => "mcts",
             Self::Polarity => "polarity",
             Self::Tencode => "tencode",
@@ -49,7 +61,11 @@ impl RepresentationKind {
     /// The inverse of [`Self::as_str`] — recovers the kind tag stored by the frame writers.
     pub fn from_tag(tag: &str) -> Option<Self> {
         Some(match tag {
+            "atsurf" => Self::AveragedTimeSurface,
             "binary" => Self::Binary,
+            "count" => Self::Count,
+            "flow" => Self::Flow,
+            "labels" => Self::Labels,
             "mcts" => Self::Mcts,
             "polarity" => Self::Polarity,
             "tencode" => Self::Tencode,
@@ -225,8 +241,8 @@ mod tests {
     use ndarray::Array2;
 
     use super::{
-        Binary, EventFrameData, Mcts, PointSet, Representation, RepresentationError, Tencode,
-        TimeSurface, VoxelGrid,
+        AveragedTimeSurface, Binary, EventCount, EventFrameData, Mcts, PointSet, Representation,
+        RepresentationError, Tencode, TimeSurface, VoxelGrid,
     };
     use crate::EventStream;
 
@@ -240,8 +256,10 @@ mod tests {
 
         for frame in [
             Binary.generate(&stream).unwrap(),
+            EventCount::new(true).generate(&stream).unwrap(),
             VoxelGrid::default().generate(&stream).unwrap(),
             TimeSurface::default().generate(&stream).unwrap(),
+            AveragedTimeSurface::default().generate(&stream).unwrap(),
             Tencode::default().generate(&stream).unwrap(),
             Mcts::default().generate(&stream).unwrap(),
         ] {

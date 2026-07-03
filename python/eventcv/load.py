@@ -48,6 +48,7 @@ def open(
     path: str,
     *,
     dt_ms: float | None = None,
+    repr: str | None = None,
     sensor_size: tuple[int, int] | None = None,
     time_unit: str | None = None,
     order: str = "txyp",
@@ -72,6 +73,13 @@ def open(
     :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
     ``sensor_size`` to skip the one-time coordinate scan resolution inference needs.
 
+    Pass ``repr`` (a representation name — ``"count"``, ``"voxel"``, ``"tsurf"``, …) to make
+    the reader a PyTorch-style **map dataset**: ``len(reader) == n_slices``, ``reader[i]``
+    returns the dense ``[C, H, W]`` array for frame ``i``, and ``reader.batch(indices)`` stacks
+    a ``[B, C, H, W]`` batch — so a ``DataLoader`` can collate the reader directly. Use
+    ``reader.with_repr(name, **opts)`` to set per-representation options (e.g. ``bins=5``).
+    Without ``repr``, ``reader[i]`` stays a raw :class:`EventStream`.
+
     Example::
 
         r = eventcv.open("rec.hdf5", dt_ms=30)   # resolution + time unit auto-detected
@@ -80,12 +88,14 @@ def open(
         for frame in r.windows():                # walk every frame (step defaults to dt_ms)
             voxel = frame.voxel()
 
-        # Pass sensor_size to skip the coordinate scan on a huge HDF5:
-        r2 = eventcv.open("rec.hdf5", dt_ms=30, sensor_size=(346, 260))
+        # As a training dataset:
+        ds = eventcv.open("rec.hdf5", dt_ms=30, repr="count")
+        loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=True)
     """
     return _rust.open(
         path,
         dt_ms=dt_ms,
+        repr=repr,
         sensor_size=sensor_size,
         time_unit=time_unit,
         order=order,
@@ -118,6 +128,46 @@ def load_frame(path: str) -> EventFrame:
     return _rust.load_frame(path)
 
 
+def export_png(
+    frames,
+    out_dir: str,
+    *,
+    colormap: str = "viridis",
+    normalize: bool = True,
+    prefix: str = "frame_",
+    start: int = 0,
+    digits: int = 5,
+):
+    """Write one or many :class:`EventFrame` s to numbered ``.png`` files — the
+    "frame sequence → video frames" export.
+
+    ``frames`` is a single :class:`EventFrame` or any iterable of them (e.g. a
+    generator over a reader's windows), so a whole recording renders lazily without
+    materialising every frame at once::
+
+        r = eventcv.open("rec.hdf5", dt_ms=30)
+        eventcv.export_png((w.count() for w in r.windows()), "out/", colormap="turbo")
+
+    Each frame is colormapped through the same path as ``frame.save("x.png")``
+    (``colormap``: ``viridis``/``turbo``/``grayscale``/``redblue``; ``normalize``
+    auto-contrasts). Files are named ``{prefix}{index:0{digits}d}.png`` counting from
+    ``start``. Returns the list of written paths (assemble a video with, e.g.,
+    ``ffmpeg -i out/frame_%05d.png out.mp4``).
+    """
+    import os
+
+    if isinstance(frames, EventFrame):
+        frames = [frames]
+
+    os.makedirs(out_dir, exist_ok=True)
+    paths = []
+    for offset, frame in enumerate(frames):
+        path = os.path.join(out_dir, f"{prefix}{start + offset:0{digits}d}.png")
+        frame.save(path, colormap=colormap, normalize=normalize)
+        paths.append(path)
+    return paths
+
+
 __all__ = [
     "Camera",
     "EventFrame",
@@ -126,6 +176,7 @@ __all__ = [
     "EventStream",
     "FrameSink",
     "Polarity",
+    "export_png",
     "load",
     "load_frame",
     "open",

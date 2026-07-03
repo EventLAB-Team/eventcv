@@ -1,11 +1,15 @@
 use ndarray::Array2;
 
 pub mod camera;
+pub mod cluster;
+pub mod features;
 pub mod filter;
+pub mod flow;
 pub mod image;
 pub mod io;
 pub mod representation;
 pub mod transform;
+pub mod viz;
 
 const COLUMN_COUNT: usize = 4;
 

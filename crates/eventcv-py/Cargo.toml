@@ -11,14 +11,14 @@ crate-type = ["cdylib"]
 eventcv-core = { path = "../eventcv-core" }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 numpy = "0.29"
+# GPU-accelerated viewer (Metal on macOS, Vulkan on Linux, DX12 on Windows) — all pure-Rust,
+# so wheels still build without system graphics SDKs. Replaces the old minifb CPU rasteriser.
+wgpu = "22"
+winit = "0.30"
+pollster = "0.3"   # block on wgpu's async device/adapter requests
+bytemuck = { version = "1", features = ["derive"] }
 
 [features]
 # Build `.h5`/`.hdf5` support into the extension (forwards to eventcv-core, which
 # builds libhdf5 from source — needs cmake). Enable with `maturin develop --features hdf5`.
 hdf5 = ["eventcv-core/hdf5"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-minifb = { version = "0.28", default-features = false, features = ["x11"] }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-minifb = { version = "0.28", default-features = false }

@@ -108,6 +108,43 @@ class SaveFrameTests(unittest.TestCase):
         self._assert_frame_eq(eventcv.load_frame(path))
 
 
+class PngExportTests(unittest.TestCase):
+    def setUp(self):
+        self.stream = _make_stream()
+
+    def _read_png_header(self, path):
+        """Returns (width, height) from a PNG's IHDR without a decoder dependency."""
+        data = Path(path).read_bytes()
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        # IHDR is the first chunk: 8-byte sig, 4-byte len, 4-byte "IHDR", then w,h (big-endian u32).
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        return width, height
+
+    def test_frame_saves_a_png_view(self):
+        path = _tmp("frame.png")
+        self.stream.count().save(path, colormap="turbo")
+        self.assertEqual(self._read_png_header(path), SENSOR)
+
+    def test_save_rejects_unknown_colormap(self):
+        with self.assertRaises(ValueError):
+            self.stream.count().save(_tmp("frame.png"), colormap="rainbow")
+
+    def test_export_png_writes_a_numbered_sequence(self):
+        out = Path(tempfile.mkdtemp()) / "seq"
+        frames = (self.stream.count() for _ in range(3))
+        paths = eventcv.export_png(frames, str(out), prefix="f_", colormap="grayscale")
+
+        self.assertEqual([Path(p).name for p in paths], ["f_00000.png", "f_00001.png", "f_00002.png"])
+        for path in paths:
+            self.assertEqual(self._read_png_header(path), SENSOR)
+
+    def test_export_png_accepts_a_single_frame(self):
+        out = Path(tempfile.mkdtemp()) / "one"
+        paths = eventcv.export_png(self.stream.atsurf(), str(out))
+        self.assertEqual(len(paths), 1)
+
+
 class FrameSinkTests(unittest.TestCase):
     def test_sink_streams_a_window_stack(self):
         if eventcv.FrameSink is None:
