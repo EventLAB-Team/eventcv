@@ -2,6 +2,11 @@
 name = "eventcv-core"
 version = "0.0.1"
 edition = "2021"
+description = "Rust core of EventCV — OpenCV for event-based vision."
+license = "Apache-2.0"
+repository = "https://github.com/EventLAB-Team/eventcv"
+keywords = ["event-camera", "computer-vision", "dvs", "neuromorphic"]
+categories = ["computer-vision"]
 
 [dependencies]
 ndarray = "0.17"
