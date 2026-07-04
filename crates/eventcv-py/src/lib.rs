@@ -25,6 +25,10 @@ use pyo3::types::{PyAny, PyTuple};
 #[pyclass(name = "EventStream", frozen)]
 struct PyEventStream {
     inner: eventcv_core::EventStream,
+    /// Default representation carried from `open(repr=…)` / `with_repr` — what `view()` and
+    /// `flatten()` render when no explicit representation is passed. `None` for raw streams
+    /// (e.g. from `load`), which fall back to the polarity image.
+    repr: Option<ReprSpec>,
 }
 
 #[pymethods]
@@ -53,6 +57,13 @@ impl PyEventStream {
         self.inner.timestamp_scale_ms()
     }
 
+    /// The default representation name carried from `open(repr=…)` / `with_repr` (what
+    /// `view()`/`flatten()` render), or `None` for a raw stream.
+    #[getter]
+    fn repr(&self) -> Option<&'static str> {
+        self.repr.map(ReprSpec::name)
+    }
+
     fn numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u64>> {
         self.inner.to_array2().into_pyarray(py)
     }
@@ -75,58 +86,58 @@ impl PyEventStream {
 
     /// Keeps events inside the `w`×`h` window at `(x0, y0)`, shifted to a new origin.
     fn crop(&self, py: Python<'_>, x0: i64, y0: i64, w: usize, h: usize) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.crop(x0, y0, w, h)))
+        self.wrap(py.detach(|| self.inner.crop(x0, y0, w, h)))
     }
 
     /// Mirrors horizontally (`x → width-1-x`).
     fn flip_x(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.flip_x()))
+        self.wrap(py.detach(|| self.inner.flip_x()))
     }
 
     /// Mirrors vertically (`y → height-1-y`).
     fn flip_y(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.flip_y()))
+        self.wrap(py.detach(|| self.inner.flip_y()))
     }
 
     /// Rotates by `k * 90°` clockwise (quarter turns swap the sensor dims).
     fn rotate90(&self, py: Python<'_>, k: i32) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.rotate90(k)))
+        self.wrap(py.detach(|| self.inner.rotate90(k)))
     }
 
     /// Reflects across the main diagonal (`(x, y) → (y, x)`); swaps the sensor dims.
     fn transpose(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.transpose()))
+        self.wrap(py.detach(|| self.inner.transpose()))
     }
 
     /// Translates by `(dx, dy)`; events shifted off the sensor are dropped.
     fn translate(&self, py: Python<'_>, dx: i64, dy: i64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.translate(dx, dy)))
+        self.wrap(py.detach(|| self.inner.translate(dx, dy)))
     }
 
     /// Event-domain resize to a `width`×`height` grid (rebinned, not interpolated).
     fn resize(&self, py: Python<'_>, width: usize, height: usize) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.resize(width, height)))
+        self.wrap(py.detach(|| self.inner.resize(width, height)))
     }
 
     /// Scales the sensor by `(sx, sy)`.
     fn scale(&self, py: Python<'_>, sx: f64, sy: f64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.scale(sx, sy)))
+        self.wrap(py.detach(|| self.inner.scale(sx, sy)))
     }
 
     /// Applies a 2×3 affine matrix `[[a,b,c],[d,e,f]]` (rounded, no interpolation).
     fn warp_affine(&self, py: Python<'_>, matrix: [[f64; 3]; 2]) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.warp_affine(matrix)))
+        self.wrap(py.detach(|| self.inner.warp_affine(matrix)))
     }
 
     /// Applies a 3×3 perspective (homography) matrix.
     fn warp_perspective(&self, py: Python<'_>, matrix: [[f64; 3]; 3]) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.warp_perspective(matrix)))
+        self.wrap(py.detach(|| self.inner.warp_perspective(matrix)))
     }
 
     /// Rectifies events with a `Camera`'s intrinsics + distortion (lens undistortion).
     fn undistort(&self, py: Python<'_>, camera: PyRef<'_, PyCamera>) -> PyEventStream {
         let camera = camera.inner;
-        Self::wrap(py.detach(|| self.inner.undistort(&camera)))
+        self.wrap(py.detach(|| self.inner.undistort(&camera)))
     }
 
     /// Keeps events where the `(H, W)` boolean mask is `True`.
@@ -134,54 +145,54 @@ impl PyEventStream {
         let view = mask.as_array();
         let (h, w) = (view.shape()[0], view.shape()[1]);
         let flat: Vec<bool> = view.iter().copied().collect();
-        Self::wrap(py.detach(|| self.inner.mask(&flat, w, h)))
+        self.wrap(py.detach(|| self.inner.mask(&flat, w, h)))
     }
 
     /// Keeps events whose timestamp lies in the half-open window `[t0, t1)` (microseconds).
     fn time_window(&self, py: Python<'_>, t0: i64, t1: i64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.time_window(t0, t1)))
+        self.wrap(py.detach(|| self.inner.time_window(t0, t1)))
     }
 
     /// Shifts every timestamp by `dt` microseconds.
     fn time_shift(&self, py: Python<'_>, dt: i64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.time_shift(dt)))
+        self.wrap(py.detach(|| self.inner.time_shift(dt)))
     }
 
     /// Scales every timestamp by `factor` (rounded).
     fn time_scale(&self, py: Python<'_>, factor: f64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.time_scale(factor)))
+        self.wrap(py.detach(|| self.inner.time_scale(factor)))
     }
 
     /// Shifts timestamps so the earliest event starts at zero.
     fn normalize_time(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.normalize_time()))
+        self.wrap(py.detach(|| self.inner.normalize_time()))
     }
 
     /// Keeps every `k`-th event by index.
     fn decimate(&self, py: Python<'_>, k: usize) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.decimate(k)))
+        self.wrap(py.detach(|| self.inner.decimate(k)))
     }
 
     /// Keeps only events of the given polarity (nonzero / `True` = ON, `0` / `False` = OFF).
     fn filter_polarity(&self, py: Python<'_>, polarity: i64) -> PyEventStream {
         let polarity = polarity != 0;
-        Self::wrap(py.detach(|| self.inner.filter_polarity(polarity)))
+        self.wrap(py.detach(|| self.inner.filter_polarity(polarity)))
     }
 
     /// Flips every event's polarity.
     fn invert_polarity(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.invert_polarity()))
+        self.wrap(py.detach(|| self.inner.invert_polarity()))
     }
 
     /// Returns a copy reordered by ascending timestamp (stable).
     fn sort_by_time(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.sort_by_time()))
+        self.wrap(py.detach(|| self.inner.sort_by_time()))
     }
 
     /// Concatenates this stream with `others` (argument order; sensor = element-wise max).
     fn concat(&self, py: Python<'_>, others: Vec<PyRef<'_, PyEventStream>>) -> PyEventStream {
         let refs: Vec<&EventStream> = others.iter().map(|other| &other.inner).collect();
-        Self::wrap(py.detach(|| self.inner.concat(&refs)))
+        self.wrap(py.detach(|| self.inner.concat(&refs)))
     }
 
     // ---- Denoising filters (Phase 3). Each drops noise events and returns a new EventStream.
@@ -190,19 +201,19 @@ impl PyEventStream {
     /// Background-activity (nearest-neighbour) noise filter: keeps an event only if a 3×3
     /// neighbour fired within `dt` (raw timestamp units, e.g. microseconds).
     fn background_activity_filter(&self, py: Python<'_>, dt: i64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.background_activity_filter(dt)))
+        self.wrap(py.detach(|| self.inner.background_activity_filter(dt)))
     }
 
     /// Refractory-period filter: suppresses a pixel's events for `dt` after it fires.
     fn refractory_filter(&self, py: Python<'_>, dt: i64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.refractory_filter(dt)))
+        self.wrap(py.detach(|| self.inner.refractory_filter(dt)))
     }
 
     /// Hot-pixel removal: drops pixels whose event count exceeds `mean + n_std·std` over the
     /// active pixels (default `n_std=3.0`).
     #[pyo3(signature = (n_std=3.0))]
     fn hot_pixel_filter(&self, py: Python<'_>, n_std: f64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.hot_pixel_filter(n_std)))
+        self.wrap(py.detach(|| self.inner.hot_pixel_filter(n_std)))
     }
 
     // ---- Feature detection (Phase 5). Corner detectors return the corner events as a new
@@ -211,7 +222,7 @@ impl PyEventStream {
     /// eFAST event corner detector (Mueggler et al., BMVC 2017). Keeps the events sitting on a
     /// moving corner, tested on two Bresenham rings over the per-polarity surface of active events.
     fn efast(&self, py: Python<'_>) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.efast()))
+        self.wrap(py.detach(|| self.inner.efast()))
     }
 
     /// Harris corner score on the Surface of Active Events: keeps events whose Harris response
@@ -220,7 +231,7 @@ impl PyEventStream {
     /// it to be stricter.
     #[pyo3(signature = (threshold=0.0))]
     fn harris_corners(&self, py: Python<'_>, threshold: f64) -> PyEventStream {
-        Self::wrap(py.detach(|| self.inner.harris_corners(threshold)))
+        self.wrap(py.detach(|| self.inner.harris_corners(threshold)))
     }
 
     /// Dense Lucas-Kanade optical flow on the time surface. Returns a two-channel `(flow_x,
@@ -253,7 +264,7 @@ impl PyEventStream {
         }
         match representation {
             Some(representation) => self.generate(py, representation, normalize),
-            None => self.generate_polarity(py, Polarity::new(normalize)),
+            None => self.default_frame(py, normalize),
         }
     }
 
@@ -313,7 +324,8 @@ impl PyEventStream {
 
     /// Opens the interactive viewer on this stream. Pass a representation **name** to choose what
     /// to show — `stream.view("flow")`, `stream.view("count")`, `stream.view("voxel")`, … — or
-    /// omit it for the default polarity image. (Equivalent to `stream.<repr>().view()`.)
+    /// omit it to use the stream's stored representation (from `open(repr=…)`), falling back to
+    /// the polarity image. (Equivalent to `stream.<repr>().view()`.)
     #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=true))]
     fn view(
         &self,
@@ -324,16 +336,33 @@ impl PyEventStream {
     ) -> PyResult<()> {
         let frame = match representation {
             Some(representation) => self.generate(py, representation, normalize)?,
-            None => self.generate_polarity(py, Polarity::new(normalize))?,
+            None => self.default_frame(py, normalize)?,
         };
         frame.view(py, colormap, normalize)
     }
 }
 
 impl PyEventStream {
-    /// Wraps a core stream as a Python `EventStream` (used by the chainable transforms).
-    fn wrap(inner: EventStream) -> PyEventStream {
-        PyEventStream { inner }
+    /// Wraps a core stream as a Python `EventStream`, carrying this stream's stored
+    /// representation forward (used by the chainable transforms, so `open(repr=…)` survives
+    /// `stream.flip_x().view()` etc.).
+    fn wrap(&self, inner: EventStream) -> PyEventStream {
+        PyEventStream {
+            inner,
+            repr: self.repr,
+        }
+    }
+
+    /// The frame rendered when no explicit representation is passed: the stream's stored
+    /// representation (from `open(repr=…)`) if set, else the default polarity image.
+    fn default_frame(&self, py: Python<'_>, normalize: bool) -> PyResult<PyEventFrame> {
+        match self.repr {
+            Some(spec) => py
+                .detach(|| spec.generate(&self.inner))
+                .map(|inner| PyEventFrame { inner })
+                .map_err(map_representation_error),
+            None => self.generate_polarity(py, Polarity::new(normalize)),
+        }
     }
 
     fn generate(
@@ -634,7 +663,7 @@ fn load(
         max_events,
     };
     py.detach(|| eventcv_core::io::load(path, options))
-        .map(|inner| PyEventStream { inner })
+        .map(|inner| PyEventStream { inner, repr: None })
         .map_err(map_io_error)
 }
 
@@ -947,7 +976,10 @@ impl PyEventReader {
                 .slice_index(i0, i1)
                 .map(|stream| apply_slice_op(op, stream))
         })
-        .map(|inner| PyEventStream { inner })
+        .map(|inner| PyEventStream {
+            inner,
+            repr: self.repr,
+        })
         .map_err(map_io_error)
     }
 
@@ -984,6 +1016,7 @@ impl PyEventReader {
             span_us,
             end: if empty { i64::MIN } else { hi },
             slice_op: self.slice_op,
+            repr: self.repr,
         })
     }
 }
@@ -1001,7 +1034,10 @@ impl PyEventReader {
                 .slice_time(t0, t1)
                 .map(|stream| apply_slice_op(op, stream))
         })
-        .map(|inner| PyEventStream { inner })
+        .map(|inner| PyEventStream {
+            inner,
+            repr: self.repr,
+        })
         .map_err(map_io_error)
     }
 
@@ -1051,6 +1087,9 @@ struct PyWindowIterator {
     span_us: i64,
     end: i64,
     slice_op: Option<SliceOp>,
+    /// The reader's stored representation, carried onto each yielded window (so `open(repr=…)`
+    /// survives `for w in reader.windows(): w.view()`).
+    repr: Option<ReprSpec>,
 }
 
 #[pymethods]
@@ -1077,7 +1116,10 @@ impl PyWindowIterator {
                     .map(|stream| apply_slice_op(op, stream))
             })
             .map_err(map_io_error)?;
-        Ok(Some(PyEventStream { inner: stream }))
+        Ok(Some(PyEventStream {
+            inner: stream,
+            repr: self.repr,
+        }))
     }
 }
 

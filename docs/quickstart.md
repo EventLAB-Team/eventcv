@@ -43,10 +43,36 @@ on demand instead of materialising it.
 reader = ecv.open("huge.hdf5", dt_ms=30)   # treat as 30 ms frames
 print(reader.n_slices)
 frame = reader.slice(50).voxel()           # the 50th 30 ms frame → voxel grid
+```
 
-# as a PyTorch map-style dataset
+Pass `repr=` to give the reader a **default representation**. It is remembered by every
+slice, so `slice(n).view()` renders it (no need to name it again), and it makes the reader
+a PyTorch map-style dataset where `reader[i]` is the dense `[C, H, W]` array:
+
+```python
+import torch
+
+reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")
+reader.slice(500).view()               # shows MCTS — the stored repr (not raw polarity)
+reader.slice(500).view("count")        # an explicit name still overrides it
+
+# as a PyTorch map-style dataset (dense arrays collate straight into a tensor)
 ds = ecv.open("huge.hdf5", dt_ms=30, repr="count")
 # len(ds) == n_slices; ds[i] -> [C, H, W]; ds.batch(idxs) -> [B, C, H, W]
+loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=True)
+```
+
+Without `repr`, `reader[i]` stays a raw {class}`~eventcv.EventStream`. Those are sparse and
+variable-length, so a `DataLoader` can't stack them — pass {func}`eventcv.collate` to batch
+them as a `list` instead:
+
+```python
+import torch
+
+reader = ecv.open("huge.hdf5", dt_ms=30)
+loader = torch.utils.data.DataLoader(reader, batch_size=32, collate_fn=ecv.collate)
+for batch in loader:                   # batch is a list[EventStream]
+    batch[0].view()
 ```
 
 ## Save

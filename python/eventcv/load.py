@@ -79,7 +79,9 @@ def open(
     ``i``, and ``reader.batch(indices)`` stacks a ``[B, C, H, W]`` batch — so a ``DataLoader``
     can collate the reader directly. Use ``reader.with_repr(name, **opts)`` to set
     per-representation options (e.g. ``bins=5``, or ``window=5`` for ``"flow"``). Without
-    ``repr``, ``reader[i]`` stays a raw :class:`EventStream`.
+    ``repr``, ``reader[i]`` stays a raw :class:`EventStream`; to still batch those through a
+    ``DataLoader`` pass ``collate_fn=eventcv.collate`` (each batch is a ``list[EventStream]``,
+    since sparse streams can't stack into a tensor).
 
     Phase 5 algorithms apply **per slice**: ``reader.efast()`` / ``reader.harris_corners(thr)``
     return a new reader whose every slice is the corner sub-stream, composing with
@@ -184,6 +186,27 @@ def export_png(
     return paths
 
 
+def collate(batch):
+    """``collate_fn`` for :class:`torch.utils.data.DataLoader` over an :class:`EventReader`.
+
+    A reader opened **with** a representation (``open(repr=…)``) yields dense ``[C, H, W]``
+    arrays that torch's default collate stacks into a ``[B, C, H, W]`` tensor with no help —
+    so you only need this for a reader opened **without** ``repr``, whose ``reader[i]`` is a
+    raw :class:`EventStream`. Those are variable-length and sparse, so they can't stack into a
+    tensor; this returns the batch as a plain ``list`` of streams instead (dense/array batches
+    still defer to torch's default collate). Pass it explicitly::
+
+        loader = torch.utils.data.DataLoader(reader, batch_size=32, collate_fn=eventcv.collate)
+        for batch in loader:        # batch is a list[EventStream]
+            batch[0].view()
+    """
+    if batch and isinstance(batch[0], EventStream):
+        return list(batch)
+    from torch.utils.data import default_collate
+
+    return default_collate(batch)
+
+
 __all__ = [
     "Camera",
     "EventFrame",
@@ -192,6 +215,7 @@ __all__ = [
     "EventStream",
     "FrameSink",
     "Polarity",
+    "collate",
     "export_png",
     "load",
     "load_frame",

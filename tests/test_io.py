@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import tempfile
 import unittest
@@ -328,6 +329,27 @@ class DatasetReaderTests(unittest.TestCase):
         self.assertEqual(reader[0].shape, (5, 8, 8))
         self.assertEqual(reader[0].dtype, np.float32)
 
+    def test_slice_carries_open_repr(self):
+        # A slice from a reader opened with a representation remembers it, so `view()`/
+        # `flatten()` render that repr instead of the default polarity image.
+        reader = self._dataset(repr="voxel")
+        stream = reader.slice(0)
+        self.assertIsInstance(stream, eventcv.EventStream)
+        self.assertEqual(stream.repr, "voxel")
+        self.assertEqual(stream.flatten().kind, "voxel")  # no explicit repr -> the stored one
+        # Transforms and windows keep it; an explicit argument still overrides it.
+        self.assertEqual(stream.flip_x().repr, "voxel")
+        self.assertEqual(next(reader.windows()).repr, "voxel")
+        self.assertEqual(stream.flatten("count").kind, "count")
+
+    def test_slice_has_no_repr_without_open_repr(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        reader = eventcv.open(str(path), dt_ms=0.01, sensor_size=(8, 8), time_unit="us")
+        stream = reader.slice(0)
+        self.assertIsNone(stream.repr)
+        self.assertEqual(stream.flatten().kind, "polarity")  # falls back to polarity
+
     def test_batch_stacks_indices(self):
         reader = self._dataset()
         batch = reader.batch([0, 2, 3])
@@ -356,6 +378,25 @@ class DatasetReaderTests(unittest.TestCase):
         self.assertEqual(len(seen), 4)
         total_events = sum(int(frame.sum()) for frame in seen)  # normalized counts
         self.assertGreater(total_events, 0)
+
+    def test_collate_batches_raw_streams_as_a_list(self):
+        # A repr-less reader yields EventStreams; ecv.collate returns them as a plain list
+        # (they can't stack into a tensor) so a DataLoader still batches them.
+        reader = self._dataset(repr=None)
+        batch = eventcv.collate([reader[0], reader[1]])
+        self.assertIsInstance(batch, list)
+        self.assertEqual([type(s).__name__ for s in batch], ["EventStream", "EventStream"])
+
+    def test_collate_defers_dense_batches_to_torch(self):
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("torch not installed")
+        import torch
+
+        reader = self._dataset()  # repr="count" -> dense [C, H, W] arrays
+        loader = torch.utils.data.DataLoader(reader, batch_size=4, collate_fn=eventcv.collate)
+        batch = next(iter(loader))
+        self.assertIsInstance(batch, torch.Tensor)
+        self.assertEqual(tuple(batch.shape), (4, 1, 8, 8))
 
 
 @unittest.skipUnless(os.path.exists(_MVSEC_BAG), "MVSEC bag fixture not present")

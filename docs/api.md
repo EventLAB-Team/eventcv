@@ -15,6 +15,7 @@ below); the free functions are generated from the methods, so the two forms stay
 .. autofunction:: save
 .. autofunction:: load_frame
 .. autofunction:: export_png
+.. autofunction:: collate
 ```
 
 ## Core types
@@ -47,5 +48,5 @@ introspecting the compiled types, so this list always matches the methods above.
 .. automodule:: eventcv
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
-      Polarity, FrameSink, load, open, save, load_frame, export_png
+      Polarity, FrameSink, load, open, save, load_frame, export_png, collate
 ```

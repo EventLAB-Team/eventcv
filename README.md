@@ -14,14 +14,8 @@ https://anaconda.org/conda-forge/eventcv)
 EventCV is "OpenCV" for event-based data and computer vision applications.
 
 ## Resources
-- **[Documentation](https://eventcv.readthedocs.io)** — Python API, quickstart, and tutorials
-- **[Rust core API](https://docs.rs/eventcv-core)** — `eventcv-core` reference on docs.rs
-- **YouTube Tutorials**
-
-## Contributing
-EventCV is an open-sourced project for the event-based computer vision community. We welcome and appreciate contributions from users who would like to propose improvements or feature additions.
-
-Please read the [contribution guidelines](https://github.com/EventLAB-Team/eventcv/blob/main/CONTRIBUTING.md) for more details.
+- **Documentation** - https://eventcv.readthedocs.io
+- **Rust core API** - https://docs.rs/eventcv-core
 
 ## Installation
 ```console
@@ -34,3 +28,8 @@ conda install eventcv
 # pixi
 pixi add eventcv
 ```
+
+## Contributing
+EventCV is an open-sourced project for the event-based computer vision community. We welcome and appreciate contributions from users who would like to propose improvements or feature additions.
+
+Please read the [contribution guidelines](https://github.com/EventLAB-Team/eventcv/blob/main/.github/CONTRIBUTING.md) for more details.
