@@ -84,5 +84,6 @@ ecv.save(clipped, "out.npz")        # streams: .npz / .txt / .h5 / .bag
 ecv.save(voxel, "voxel.h5")         # frames: .npz / .h5
 ```
 
-See the [API reference](api.md) for the full list of readers, transforms, and
-representations.
+See the [Representations](representations.md) page for every available representation
+(`voxel`, `tsurf`, `atsurf`, `count`, `tencode`, `mcts`, `flow`, `pset`, …) with its parameters
+and output shape, and the [API reference](api.md) for the full list of readers and transforms.

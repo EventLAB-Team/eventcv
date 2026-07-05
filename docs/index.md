@@ -18,6 +18,7 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
 :caption: Contents
 
 quickstart
+representations
 tutorials/index
 api
 ```
