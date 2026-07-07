@@ -35,6 +35,15 @@ struct OpenedFile {
     total: usize,
 }
 
+/// Per-dataset raw chunk cache (bytes / slots) applied when opening event files. The
+/// default HDF5 cache (1 MiB) holds under one LZF chunk, so every `slice_time` binary
+/// search re-decompresses ~all its probed chunks. Sizing the cache to the binary-search
+/// working set lets repeated and adjacent slices (batching, sequential readers) reuse
+/// decompressed chunks instead of paying the decompress each time. `nslots` is prime per
+/// the HDF5 guidance that it comfortably exceed the number of cached chunks.
+const CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const CHUNK_CACHE_SLOTS: usize = 8009;
+
 /// Opens the file, locates the `x`/`y`/`t`/`p` datasets, and checks their lengths
 /// agree. Shared by the eager [`read_hdf5`] and the lazy [`Hdf5SliceSource`].
 fn open_validated(path: &Path) -> Result<OpenedFile, IoError> {
@@ -45,7 +54,10 @@ fn open_validated(path: &Path) -> Result<OpenedFile, IoError> {
         )));
     }
 
-    let file = File::open(path).map_err(map_hdf5_error)?;
+    let file = File::with_options()
+        .with_fapl(|fapl| fapl.chunk_cache(CHUNK_CACHE_SLOTS, CHUNK_CACHE_BYTES, 0.75))
+        .open(path)
+        .map_err(map_hdf5_error)?;
     let datasets = open_event_datasets(&file)?;
     let total = datasets[0].shape().first().copied().unwrap_or(0);
     for (axis, dataset) in [
@@ -237,23 +249,35 @@ pub fn open_hdf5_slice(
 const SCAN_BLOCK: usize = 1 << 16;
 
 impl Hdf5SliceSource {
-    /// First index whose timestamp (µs) is `>= target_us` (`total` if none), by binary
-    /// search over the on-disk `t` dataset. Each probe decompresses a 100k-element LZF
-    /// chunk, so the probe count *is* the latency — only one binary search runs per
-    /// slice (the window end is found while reading the events, see [`read_window`]).
+    /// First index whose timestamp (µs) is `>= target_us` (`total` if none). Each probe
+    /// decompresses a 100k-element LZF chunk, so the probe count *is* the latency — and it
+    /// dominates a slice (the window read past it is comparatively cheap). Rather than
+    /// bisecting, this interpolation-searches the monotone `t` column: each probe is seeded
+    /// by a linear guess from the bracketing (index, time) pairs, which for the roughly
+    /// steady event rate of a recording converges in a handful of chunk reads instead of
+    /// ~log2(total). The `hi - 1` clamp guarantees the range shrinks every step, so uneven
+    /// event density degrades gracefully rather than looping.
     fn lower_bound_time(&self, target_us: i64) -> Result<usize, IoError> {
         let t = &self.datasets[2];
-        let mut lo = 0;
-        let mut hi = self.total;
+        if self.total == 0 || target_us <= self.span.0 {
+            return Ok(0);
+        }
+        if target_us > self.span.1 {
+            return Ok(self.total);
+        }
+        // Endpoints of the search come free from the cached time span (t[0], t[total-1]).
+        let (mut lo, mut lo_t) = (0usize, self.span.0);
+        let (mut hi, mut hi_t) = (self.total - 1, self.span.1);
         while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let value = self
+            let frac = (target_us - lo_t) as f64 / (hi_t - lo_t).max(1) as f64;
+            let mid = (lo + (frac.clamp(0.0, 1.0) * (hi - lo) as f64) as usize).clamp(lo, hi - 1);
+            let mid_t = self
                 .time_unit
                 .microseconds_from_int(read_integers(t, mid..mid + 1)?[0]);
-            if value < target_us {
-                lo = mid + 1;
+            if mid_t < target_us {
+                (lo, lo_t) = (mid + 1, mid_t);
             } else {
-                hi = mid;
+                (hi, hi_t) = (mid, mid_t);
             }
         }
         Ok(lo)
