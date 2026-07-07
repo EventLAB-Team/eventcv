@@ -11,6 +11,7 @@ below); the free functions are generated from the methods, so the two forms stay
 .. currentmodule:: eventcv
 
 .. autofunction:: load
+.. autofunction:: from_numpy
 .. autofunction:: open
 .. autofunction:: save
 .. autofunction:: load_frame
@@ -48,5 +49,5 @@ introspecting the compiled types, so this list always matches the methods above.
 .. automodule:: eventcv
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
-      Polarity, FrameSink, load, open, save, load_frame, export_png, collate
+      Polarity, FrameSink, load, from_numpy, open, save, load_frame, export_png, collate
 ```

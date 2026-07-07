@@ -313,7 +313,7 @@ class DatasetReaderTests(unittest.TestCase):
         frame = reader[0]
         self.assertIsInstance(frame, np.ndarray)
         self.assertEqual(frame.shape, (1, 8, 8))  # count = 1 channel
-        self.assertEqual(frame.dtype, np.uint8)   # normalized by default
+        self.assertEqual(frame.dtype, np.uint64)  # raw counts by default
         # Frame 0 holds exactly the event at (0,0).
         self.assertEqual(frame.sum(), frame[0, 0, 0])
 
@@ -354,7 +354,7 @@ class DatasetReaderTests(unittest.TestCase):
         reader = self._dataset()
         batch = reader.batch([0, 2, 3])
         self.assertEqual(batch.shape, (3, 1, 8, 8))
-        self.assertEqual(batch.dtype, np.uint8)
+        self.assertEqual(batch.dtype, np.uint64)
         # Each row matches the corresponding single-index render.
         for row, index in enumerate([0, 2, 3]):
             np.testing.assert_array_equal(batch[row], reader[index])
@@ -376,8 +376,102 @@ class DatasetReaderTests(unittest.TestCase):
         reader = self._dataset()
         seen = [reader[i] for i in range(len(reader))]
         self.assertEqual(len(seen), 4)
-        total_events = sum(int(frame.sum()) for frame in seen)  # normalized counts
-        self.assertGreater(total_events, 0)
+        # Raw counts by default, so the frames sum to exactly the file's 4 events.
+        total_events = sum(int(frame.sum()) for frame in seen)
+        self.assertEqual(total_events, 4)
+
+    def test_max_events_mode_slices_fixed_count_frames(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n40 4 4 1\n")
+        reader = eventcv.open(str(path), max_events=2, sensor_size=(8, 8), time_unit="us")
+
+        self.assertEqual(reader.max_events, 2)
+        self.assertIsNone(reader.dt_ms)
+        self.assertEqual(reader.n_slices, 3)  # ceil(5 / 2), last slice is short
+        self.assertEqual(len(reader), 3)
+        self.assertEqual([len(reader.slice(i)) for i in range(3)], [2, 2, 1])
+        self.assertEqual(len(reader.slice(-1)), 1)  # negative indices count back
+        # Slices partition the file in order: first slice holds the first two events.
+        np.testing.assert_array_equal(reader.slice(0).numpy()[:, 2], [0, 10])
+        with self.assertRaisesRegex(IndexError, "out of range"):
+            reader.slice(3)
+        # windows() without arguments walks the same fixed-count slices.
+        self.assertEqual([len(w) for w in reader.windows()], [2, 2, 1])
+
+    def test_max_events_mode_works_as_dataset(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        reader = eventcv.open(
+            str(path), max_events=2, repr="count", sensor_size=(8, 8), time_unit="us"
+        )
+
+        self.assertEqual(reader[0].shape, (1, 8, 8))
+        self.assertEqual(int(reader[0].sum()), 2)  # raw counts: 2 events per slice
+        self.assertEqual(reader.batch([0, 1]).shape, (2, 1, 8, 8))
+        stream = reader.slice(1)
+        self.assertEqual(stream.repr, "count")  # open(repr=…) survives count slicing
+
+    def test_open_rejects_dt_ms_with_max_events(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n")
+        with self.assertRaisesRegex(ValueError, "not both"):
+            eventcv.open(str(path), dt_ms=1.0, max_events=2, sensor_size=(8, 8), time_unit="us")
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            eventcv.open(str(path), max_events=0, sensor_size=(8, 8), time_unit="us")
+
+    def test_offset_shifts_duration_framing(self):
+        # Events at t = 0, 10, 20, 30, 40 us; dt = 10 us. offset is an absolute timestamp in
+        # ms: 0.02 ms = 20 us moves the origin to t = 20, so the first two events fall outside
+        # every frame.
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n40 4 4 1\n")
+        reader = eventcv.open(
+            str(path), dt_ms=0.01, offset=0.02, sensor_size=(8, 8), time_unit="us"
+        )
+
+        self.assertAlmostEqual(reader.offset, 0.02)
+        self.assertEqual(reader.n_slices, 3)  # frames at [20,30), [30,40), [40,50) us
+        self.assertEqual(len(reader), 3)
+        np.testing.assert_array_equal(reader.slice(0).numpy()[:, 2], [20])
+        np.testing.assert_array_equal(reader.slice(-1).numpy()[:, 2], [40])
+        # windows() also starts at the offset origin.
+        self.assertEqual([w.numpy()[0, 2] for w in reader.windows()], [20, 30, 40])
+
+    def test_offset_shifts_count_framing(self):
+        # offset = 0.02 ms (absolute t = 20 us) skips the first two events, then max_events
+        # counts from there.
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n40 4 4 1\n")
+        reader = eventcv.open(
+            str(path), max_events=2, offset=0.02, sensor_size=(8, 8), time_unit="us"
+        )
+
+        self.assertAlmostEqual(reader.offset, 0.02)
+        self.assertEqual(reader.n_slices, 2)  # ceil(3 / 2) over the events at/after t=20
+        np.testing.assert_array_equal(reader.slice(0).numpy()[:, 2], [20, 30])
+        np.testing.assert_array_equal(reader.slice(1).numpy()[:, 2], [40])
+        self.assertEqual([len(w) for w in reader.windows()], [2, 1])
+
+    def test_offset_clamps_to_t_min_and_past_end(self):
+        # offset uses the same absolute time base as slice(t0_ms=…). Events at t = 100, 110,
+        # 120 us (t_min = 0.1 ms): an offset before t_min is a no-op (clamped to t_min), one
+        # past the end yields zero frames.
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("100 0 0 1\n110 1 1 0\n120 2 2 1\n")
+        clamped = eventcv.open(
+            str(path), dt_ms=0.01, offset=0.05, sensor_size=(8, 8), time_unit="us"
+        )
+        self.assertEqual(clamped.n_slices, 3)  # 0.05 ms = 50 us < t_min -> whole recording
+        past_end = eventcv.open(
+            str(path), dt_ms=0.01, offset=1.0, sensor_size=(8, 8), time_unit="us"
+        )
+        self.assertEqual(past_end.n_slices, 0)  # 1 ms = 1000 us > t_max = 120 us
+
+    def test_open_rejects_negative_offset(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n")
+        with self.assertRaisesRegex(ValueError, "offset"):
+            eventcv.open(str(path), dt_ms=1.0, offset=-1, sensor_size=(8, 8), time_unit="us")
 
     def test_collate_batches_raw_streams_as_a_list(self):
         # A repr-less reader yields EventStreams; ecv.collate returns them as a plain list

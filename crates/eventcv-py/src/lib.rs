@@ -7,7 +7,10 @@ use eventcv_core::{
     cluster::ClusterError,
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
-    io::{open as open_reader, ColumnOrder, IoError, LoadOptions, Reader, SaveOptions, TimeUnit},
+    io::{
+        load_rows, open as open_reader, ColumnOrder, IoError, LoadOptions, RawRow, Reader,
+        SaveOptions, TimeUnit,
+    },
     representation::{
         AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, EventPointSet, Mcts,
         PointSet, Polarity, Representation, RepresentationError, Tencode, TimeSurface, VoxelGrid,
@@ -15,6 +18,7 @@ use eventcv_core::{
     viz::Colormap,
     EventStream, EventStreamBuilder,
 };
+use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
@@ -243,12 +247,12 @@ impl PyEventStream {
             .map_err(map_flow_error)
     }
 
-    #[pyo3(signature = (representation=None, *, normalize=true, binary=false))]
+    #[pyo3(signature = (representation=None, *, normalize=None, binary=false))]
     fn flatten(
         &self,
         py: Python<'_>,
         representation: Option<&Bound<'_, PyAny>>,
-        normalize: bool,
+        normalize: Option<bool>,
         binary: bool,
     ) -> PyResult<PyEventFrame> {
         if binary {
@@ -293,9 +297,9 @@ impl PyEventStream {
             .map_err(map_representation_error)
     }
 
-    /// Event-count image — one channel of total events per pixel (both polarities). `uint64`
-    /// counts, or `uint8` rescaled to the busiest pixel when `normalize=True`.
-    #[pyo3(signature = (*, normalize=true))]
+    /// Event-count image — one channel of total events per pixel (both polarities). Raw
+    /// `uint64` counts by default; `uint8` rescaled to the busiest pixel when `normalize=True`.
+    #[pyo3(signature = (*, normalize=false))]
     fn count(&self, py: Python<'_>, normalize: bool) -> PyResult<PyEventFrame> {
         py.detach(|| EventCount::new(normalize).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
@@ -326,19 +330,20 @@ impl PyEventStream {
     /// to show — `stream.view("flow")`, `stream.view("count")`, `stream.view("voxel")`, … — or
     /// omit it to use the stream's stored representation (from `open(repr=…)`), falling back to
     /// the polarity image. (Equivalent to `stream.<repr>().view()`.)
-    #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=true))]
+    #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=None))]
     fn view(
         &self,
         py: Python<'_>,
         representation: Option<&Bound<'_, PyAny>>,
         colormap: &str,
-        normalize: bool,
+        normalize: Option<bool>,
     ) -> PyResult<()> {
         let frame = match representation {
             Some(representation) => self.generate(py, representation, normalize)?,
             None => self.default_frame(py, normalize)?,
         };
-        frame.view(py, colormap, normalize)
+        // Rendering always auto-contrasts unless the caller opts out explicitly.
+        frame.view(py, colormap, normalize.unwrap_or(true))
     }
 }
 
@@ -355,13 +360,13 @@ impl PyEventStream {
 
     /// The frame rendered when no explicit representation is passed: the stream's stored
     /// representation (from `open(repr=…)`) if set, else the default polarity image.
-    fn default_frame(&self, py: Python<'_>, normalize: bool) -> PyResult<PyEventFrame> {
+    fn default_frame(&self, py: Python<'_>, normalize: Option<bool>) -> PyResult<PyEventFrame> {
         match self.repr {
             Some(spec) => py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
                 .map_err(map_representation_error),
-            None => self.generate_polarity(py, Polarity::new(normalize)),
+            None => self.generate_polarity(py, Polarity::new(normalize.unwrap_or(true))),
         }
     }
 
@@ -369,10 +374,10 @@ impl PyEventStream {
         &self,
         py: Python<'_>,
         representation: &Bound<'_, PyAny>,
-        normalize: bool,
+        normalize: Option<bool>,
     ) -> PyResult<PyEventFrame> {
         if representation.extract::<PyRef<'_, PyPolarity>>().is_ok() {
-            return self.generate_polarity(py, Polarity::new(normalize));
+            return self.generate_polarity(py, Polarity::new(normalize.unwrap_or(true)));
         }
         // A representation *name* ("count", "flow", "voxel", …) renders that repr with its
         // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
@@ -638,8 +643,20 @@ fn us_to_ms(us: i64) -> f64 {
     us as f64 / 1000.0
 }
 
+/// Converts an `offset` argument — an absolute timestamp in ms (the file's own time base) —
+/// into microseconds. `None` and non-positive values mean "read from the start".
+fn parse_offset(offset_ms: Option<f64>) -> PyResult<Option<i64>> {
+    match offset_ms {
+        None => Ok(None),
+        Some(ms) if ms.is_nan() => Err(PyValueError::new_err("offset must be a number")),
+        Some(ms) if ms < 0.0 => Err(PyValueError::new_err("offset must be non-negative")),
+        Some(ms) => Ok(Some(ms_to_us(ms))),
+    }
+}
+
 #[pyfunction]
-#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None))]
+#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None))]
+#[allow(clippy::too_many_arguments)]
 fn load(
     py: Python<'_>,
     path: &str,
@@ -648,6 +665,7 @@ fn load(
     order: &str,
     topic: Option<String>,
     max_events: Option<i64>,
+    offset: Option<f64>,
 ) -> PyResult<PyEventStream> {
     let max_events = max_events
         .map(|count| {
@@ -661,10 +679,86 @@ fn load(
         order: parse_order(order)?,
         topic,
         max_events,
+        offset: parse_offset(offset)?,
     };
     py.detach(|| eventcv_core::io::load(path, options))
         .map(|inner| PyEventStream { inner, repr: None })
         .map_err(map_io_error)
+}
+
+/// Builds an `EventStream` from an in-memory `(N, 4)` numpy array — the constructor
+/// mirror of `EventStream.numpy()`. Columns follow `order` (default `xytp`, matching
+/// `numpy()`'s output); `sensor_size` and `time_unit` are inferred exactly like `load`
+/// when omitted. Any integer or float dtype is accepted.
+#[pyfunction]
+#[pyo3(signature = (events, *, sensor_size=None, time_unit=None, order="xytp"))]
+fn from_numpy(
+    py: Python<'_>,
+    events: &Bound<'_, PyAny>,
+    sensor_size: Option<(i64, i64)>,
+    time_unit: Option<&str>,
+    order: &str,
+) -> PyResult<PyEventStream> {
+    let options = LoadOptions {
+        sensor_size: parse_sensor_size(sensor_size)?,
+        time_unit: parse_time_unit(time_unit)?,
+        order: parse_order(order)?,
+        topic: None,
+        max_events: None,
+        offset: None,
+    };
+    let rows = numpy_rows(events, options.order)?;
+    py.detach(|| load_rows(&rows, &options))
+        .map(|inner| PyEventStream { inner, repr: None })
+        .map_err(map_io_error)
+}
+
+/// Converts an `(N, ≥4)` numpy array of any int/float dtype into raw event rows laid
+/// out per `order` (extra columns are ignored, like the text loader).
+fn numpy_rows(events: &Bound<'_, PyAny>, order: ColumnOrder) -> PyResult<Vec<RawRow>> {
+    macro_rules! try_dtype {
+        ($($ty:ty),*) => {$(
+            if let Ok(array) = events.extract::<PyReadonlyArray2<$ty>>() {
+                return rows_from_view(&array.as_array().mapv(|value| value as f64), order);
+            }
+        )*};
+    }
+    try_dtype!(u64, i64, f64, u32, i32, f32, u16, i16, u8);
+    Err(PyTypeError::new_err(
+        "events must be an (N, 4) numpy array of an integer or float dtype",
+    ))
+}
+
+fn rows_from_view(view: &Array2<f64>, order: ColumnOrder) -> PyResult<Vec<RawRow>> {
+    if view.ncols() < 4 {
+        return Err(PyValueError::new_err(format!(
+            "expected an (N, 4) event array, got {} column(s)",
+            view.ncols()
+        )));
+    }
+    let (tc, xc, yc, pc) = match order {
+        ColumnOrder::Txyp => (0, 1, 2, 3),
+        ColumnOrder::Xytp => (2, 0, 1, 3),
+    };
+    let mut rows = Vec::with_capacity(view.nrows());
+    for (index, row) in view.rows().into_iter().enumerate() {
+        let coord = |value: f64, name: &str| -> PyResult<u16> {
+            let rounded = value.round();
+            if !(0.0..=f64::from(u16::MAX)).contains(&rounded) {
+                return Err(PyValueError::new_err(format!(
+                    "row {index}: {name} = {value} is not a valid sensor coordinate"
+                )));
+            }
+            Ok(rounded as u16)
+        };
+        rows.push(RawRow {
+            x: coord(row[xc], "x")?,
+            y: coord(row[yc], "y")?,
+            t: row[tc],
+            p: row[pc] > 0.0,
+        });
+    }
+    Ok(rows)
 }
 
 fn parse_dt_ms(dt_ms: Option<f64>) -> PyResult<Option<i64>> {
@@ -677,31 +771,39 @@ fn parse_dt_ms(dt_ms: Option<f64>) -> PyResult<Option<i64>> {
     }
 }
 
-/// Number of `dt`-length (µs) windows covering `[t_min, t_max]`; 0 when empty.
-fn slice_total(n_events: usize, span: (i64, i64), dt: i64) -> usize {
-    if n_events == 0 {
-        return 0;
-    }
-    let (lo, hi) = span;
-    ((hi - lo) / dt + 1) as usize
-}
-
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None))]
+#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
     path: &str,
     dt_ms: Option<f64>,
+    max_events: Option<i64>,
+    offset: Option<f64>,
     repr: Option<&str>,
     sensor_size: Option<(i64, i64)>,
     time_unit: Option<&str>,
     order: &str,
     topic: Option<String>,
 ) -> PyResult<PyEventReader> {
-    let dt_us = parse_dt_ms(dt_ms)?;
+    let mode = match (parse_dt_ms(dt_ms)?, max_events) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "pass either dt_ms (fixed-duration slices) or max_events (fixed-count slices), not both",
+            ))
+        }
+        (Some(dt), None) => Some(SliceMode::Duration(dt)),
+        (None, Some(len)) => Some(SliceMode::Count(
+            usize::try_from(len)
+                .ok()
+                .filter(|&len| len >= 1)
+                .ok_or_else(|| PyValueError::new_err("max_events must be at least 1"))?,
+        )),
+        (None, None) => None,
+    };
+    let offset_us = parse_offset(offset)?;
     let repr = repr
-        .map(|name| ReprSpec::new(name, None, None, None, None, None, true))
+        .map(|name| ReprSpec::new(name, None, None, None, None, None, None))
         .transpose()?;
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
@@ -709,15 +811,33 @@ fn open(
         order: parse_order(order)?,
         topic,
         max_events: None,
+        offset: None,
     };
     let reader = py
         .detach(|| open_reader(path, options))
         .map_err(map_io_error)?;
+    // Translate the absolute offset timestamp into a base event index for fixed-count framing:
+    // the events before it are the prefix `slice(0)` must skip. Duration framing needs no index
+    // (its windows start at the origin timestamp), so this read only runs for count mode.
+    let base_index = match (offset_us, mode) {
+        (Some(origin), Some(SliceMode::Count(_))) => {
+            let (lo, _) = reader.time_span();
+            let origin = origin.max(lo);
+            if origin > lo {
+                reader.slice_time(lo, origin).map_err(map_io_error)?.len()
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
     Ok(PyEventReader {
         inner: Arc::new(Mutex::new(reader)),
-        dt_us,
+        mode,
         repr,
         slice_op: None,
+        offset_us,
+        base_index,
     })
 }
 
@@ -728,14 +848,22 @@ fn open(
 #[pyclass(name = "EventReader", frozen)]
 struct PyEventReader {
     inner: Arc<Mutex<Reader>>,
-    /// Fixed slice duration in µs from `open(dt_ms=…)`; enables integer `slice(n)`.
-    dt_us: Option<i64>,
+    /// How the recording is partitioned into frames from `open(dt_ms=…)` /
+    /// `open(max_events=…)`; enables integer `slice(n)`.
+    mode: Option<SliceMode>,
     /// Per-slice dense rendering set by `open(repr=…)` / `with_repr` — makes the reader a
     /// map-style dataset (`reader[i]` → `[C, H, W]`, `batch` → `[B, C, H, W]`).
     repr: Option<ReprSpec>,
     /// Per-slice stream op set by `efast`/`harris_corners` — applied to every slice before any
     /// `repr`, so corner detection composes with `slice`/`windows`/`with_repr`.
     slice_op: Option<SliceOp>,
+    /// `open(offset=…)`: the absolute framing origin (µs, the file's own time base). `slice(0)` /
+    /// `windows()` / `n_slices` all start here (clamped up to `t_min`); events before it are
+    /// outside every indexed frame. `None` frames the whole recording from `t_min`.
+    offset_us: Option<i64>,
+    /// The event index of the first event at/after the offset origin — the fixed-count framing
+    /// counterpart of `offset_us` (0 for duration mode, no offset, or an offset past the end).
+    base_index: usize,
 }
 
 /// A per-slice `EventStream` → `EventStream` operation a reader carries (Phase 5 corner
@@ -763,16 +891,47 @@ fn apply_slice_op(op: Option<SliceOp>, stream: EventStream) -> EventStream {
     }
 }
 
+/// How `slice(n)` / `reader[n]` / `windows()` partition the recording: fixed-duration
+/// frames (`open(dt_ms=…)`, µs) or fixed-count frames (`open(max_events=…)`).
+#[derive(Clone, Copy)]
+enum SliceMode {
+    Duration(i64),
+    Count(usize),
+}
+
+/// One resolved slice: a half-open time window (µs) or event-index range.
+#[derive(Clone, Copy)]
+enum SliceWindow {
+    Time(i64, i64),
+    Index(usize, usize),
+}
+
+/// Reads `window` from the shared reader off-GIL, applying the per-slice op.
+fn fetch_window(
+    py: Python<'_>,
+    reader: &Arc<Mutex<Reader>>,
+    window: SliceWindow,
+    op: Option<SliceOp>,
+) -> PyResult<EventStream> {
+    let reader = Arc::clone(reader);
+    py.detach(move || {
+        let guard = reader.lock().unwrap();
+        match window {
+            SliceWindow::Time(t0, t1) => guard.slice_time(t0, t1),
+            SliceWindow::Index(i0, i1) => guard.slice_index(i0, i1),
+        }
+        .map(|stream| apply_slice_op(op, stream))
+    })
+    .map_err(map_io_error)
+}
+
 #[pymethods]
 impl PyEventReader {
-    /// `n_slices` in the `dt_ms` frame-dataset mode (so `len(reader) == len(reader[:])`),
-    /// else the raw event count. Lets `DataLoader` iterate the reader directly.
+    /// `n_slices` in the `dt_ms` / `max_events` frame-dataset modes (so `len(reader) ==
+    /// len(reader[:])`), else the raw event count. Lets `DataLoader` iterate the reader directly.
     fn __len__(&self) -> PyResult<usize> {
-        match self.dt_us {
-            Some(dt) => {
-                let guard = self.inner.lock().unwrap();
-                Ok(slice_total(guard.n_events(), guard.time_span(), dt))
-            }
+        match self.mode {
+            Some(mode) => Ok(self.frame_count(mode)),
             None => Ok(self.inner.lock().unwrap().n_events()),
         }
     }
@@ -805,25 +964,45 @@ impl PyEventReader {
         us_to_ms(hi - lo)
     }
 
-    /// Number of fixed `dt_ms` slices spanning the recording (requires `open(dt_ms=…)`).
+    /// Number of fixed slices spanning the recording (requires `open(dt_ms=…)` or
+    /// `open(max_events=…)`).
     #[getter]
     fn n_slices(&self) -> PyResult<usize> {
-        let dt = self.require_dt()?;
-        let guard = self.inner.lock().unwrap();
-        Ok(slice_total(guard.n_events(), guard.time_span(), dt))
+        let mode = self.require_mode()?;
+        Ok(self.frame_count(mode))
     }
 
     /// The fixed slice duration set at `open`, or `None` if it was not given.
     #[getter]
     fn dt_ms(&self) -> Option<f64> {
-        self.dt_us.map(us_to_ms)
+        match self.mode {
+            Some(SliceMode::Duration(dt)) => Some(us_to_ms(dt)),
+            _ => None,
+        }
+    }
+
+    /// The fixed events-per-slice set at `open(max_events=…)`, or `None` if it was not given.
+    #[getter]
+    fn max_events(&self) -> Option<usize> {
+        match self.mode {
+            Some(SliceMode::Count(len)) => Some(len),
+            _ => None,
+        }
+    }
+
+    /// The absolute framing origin (ms, the file's time base) set at `open(offset=…)`, or
+    /// `None` if it was not given.
+    #[getter]
+    fn offset(&self) -> Option<f64> {
+        self.offset_us.map(us_to_ms)
     }
 
     /// One slice as an `EventStream`. With a positional index `n` (requires
-    /// `open(dt_ms=…)`), returns the `n`-th fixed `dt_ms` frame measured from the
-    /// recording start — `[t_min + n·dt, t_min + (n+1)·dt)`; negative `n` counts from
-    /// the end. Otherwise returns the half-open time window `[t0_ms, t1_ms)`, with
-    /// omitted bounds extending to the recording's start / end.
+    /// `open(dt_ms=…)` or `open(max_events=…)`), returns the `n`-th fixed frame — the
+    /// `dt_ms`-long window `[t_min + n·dt, t_min + (n+1)·dt)`, or the `max_events`-sized
+    /// event chunk `[n·N, (n+1)·N)`; negative `n` counts from the end. Otherwise returns
+    /// the half-open time window `[t0_ms, t1_ms)`, with omitted bounds extending to the
+    /// recording's start / end.
     #[pyo3(signature = (index=None, *, t0_ms=None, t1_ms=None))]
     fn slice(
         &self,
@@ -832,7 +1011,7 @@ impl PyEventReader {
         t0_ms: Option<f64>,
         t1_ms: Option<f64>,
     ) -> PyResult<PyEventStream> {
-        let (t0, t1) = if let Some(index) = index {
+        let window = if let Some(index) = index {
             if t0_ms.is_some() || t1_ms.is_some() {
                 return Err(PyValueError::new_err(
                     "pass either a slice index or t0_ms/t1_ms, not both",
@@ -841,21 +1020,21 @@ impl PyEventReader {
             self.window_for_index(index)?
         } else {
             let (lo, hi) = self.inner.lock().unwrap().time_span();
-            (
+            SliceWindow::Time(
                 t0_ms.map_or(lo, ms_to_us),
                 t1_ms.map_or(hi.saturating_add(1), ms_to_us), // +1 keeps the last event
             )
         };
-        self.fetch_time(py, t0, t1)
+        self.fetch(py, window)
     }
 
-    /// `reader[n]` — the `n`-th `dt_ms` frame (requires `open(dt_ms=…)`). Without a
-    /// representation it returns the raw `EventStream` (like `slice(n)`); with one set
-    /// (`open(repr=…)` / `with_repr`) it returns the dense `[C, H, W]` array, so a
-    /// `torch.utils.data.DataLoader` can collate the reader directly.
+    /// `reader[n]` — the `n`-th fixed frame (requires `open(dt_ms=…)` or
+    /// `open(max_events=…)`). Without a representation it returns the raw `EventStream`
+    /// (like `slice(n)`); with one set (`open(repr=…)` / `with_repr`) it returns the dense
+    /// `[C, H, W]` array, so a `torch.utils.data.DataLoader` can collate the reader directly.
     fn __getitem__(&self, py: Python<'_>, index: i64) -> PyResult<Py<PyAny>> {
-        let (t0, t1) = self.window_for_index(index)?;
-        let stream = self.fetch_time(py, t0, t1)?;
+        let window = self.window_for_index(index)?;
+        let stream = self.fetch(py, window)?;
         match self.repr {
             Some(spec) => {
                 let frame = py
@@ -870,7 +1049,7 @@ impl PyEventReader {
     /// Returns a new reader over the same file that renders each slice with `repr` (unset
     /// params take their method defaults). The dataset-mode counterpart of `open(repr=…)`,
     /// but with per-representation options: e.g. `reader.with_repr("voxel", bins=5)`.
-    #[pyo3(signature = (repr, *, bins=None, window_ms=None, tau_ms=None, max_window_ms=None, window=None, normalize=true))]
+    #[pyo3(signature = (repr, *, bins=None, window_ms=None, tau_ms=None, max_window_ms=None, window=None, normalize=None))]
     #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
@@ -880,7 +1059,7 @@ impl PyEventReader {
         tau_ms: Option<f64>,
         max_window_ms: Option<f64>,
         window: Option<i64>,
-        normalize: bool,
+        normalize: Option<bool>,
     ) -> PyResult<PyEventReader> {
         let spec = ReprSpec::new(
             repr,
@@ -893,9 +1072,11 @@ impl PyEventReader {
         )?;
         Ok(PyEventReader {
             inner: Arc::clone(&self.inner),
-            dt_us: self.dt_us,
+            mode: self.mode,
             repr: Some(spec),
             slice_op: self.slice_op,
+            offset_us: self.offset_us,
+            base_index: self.base_index,
         })
     }
 
@@ -928,18 +1109,8 @@ impl PyEventReader {
         })?;
         let mut frames = Vec::with_capacity(indices.len());
         for index in indices {
-            let (t0, t1) = self.window_for_index(index)?;
-            let reader = Arc::clone(&self.inner);
-            let op = self.slice_op;
-            let stream = py
-                .detach(move || {
-                    reader
-                        .lock()
-                        .unwrap()
-                        .slice_time(t0, t1)
-                        .map(|stream| apply_slice_op(op, stream))
-                })
-                .map_err(map_io_error)?;
+            let window = self.window_for_index(index)?;
+            let stream = fetch_window(py, &self.inner, window, self.slice_op)?;
             let frame = py
                 .detach(|| spec.generate(&stream))
                 .map_err(map_representation_error)?;
@@ -967,36 +1138,41 @@ impl PyEventReader {
             usize::try_from(i0).map_err(|_| PyValueError::new_err("i0 must be non-negative"))?;
         let i1 =
             usize::try_from(i1).map_err(|_| PyValueError::new_err("i1 must be non-negative"))?;
-        let reader = Arc::clone(&self.inner);
-        let op = self.slice_op;
-        py.detach(move || {
-            reader
-                .lock()
-                .unwrap()
-                .slice_index(i0, i1)
-                .map(|stream| apply_slice_op(op, stream))
-        })
-        .map(|inner| PyEventStream {
-            inner,
-            repr: self.repr,
-        })
-        .map_err(map_io_error)
+        self.fetch(py, SliceWindow::Index(i0, i1))
     }
 
     /// Lazy iterator of consecutive windows: each is `[start, start + span_ms)` and
     /// `start` advances by `step_ms`. `step_ms` defaults to the `dt_ms` set at `open`
     /// (so `windows()` walks every `slice(n)`), and `span_ms` defaults to `step_ms`
-    /// (non-overlapping). Streams a multi-GB file window-by-window without loading it.
+    /// (non-overlapping). For a `max_events` reader, `windows()` without arguments walks
+    /// the fixed-count slices instead. Streams a multi-GB file window-by-window without
+    /// loading it.
     #[pyo3(signature = (*, step_ms=None, span_ms=None))]
     fn windows(&self, step_ms: Option<f64>, span_ms: Option<f64>) -> PyResult<PyWindowIterator> {
+        let guard = self.inner.lock().unwrap();
+        let (lo, hi) = guard.time_span();
+        let n_events = guard.n_events();
+        drop(guard);
+        if let (None, None, Some(SliceMode::Count(len))) = (step_ms, span_ms, self.mode) {
+            return Ok(self.window_iterator(WindowCursor::Index {
+                next: self.base_index,
+                len,
+                total: n_events,
+            }));
+        }
         let step_us = match step_ms {
             Some(ms) if ms.is_nan() || ms <= 0.0 => {
                 return Err(PyValueError::new_err("step_ms must be positive"))
             }
             Some(ms) => ms_to_us(ms).max(1),
-            None => self.dt_us.ok_or_else(|| {
-                PyValueError::new_err("windows() needs step_ms, or open the file with dt_ms")
-            })?,
+            None => match self.mode {
+                Some(SliceMode::Duration(dt)) => dt,
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "windows() needs step_ms, or open the file with dt_ms",
+                    ))
+                }
+            },
         };
         let span_us = match span_ms {
             Some(ms) if ms.is_nan() || ms <= 0.0 => {
@@ -1005,76 +1181,106 @@ impl PyEventReader {
             Some(ms) => ms_to_us(ms).max(1),
             None => step_us,
         };
-        let guard = self.inner.lock().unwrap();
-        let (lo, hi) = guard.time_span();
-        let empty = guard.n_events() == 0;
-        drop(guard);
-        Ok(PyWindowIterator {
-            reader: Arc::clone(&self.inner),
-            cursor: lo,
+        Ok(self.window_iterator(WindowCursor::Time {
+            next: self.origin(lo),
             step_us,
             span_us,
-            end: if empty { i64::MIN } else { hi },
-            slice_op: self.slice_op,
-            repr: self.repr,
-        })
+            end: if n_events == 0 { i64::MIN } else { hi },
+        }))
     }
 }
 
 impl PyEventReader {
-    /// Reads the half-open time window `[t0, t1)` (µs) off-GIL into an `EventStream`, applying the
-    /// reader's per-slice op (e.g. `efast`) if one is set.
-    fn fetch_time(&self, py: Python<'_>, t0: i64, t1: i64) -> PyResult<PyEventStream> {
-        let reader = Arc::clone(&self.inner);
-        let op = self.slice_op;
-        py.detach(move || {
-            reader
-                .lock()
-                .unwrap()
-                .slice_time(t0, t1)
-                .map(|stream| apply_slice_op(op, stream))
-        })
-        .map(|inner| PyEventStream {
+    /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
+    /// applying the per-slice op (e.g. `efast`) if one is set.
+    fn fetch(&self, py: Python<'_>, window: SliceWindow) -> PyResult<PyEventStream> {
+        fetch_window(py, &self.inner, window, self.slice_op).map(|inner| PyEventStream {
             inner,
             repr: self.repr,
         })
-        .map_err(map_io_error)
     }
 
-    /// A new reader over the same file (and `dt`/`repr`) that applies `op` to every slice.
+    /// A new reader over the same file (and mode/`repr`) that applies `op` to every slice.
     fn with_slice_op(&self, op: SliceOp) -> PyEventReader {
         PyEventReader {
             inner: Arc::clone(&self.inner),
-            dt_us: self.dt_us,
+            mode: self.mode,
             repr: self.repr,
             slice_op: Some(op),
+            offset_us: self.offset_us,
+            base_index: self.base_index,
         }
     }
 
-    fn require_dt(&self) -> PyResult<i64> {
-        self.dt_us.ok_or_else(|| {
+    /// An iterator over this reader's file starting at `cursor` (shares op/repr).
+    fn window_iterator(&self, cursor: WindowCursor) -> PyWindowIterator {
+        PyWindowIterator {
+            reader: Arc::clone(&self.inner),
+            cursor,
+            slice_op: self.slice_op,
+            repr: self.repr,
+        }
+    }
+
+    fn require_mode(&self) -> PyResult<SliceMode> {
+        self.mode.ok_or_else(|| {
             PyValueError::new_err(
-                "reader was opened without dt_ms; pass open(path, dt_ms=…) to use integer slice indices",
+                "reader was opened without dt_ms or max_events; pass open(path, dt_ms=…) or open(path, max_events=…) to use integer slice indices",
             )
         })
     }
 
-    /// The `[t0, t1)` window (µs) for the `index`-th `dt` slice, validating the range
-    /// (negative indices count back from the end).
-    fn window_for_index(&self, index: i64) -> PyResult<(i64, i64)> {
-        let dt = self.require_dt()?;
+    /// The window for the `index`-th slice under the reader's mode, validating the range
+    /// (negative indices count back from the end). Framing starts at the offset origin
+    /// (`t_min + offset` for duration mode, `base_index` for count mode).
+    fn window_for_index(&self, index: i64) -> PyResult<SliceWindow> {
+        let mode = self.require_mode()?;
         let guard = self.inner.lock().unwrap();
-        let total = slice_total(guard.n_events(), guard.time_span(), dt) as i64;
-        let (lo, _hi) = guard.time_span();
+        let (n_events, (lo, _)) = (guard.n_events(), guard.time_span());
         drop(guard);
+        let total = self.frame_count(mode) as i64;
         let resolved = if index < 0 { index + total } else { index };
         if resolved < 0 || resolved >= total {
             return Err(PyIndexError::new_err(format!(
                 "slice index {index} out of range for {total} slices"
             )));
         }
-        let t0 = lo + resolved * dt;
-        Ok((t0, t0 + dt))
+        Ok(match mode {
+            SliceMode::Duration(dt) => {
+                let t0 = self.origin(lo) + resolved * dt;
+                SliceWindow::Time(t0, t0 + dt)
+            }
+            SliceMode::Count(len) => {
+                let i0 = self.base_index + resolved as usize * len;
+                SliceWindow::Index(i0, (i0 + len).min(n_events))
+            }
+        })
+    }
+
+    /// Number of fixed frames under `mode`, measured from the offset origin: duration frames
+    /// spanning `[t_min + offset, t_max]`, or count frames over the events at/after `base_index`.
+    fn frame_count(&self, mode: SliceMode) -> usize {
+        let guard = self.inner.lock().unwrap();
+        let (lo, hi) = guard.time_span();
+        let n_events = guard.n_events();
+        drop(guard);
+        match mode {
+            SliceMode::Duration(dt) => {
+                let origin = self.origin(lo);
+                if n_events == 0 || origin > hi {
+                    0
+                } else {
+                    ((hi - origin) / dt + 1) as usize
+                }
+            }
+            SliceMode::Count(len) => n_events.saturating_sub(self.base_index).div_ceil(len),
+        }
+    }
+
+    /// The absolute framing origin (µs) given the recording's `t_min` (`lo`): the offset
+    /// timestamp clamped up to `t_min`, or `t_min` itself when no offset was set.
+    fn origin(&self, lo: i64) -> i64 {
+        self.offset_us.map_or(lo, |offset| offset.max(lo))
     }
 }
 
@@ -1082,14 +1288,56 @@ impl PyEventReader {
 #[pyclass]
 struct PyWindowIterator {
     reader: Arc<Mutex<Reader>>,
-    cursor: i64,
-    step_us: i64,
-    span_us: i64,
-    end: i64,
+    cursor: WindowCursor,
     slice_op: Option<SliceOp>,
     /// The reader's stored representation, carried onto each yielded window (so `open(repr=…)`
     /// survives `for w in reader.windows(): w.view()`).
     repr: Option<ReprSpec>,
+}
+
+/// Walks a recording as consecutive time windows (`windows(step_ms=…)` / `dt_ms`
+/// readers) or fixed-count event chunks (`max_events` readers).
+enum WindowCursor {
+    Time {
+        next: i64,
+        step_us: i64,
+        span_us: i64,
+        end: i64,
+    },
+    Index {
+        next: usize,
+        len: usize,
+        total: usize,
+    },
+}
+
+impl WindowCursor {
+    /// The next window to fetch, advancing the cursor; `None` when exhausted.
+    fn advance(&mut self) -> Option<SliceWindow> {
+        match self {
+            Self::Time {
+                next,
+                step_us,
+                span_us,
+                end,
+            } => {
+                if *next > *end {
+                    return None;
+                }
+                let t0 = *next;
+                *next = next.saturating_add(*step_us);
+                Some(SliceWindow::Time(t0, t0.saturating_add(*span_us)))
+            }
+            Self::Index { next, len, total } => {
+                if *next >= *total {
+                    return None;
+                }
+                let i0 = *next;
+                *next = i0 + *len;
+                Some(SliceWindow::Index(i0, (i0 + *len).min(*total)))
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -1099,23 +1347,10 @@ impl PyWindowIterator {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyEventStream>> {
-        if self.cursor > self.end {
+        let Some(window) = self.cursor.advance() else {
             return Ok(None);
-        }
-        let t0 = self.cursor;
-        let t1 = t0.saturating_add(self.span_us);
-        self.cursor = self.cursor.saturating_add(self.step_us);
-        let reader = Arc::clone(&self.reader);
-        let op = self.slice_op;
-        let stream = py
-            .detach(move || {
-                reader
-                    .lock()
-                    .unwrap()
-                    .slice_time(t0, t1)
-                    .map(|stream| apply_slice_op(op, stream))
-            })
-            .map_err(map_io_error)?;
+        };
+        let stream = fetch_window(py, &self.reader, window, self.slice_op)?;
         Ok(Some(PyEventStream {
             inner: stream,
             repr: self.repr,
@@ -1325,7 +1560,7 @@ enum ReprSpec {
 
 impl ReprSpec {
     /// Builds a spec from a repr name and the optional overrides (unset ones take the
-    /// same defaults as the `EventStream` methods).
+    /// same defaults as the `EventStream` methods: count raw `u64`, polarity normalized).
     fn new(
         name: &str,
         bins: Option<i64>,
@@ -1333,12 +1568,16 @@ impl ReprSpec {
         tau_ms: Option<f64>,
         max_window_ms: Option<f64>,
         window: Option<i64>,
-        normalize: bool,
+        normalize: Option<bool>,
     ) -> PyResult<Self> {
         Ok(match name {
             "binary" => Self::Binary,
-            "count" => Self::Count { normalize },
-            "polarity" => Self::Polarity { normalize },
+            "count" => Self::Count {
+                normalize: normalize.unwrap_or(false),
+            },
+            "polarity" => Self::Polarity {
+                normalize: normalize.unwrap_or(true),
+            },
             "voxel" => Self::Voxel {
                 bins: bins
                     .map(|value| {
@@ -1428,6 +1667,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPolarity>()?;
     m.add_class::<PyCamera>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
+    m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(load_frame, m)?)?;

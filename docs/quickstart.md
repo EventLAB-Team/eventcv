@@ -11,7 +11,26 @@ import eventcv as ecv
 stream = ecv.load("recording.hdf5")
 print(stream.sensor_size)      # (width, height)
 print(len(stream))             # number of events
-events = stream.numpy()        # N×4 array of [t, x, y, p]
+events = stream.numpy()        # N×4 array of [x, y, t, p]
+```
+
+To read only part of a large recording, `offset` skips events before an **absolute
+timestamp** (in milliseconds, the file's own time base) and `max_events` caps how many are
+kept after it:
+
+```python
+window = ecv.load("recording.hdf5", offset=1_000, max_events=500_000)   # from t = 1 s on
+```
+
+Already have events in memory (e.g. from another tool)? {func}`eventcv.from_numpy` is the
+inverse of `numpy()` — build a stream from an `(N, 4)` array. Columns default to `xytp`
+(what `numpy()` emits); sensor size and time unit are inferred when omitted:
+
+```python
+import numpy as np
+
+events = np.array([[0, 0, 100, 1], [1, 2, 250, 0]])   # x y t p
+stream = ecv.from_numpy(events, time_unit="us")
 ```
 
 ## Transform (chainable, functional)
@@ -44,6 +63,29 @@ reader = ecv.open("huge.hdf5", dt_ms=30)   # treat as 30 ms frames
 print(reader.n_slices)
 frame = reader.slice(50).voxel()           # the 50th 30 ms frame → voxel grid
 ```
+
+Slice by a fixed **event count** instead of a fixed duration with `max_events` — each
+slice holds exactly that many consecutive events (the last may be shorter), which keeps
+the number of events per frame constant rather than the time span. It is mutually
+exclusive with `dt_ms`:
+
+```python
+reader = ecv.open("huge.hdf5", max_events=10_000)   # 10k-event frames
+frame = reader.slice(50).voxel()                    # the 50th 10k-event frame
+```
+
+Pass `offset` — an **absolute timestamp in milliseconds** (the same time base as
+`slice(t0_ms=…)`) — to move the framing origin: `slice(0)`, `windows()`, and `n_slices` all
+begin at that time, and earlier events fall outside every frame. It composes with either
+`dt_ms` or `max_events`:
+
+```python
+reader = ecv.open("huge.hdf5", dt_ms=30, offset=1_000)   # frame 0 starts at t = 1 s
+```
+
+For a recording whose timestamps are epoch-based, `offset` is just that epoch time in ms
+(e.g. `offset=1_587_540_271_650`). Values before the recording clamp to the start; values
+past the end give zero frames.
 
 Pass `repr=` to give the reader a **default representation**. It is remembered by every
 slice, so `slice(n).view()` renders it (no need to name it again), and it makes the reader

@@ -231,3 +231,4 @@ tests/quickview.py
 
 # Large local development fixtures (multi-GB; keep local, never commit)
 data/development/
+data/test/sunset2.hdf5

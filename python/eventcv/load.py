@@ -18,6 +18,7 @@ def load(
     order: str = "txyp",
     topic: str | None = None,
     max_events: int | None = None,
+    offset: float | None = None,
 ) -> EventStream:
     """Load events from any supported file, detected by its extension.
 
@@ -31,8 +32,12 @@ def load(
     from the coordinate range. Passing ``sensor_size`` for HDF5 also skips that scan.
     ``time_unit`` is ``seconds``/``milliseconds``/``microseconds``/``nanoseconds`` (or
     ``auto``); ``order`` (``txyp``/``xytp``) applies to text. ``topic`` selects the
-    rosbag topic (default ``/davis/left/events``). ``max_events`` caps how many events
-    are read, handy for previewing very large files.
+    rosbag topic (default ``/davis/left/events``). ``offset`` is an **absolute timestamp
+    in milliseconds** (the file's own time base — the same base as ``stream.numpy()[:, 2]``
+    scaled to ms): events before it are skipped, and ``max_events`` then caps how many are
+    kept *after* it — together they read a window, handy for previewing a slice of a very
+    large file. For a recording whose timestamps are epoch-based, pass the epoch time in ms
+    (e.g. ``offset=1_587_540_271_650``); ``<= 0`` reads from the start.
     """
     return _rust.load(
         path,
@@ -41,6 +46,43 @@ def load(
         order=order,
         topic=topic,
         max_events=max_events,
+        offset=offset,
+    )
+
+
+def from_numpy(
+    events,
+    *,
+    sensor_size: tuple[int, int] | None = None,
+    time_unit: str | None = None,
+    order: str = "xytp",
+) -> EventStream:
+    """Build an :class:`EventStream` from an in-memory ``(N, 4)`` NumPy array.
+
+    The constructor mirror of :meth:`EventStream.numpy`: ``order`` defaults to ``xytp``
+    (the column layout ``numpy()`` emits, with timestamps in microseconds), so
+    ``ecv.from_numpy(stream.numpy(), time_unit="us")`` round-trips a stream. Pass
+    ``order="txyp"`` for arrays in the common ``t x y p`` dataset layout. Any integer or
+    float dtype is accepted; polarity is positive when its value is greater than zero
+    (both ``0/1`` and ``-1/1`` conventions work).
+
+    ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted, exactly like
+    :func:`load`: the sensor is the smallest grid holding every event, and the time unit
+    is inferred from the timestamp span (fractional values mean seconds; the inference
+    assumes a recording of at least ~1 s, so pass ``time_unit`` explicitly for short
+    arrays). Events outside an explicit ``sensor_size`` are dropped.
+
+    Example::
+
+        events = np.array([[0, 0, 100, 1], [1, 2, 250, 0]])   # x y t p
+        stream = ecv.from_numpy(events, time_unit="us")
+        stream.count().numpy()
+    """
+    return _rust.from_numpy(
+        events,
+        sensor_size=sensor_size,
+        time_unit=time_unit,
+        order=order,
     )
 
 
@@ -48,6 +90,8 @@ def open(
     path: str,
     *,
     dt_ms: float | None = None,
+    max_events: int | None = None,
+    offset: float | None = None,
     repr: str | None = None,
     sensor_size: tuple[int, int] | None = None,
     time_unit: str | None = None,
@@ -66,8 +110,20 @@ def open(
     Pass ``dt_ms`` to treat the recording as a sequence of fixed-duration frames: the
     reader reports ``n_slices`` and ``reader.slice(n)`` returns the ``n``-th frame
     (``reader[n]`` works too). Frame ``n`` is measured from the recording start, so you
-    never deal with absolute timestamps (which may be epoch-based). Without ``dt_ms``,
-    slice by explicit time/count window instead.
+    never deal with absolute timestamps (which may be epoch-based). ``max_events`` is
+    the event-count twin: ``open(path, max_events=10_000)`` makes each slice exactly
+    10 000 consecutive events (the last one may be shorter), which keeps the event rate
+    per frame constant instead of the duration. The two are mutually exclusive — pass
+    one or the other, not both. Without either, slice by explicit time/count window
+    instead.
+
+    ``offset`` is an **absolute timestamp in milliseconds** (the file's own time base —
+    exactly what ``slice(t0_ms=…)`` takes) that moves the framing origin: ``slice(0)``,
+    ``windows()``, and ``n_slices`` all begin at that time, and events before it fall
+    outside every indexed frame. It is clamped up to ``t_min``, so an offset before the
+    recording is a no-op, and one past the end yields zero frames. For an epoch-based
+    recording pass the epoch time in ms (e.g. ``offset=1_587_540_271_650``). It composes
+    with either ``dt_ms`` or ``max_events``.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted (see
     :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
@@ -113,6 +169,8 @@ def open(
     return _rust.open(
         path,
         dt_ms=dt_ms,
+        max_events=max_events,
+        offset=offset,
         repr=repr,
         sensor_size=sensor_size,
         time_unit=time_unit,
@@ -217,6 +275,7 @@ __all__ = [
     "Polarity",
     "collate",
     "export_png",
+    "from_numpy",
     "load",
     "load_frame",
     "open",

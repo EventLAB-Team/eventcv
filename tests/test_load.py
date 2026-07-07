@@ -33,6 +33,68 @@ class LoadTests(unittest.TestCase):
         events[0] = 0
         np.testing.assert_array_equal(stream.numpy()[0], first_event)
 
+    def test_offset_skips_events_before_absolute_time(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+        t = stream.numpy()[:, 2]
+        cutoff_us = int(t.min()) + 10_000  # an absolute timestamp 10 ms after t_min
+
+        skipped = eventcv.load(str(EXAMPLE_PATH), offset=cutoff_us / 1000)  # offset is ms
+
+        expected = int((t >= cutoff_us).sum())
+        self.assertEqual(len(skipped), expected)
+        self.assertGreaterEqual(int(skipped.numpy()[:, 2].min()), cutoff_us)
+
+    def test_offset_composes_with_max_events(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+        t = stream.numpy()[:, 2]
+        cutoff_us = int(t.min()) + 10_000
+
+        window = eventcv.load(str(EXAMPLE_PATH), offset=cutoff_us / 1000, max_events=100)
+
+        self.assertEqual(len(window), 100)  # capped after the offset
+        # The first kept event is the first at/after the cutoff, not the file's first.
+        self.assertEqual(int(window.numpy()[0, 2]), int(t[t >= cutoff_us].min()))
+
+    def test_offset_rejects_negative(self):
+        with self.assertRaisesRegex(ValueError, "offset"):
+            eventcv.load(str(EXAMPLE_PATH), offset=-1)
+
+    def test_from_numpy_round_trips_a_stream(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        rebuilt = eventcv.from_numpy(
+            stream.numpy(), sensor_size=(640, 480), time_unit="us"
+        )
+
+        self.assertIsInstance(rebuilt, eventcv.EventStream)
+        self.assertEqual(rebuilt.sensor_size, (640, 480))
+        np.testing.assert_array_equal(rebuilt.numpy(), stream.numpy())
+
+    def test_from_numpy_infers_sensor_size_and_accepts_txyp(self):
+        events = np.array([[100, 3, 1, 1], [250, 0, 2, -1]])  # t x y p
+
+        stream = eventcv.from_numpy(events, order="txyp", time_unit="us")
+
+        self.assertEqual(stream.sensor_size, (4, 3))
+        np.testing.assert_array_equal(
+            stream.numpy(), [[3, 1, 100, 1], [0, 2, 250, 0]]
+        )
+
+    def test_from_numpy_converts_float_seconds(self):
+        events = np.array([[0.0, 0.0, 0.5, 1.0], [1.0, 1.0, 1.5, 0.0]])  # x y t p
+
+        stream = eventcv.from_numpy(events)  # fractional t -> seconds
+
+        np.testing.assert_array_equal(stream.numpy()[:, 2], [500_000, 1_500_000])
+
+    def test_from_numpy_rejects_bad_input(self):
+        with self.assertRaisesRegex(ValueError, "4"):
+            eventcv.from_numpy(np.zeros((2, 3)))
+        with self.assertRaisesRegex(ValueError, "coordinate"):
+            eventcv.from_numpy(np.array([[-1, 0, 100, 1]]), time_unit="us")
+        with self.assertRaisesRegex(TypeError, "numpy array"):
+            eventcv.from_numpy([[0, 0, 100, 1]])
+
     def test_generates_polarity_representation(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
@@ -121,8 +183,8 @@ class LoadTests(unittest.TestCase):
     def test_generates_count_and_averaged_time_surface(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
-        count = stream.count(normalize=False)
-        count_norm = stream.count()
+        count = stream.count()
+        count_norm = stream.count(normalize=True)
         atsurf = stream.atsurf()
 
         self.assertEqual((count.kind, count.shape), ("count", (1, 480, 640)))
