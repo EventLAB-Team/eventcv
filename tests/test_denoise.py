@@ -1,8 +1,7 @@
 """Denoising filters (Phase 3): background-activity, refractory, and hot-pixel removal.
 
 Each filter is exercised on a synthetic recording built so that "signal" (spatially and
-temporally correlated events) is separable from planted noise — the v1.0.0 acceptance
-criterion is that synthetic noise is removed while signal is retained.
+temporally correlated events) is separable from planted noise.
 """
 
 import tempfile
