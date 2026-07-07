@@ -20,7 +20,8 @@ pub use h5::{
 pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream};
 pub use prophesee::read_dat;
 pub use text::{
-    open_text_slice, read_text, write_text_stream, ColumnOrder, TextOptions, TextReader, TimeUnit,
+    load_rows, open_text_slice, read_text, write_text_stream, ColumnOrder, RawRow, TextOptions,
+    TextReader, TimeUnit,
 };
 
 use crate::representation::EventFrame;
@@ -82,6 +83,9 @@ pub struct LoadOptions {
     pub topic: Option<String>,
     /// Cap on the number of events to read.
     pub max_events: Option<usize>,
+    /// Absolute timestamp (µs, the file's own time base): events before it are skipped.
+    /// `max_events` then caps the events *after* the offset. `None`/`<= 0` reads from the start.
+    pub offset: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,14 +130,42 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
 /// `.aedat` (AEDAT 2.0), and `.dat` (Prophesee CD).
 pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream, IoError> {
     let path = path.as_ref();
+    let Some(cutoff) = options.offset.filter(|&offset| offset > 0) else {
+        return load_format(path, &options);
+    };
+    // The offset is an absolute timestamp, so the whole recording must be read before
+    // skipping; the cap then applies to the events at/after the offset.
+    let mut read_options = options.clone();
+    read_options.max_events = None;
+    load_format(path, &read_options).map(|stream| skip_before(stream, cutoff, options.max_events))
+}
+
+/// Drops events before the absolute timestamp `cutoff` (µs), then keeps at most `max` of the rest.
+fn skip_before(stream: EventStream, cutoff: i64, max: Option<usize>) -> EventStream {
+    let (ts, (xs, ys, ps)) = (stream.ts(), (stream.xs(), stream.ys(), stream.ps()));
+    if ts.is_empty() {
+        return stream;
+    }
+    let (width, height) = stream.sensor_size();
+    let mut builder = EventStreamBuilder::new(width, height, stream.timestamp_scale_ms());
+    for index in (0..ts.len()).filter(|&index| ts[index] >= cutoff) {
+        builder.push(xs[index], ys[index], ts[index], ps[index]);
+        if max.is_some_and(|max| builder.len() >= max) {
+            break;
+        }
+    }
+    builder.build()
+}
+
+fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoError> {
     match detect_format(path)? {
         Format::Npz => npz::read_npz(path, options.sensor_size),
-        Format::Text => text::load_text(path, &options),
-        Format::Rosbag => bag::read_bag(path, &options),
+        Format::Text => text::load_text(path, options),
+        Format::Rosbag => bag::read_bag(path, options),
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {
-                h5::read_hdf5(path, &options)
+                h5::read_hdf5(path, options)
             }
             #[cfg(not(feature = "hdf5"))]
             {
@@ -142,12 +174,12 @@ pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream,
                 ))
             }
         }
-        Format::Aedat => aedat::read_aedat(path, &options),
+        Format::Aedat => aedat::read_aedat(path, options),
         Format::Aedat4 => Err(IoError::Unsupported(
             "AEDAT4 (.aedat4, iniVation DV FlatBuffer/LZ4) reading is not implemented yet"
                 .to_owned(),
         )),
-        Format::PropheseeDat => prophesee::read_dat(path, &options),
+        Format::PropheseeDat => prophesee::read_dat(path, options),
         Format::PropheseeRaw => Err(IoError::Unsupported(
             "Prophesee .raw (EVT2/EVT3) reading is not implemented yet".to_owned(),
         )),

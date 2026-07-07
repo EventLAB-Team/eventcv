@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "eventcv"
-version = "1.0.0"
+version = "1.0.1"
 description = "Open source event-based computer vision library."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -15,7 +15,7 @@ authors = [
   { name = "Adam Hines", email = "a.david.hines@gmail.com"}
 ]
 dependencies = [
-    "numpy>=1.24,<2"
+    "numpy"
 ]
 
 # Test-only tools (writing/inspecting HDF5 fixtures). Not needed to use eventcv —

@@ -243,11 +243,12 @@ pub fn read_text(path: impl AsRef<Path>, options: TextOptions) -> Result<EventSt
 
 /// One parsed row before unit conversion / bounds filtering. The inference path needs
 /// the *raw* timestamp (to detect the unit), so it can't go through [`TextReader`].
-struct RawRow {
-    x: u16,
-    y: u16,
-    t: f64,
-    p: bool,
+/// Also the input to [`load_rows`], the in-memory (`from_numpy`) loader.
+pub struct RawRow {
+    pub x: u16,
+    pub y: u16,
+    pub t: f64,
+    pub p: bool,
 }
 
 /// Loads a text file, inferring whichever of `sensor_size` (from the coordinate range)
@@ -266,16 +267,23 @@ pub fn load_text(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventS
     }
 
     let rows = read_raw_rows(path.as_ref(), options.order)?;
+    load_rows(&rows, options)
+}
+
+/// Builds an [`EventStream`] from already-parsed rows, inferring whichever of
+/// `sensor_size`/`time_unit` the caller left unset (the in-memory twin of
+/// [`load_text`], shared with `eventcv.from_numpy`).
+pub fn load_rows(rows: &[RawRow], options: &LoadOptions) -> Result<EventStream, IoError> {
     let (width, height) = options
         .sensor_size
-        .unwrap_or_else(|| infer_sensor_size(&rows));
-    let time_unit = options.time_unit.unwrap_or_else(|| infer_time_unit(&rows));
+        .unwrap_or_else(|| infer_sensor_size(rows));
+    let time_unit = options.time_unit.unwrap_or_else(|| infer_time_unit(rows));
     if width == 0 || height == 0 {
         return Err(IoError::InvalidSensorSize);
     }
 
     let mut builder = EventStreamBuilder::new(width, height, 0.001);
-    for row in &rows {
+    for row in rows {
         builder.push(row.x, row.y, time_unit.to_microseconds(row.t), row.p);
         if options.max_events.is_some_and(|max| builder.len() >= max) {
             break;

@@ -39,8 +39,10 @@ neither is a valid `repr=` / `flatten` / `view` name. See their sections below.
 
 The dtype column lists `uint64`/`uint8` for the two representations with a `normalize` option
 (`count` and `polarity`): raw `uint64` counts, or `uint8` rescaled so the busiest pixel maps to
-255 when `normalize=True` (the default in every Python entry point). The rest have no
-normalization option.
+255 when `normalize=True`. The default differs by representation: `polarity` normalizes by
+default (`True`), while `count` returns raw counts by default (`False`) so the frame preserves
+exact event totals. The rest have no normalization option. `view` always auto-contrasts for
+display regardless of the frame's dtype.
 
 ## Polarity
 
@@ -70,15 +72,17 @@ No parameters, and — like `polarity` — no dedicated method; only reachable v
 ## Count
 
 ```python
-stream.count(normalize=True)
-ecv.count(stream, normalize=False)
+stream.count()                    # raw uint64 counts (default)
+ecv.count(stream, normalize=True) # uint8, busiest pixel → 255
 ```
 
-- `normalize` (`bool`, default `True`) — rescale to `uint8` (busiest pixel → 255) instead of
-  raw `uint64` counts.
+- `normalize` (`bool`, default `False`) — when `True`, rescale to `uint8` (busiest pixel → 255)
+  instead of the default raw `uint64` counts.
 
 Single channel: total events per pixel, both polarities summed. The plainest "how much
-happened here" frame — unlike `polarity`, it collapses polarity into one intensity map.
+happened here" frame — unlike `polarity`, it collapses polarity into one intensity map. The raw
+`uint64` default keeps exact totals (e.g. `count().numpy().sum()` equals the event count), which
+is what you want for analysis; pass `normalize=True` for a display-scaled image.
 
 ## Voxel grid
 
@@ -204,8 +208,10 @@ and `reader.with_repr(...)`. The name is one of `"polarity"`, `"binary"`, `"coun
 parameters — they don't accept a representation's own parameters (`bins`, `tau_ms`, `window_ms`,
 `max_window_ms`, `window`), so `stream.flatten("voxel", bins=5)` is a `TypeError`. The one
 exception is `normalize`, which is an argument of `flatten`/`view` themselves, so
-`stream.flatten("count", normalize=False)` does work. To override the other parameters by name,
-use `reader.with_repr(name, **opts)`, which returns a new dataset reader:
+`stream.flatten("count", normalize=True)` does work (and each representation keeps its own
+`normalize` default when the argument is omitted — `False` for `count`, `True` for `polarity`).
+To override the other parameters by name, use `reader.with_repr(name, **opts)`, which returns a
+new dataset reader:
 
 ```python
 # defaults, by name:
