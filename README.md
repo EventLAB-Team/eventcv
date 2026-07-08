@@ -5,7 +5,7 @@
 # EventCV: Open source event-based computer vision library
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
-![PyPI - Version](https://img.shields.io/pypi/v/eventcv)
+[![PyPI - Version](https://img.shields.io/pypi/v/eventcv)](https://pypi.org/project/eventcv/)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/eventcv?period=monthly&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=GREEN&left_text=PyPi+downloads/month)](https://pepy.tech/projects/eventcv)
 [![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/eventcv.svg?label=Conda%20downloads)](
 https://anaconda.org/conda-forge/eventcv)
