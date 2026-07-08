@@ -35,12 +35,12 @@ classifiers = [
         # Topics
         'Topic :: Software Development',
         'Topic :: Scientific/Engineering',
-        'Topic :: Scientific/Engineering :: Image Recognition'
+        'Topic :: Scientific/Engineering :: Image Recognition',
 
         # Operating Systems
-        'Operating System :: Microsoft :: Windows'
-        'Operating System :: Unix'
-        'Operating System :: MacOS'
+        'Operating System :: Microsoft :: Windows',
+        'Operating System :: Unix',
+        'Operating System :: MacOS',
 ]
 
 # Test-only tools (writing/inspecting HDF5 fixtures). Not needed to use eventcv —
