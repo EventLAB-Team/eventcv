@@ -11,11 +11,36 @@ description = "Open source event-based computer vision library."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-authors = [
-  { name = "Adam Hines", email = "a.david.hines@gmail.com"}
-]
-dependencies = [
-    "numpy"
+authors = [{ name = "Adam Hines"}]
+maintainers = [{ name = "EventLAB Team", email="eventlab.localization@gmail.com"}]
+dependencies = ["numpy"]
+classifiers = [
+        # Development status
+        'Development Status :: 5 - Production/Stable',
+
+        # Intended audience
+        'Intended Audience :: Developers',
+        'Intended Audience :: Science/Researcher',
+
+        # Languages
+        'Programming Language :: Rust',
+        'Programming Language :: Python',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
+        'Programming Language :: Python :: 3.14',
+
+        # Topics
+        'Topic :: Software Development',
+        'Topic :: Scientific/Engineering',
+        'Topic :: Scientific/Engineering :: Image Recognition'
+
+        # Operating Systems
+        'Operating System :: Microsoft :: Windows'
+        'Operating System :: Unix'
+        'Operating System :: MacOS'
 ]
 
 # Test-only tools (writing/inspecting HDF5 fixtures). Not needed to use eventcv —
