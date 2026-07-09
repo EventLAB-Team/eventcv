@@ -97,6 +97,8 @@ def open(
     time_unit: str | None = None,
     order: str = "txyp",
     topic: str | None = None,
+    hot_pixel_filter: bool = False,
+    hot_pixel_std: float = 3.0,
 ) -> EventReader:
     """Open a file for lazy slicing without loading it whole.
 
@@ -128,6 +130,17 @@ def open(
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted (see
     :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
     ``sensor_size`` to skip the one-time coordinate scan resolution inference needs.
+
+    Pass ``hot_pixel_filter=True`` to strip *stuck* pixels consistently across the whole
+    recording. ``open`` scans the file once up front, flags every pixel whose event count exceeds
+    ``mean + hot_pixel_std·std`` (over the active pixels), and drops those pixels from every slice
+    it returns — the filter runs before any per-slice op (``efast`` / ``repr`` / …). This is
+    deliberately **global**: calling :meth:`EventStream.hot_pixel_filter` per slice re-thresholds
+    each window, so genuinely hot pixels survive at long ``dt_ms``. The pre-scan is kept
+    lightweight — it reads only the event coordinates (skipping the timestamp/polarity columns)
+    and, for a large recording, samples windows spread evenly across it rather than every event, so
+    the mask is a robust estimate rather than an exact tally. ``hot_pixel_std`` (default ``3.0``)
+    tunes how aggressive it is, matching :meth:`EventStream.hot_pixel_filter`.
 
     Pass ``repr`` (a representation name — ``"count"``, ``"voxel"``, ``"tsurf"``, ``"flow"``
     for optical flow, …) to make the reader a PyTorch-style **map dataset**:
@@ -176,6 +189,8 @@ def open(
         time_unit=time_unit,
         order=order,
         topic=topic,
+        hot_pixel_filter=hot_pixel_filter,
+        hot_pixel_std=hot_pixel_std,
     )
 
 

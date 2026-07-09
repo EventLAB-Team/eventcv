@@ -83,6 +83,16 @@ begin at that time, and earlier events fall outside every frame. It composes wit
 reader = ecv.open("huge.hdf5", dt_ms=30, offset=1_000)   # frame 0 starts at t = 1 s
 ```
 
+Pass `hot_pixel_filter=True` to strip stuck pixels **consistently across the whole recording**:
+`open` scans the file once up front and drops those pixels from every slice. Unlike
+`stream.hot_pixel_filter()` run per slice — whose threshold shifts window to window, so hot
+pixels leak back at long `dt_ms` — this is a single global mask. `hot_pixel_std` (default `3.0`)
+tunes it:
+
+```python
+reader = ecv.open("huge.hdf5", dt_ms=1000, hot_pixel_filter=True)   # hot pixels gone everywhere
+```
+
 For a recording whose timestamps are epoch-based, `offset` is just that epoch time in ms
 (e.g. `offset=1_587_540_271_650`). Values before the recording clamp to the start; values
 past the end give zero frames.
