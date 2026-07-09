@@ -203,6 +203,24 @@ pub trait SliceSource: Send {
     fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError>;
     /// Events whose timestamp (µs) lies in the half-open window `[t0, t1)`.
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError>;
+
+    /// Per-pixel event counts over the whole file (row-major `width·height`), out-of-bounds
+    /// events dropped — what the reader's hot-pixel pre-scan needs. The default tallies through
+    /// `slice_index` in bounded chunks; a source that can read coordinates alone (HDF5) overrides
+    /// this to skip the `t`/`p` columns and stream construction, which is most of the work.
+    fn pixel_counts(&self) -> Result<Vec<u64>, IoError> {
+        const CHUNK: usize = 8_000_000;
+        let (width, height) = self.sensor_size();
+        let mut counts = vec![0u64; width * height];
+        let total = self.n_events();
+        let mut start = 0;
+        while start < total {
+            let end = (start + CHUNK).min(total);
+            self.slice_index(start, end)?.add_pixel_counts(&mut counts);
+            start = end;
+        }
+        Ok(counts)
+    }
 }
 
 /// A [`SliceSource`] backed by an already-loaded stream — the universal fallback for
@@ -263,6 +281,14 @@ impl SliceSource for MemorySliceSource {
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {
         let ts = self.stream.ts();
         Ok(self.rebuild((0..ts.len()).filter(|&index| ts[index] >= t0 && ts[index] < t1)))
+    }
+
+    fn pixel_counts(&self) -> Result<Vec<u64>, IoError> {
+        // Already resident — tally straight from the stream, no chunked rebuilds.
+        let (width, height) = self.stream.sensor_size();
+        let mut counts = vec![0u64; width * height];
+        self.stream.add_pixel_counts(&mut counts);
+        Ok(counts)
     }
 }
 

@@ -772,7 +772,7 @@ fn parse_dt_ms(dt_ms: Option<f64>) -> PyResult<Option<i64>> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None))]
+#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -785,6 +785,8 @@ fn open(
     time_unit: Option<&str>,
     order: &str,
     topic: Option<String>,
+    hot_pixel_filter: bool,
+    hot_pixel_std: f64,
 ) -> PyResult<PyEventReader> {
     let mode = match (parse_dt_ms(dt_ms)?, max_events) {
         (Some(_), Some(_)) => {
@@ -831,6 +833,19 @@ fn open(
         }
         _ => 0,
     };
+    // Whole-recording hot-pixel mask: tally per-pixel counts once now (the accepted pre-processing
+    // cost) so every slice drops the same stuck pixels. A per-slice filter can't — its threshold
+    // shifts with each window, letting hot pixels survive at long dt_ms. `pixel_counts` reads only
+    // the coordinate columns (HDF5), so the scan stays lazy and cheap. `None` unless requested.
+    let hot_pixel_mask = if hot_pixel_filter {
+        let counts = reader.pixel_counts().map_err(map_io_error)?;
+        Some(Arc::from(EventStream::hot_pixel_mask_from_counts(
+            &counts,
+            hot_pixel_std,
+        )))
+    } else {
+        None
+    };
     Ok(PyEventReader {
         inner: Arc::new(Mutex::new(reader)),
         mode,
@@ -838,6 +853,7 @@ fn open(
         slice_op: None,
         offset_us,
         base_index,
+        hot_pixel_mask,
     })
 }
 
@@ -864,6 +880,11 @@ struct PyEventReader {
     /// The event index of the first event at/after the offset origin — the fixed-count framing
     /// counterpart of `offset_us` (0 for duration mode, no offset, or an offset past the end).
     base_index: usize,
+    /// Whole-recording hot-pixel mask from `open(hot_pixel_filter=True)` (row-major
+    /// `width·height`, `true` = drop). Computed once at `open` and applied to every fetched slice
+    /// before any per-slice op, so stuck pixels are removed consistently across frames; `None`
+    /// when hot-pixel filtering was not requested.
+    hot_pixel_mask: Option<Arc<[bool]>>,
 }
 
 /// A per-slice `EventStream` → `EventStream` operation a reader carries (Phase 5 corner
@@ -906,12 +927,14 @@ enum SliceWindow {
     Index(usize, usize),
 }
 
-/// Reads `window` from the shared reader off-GIL, applying the per-slice op.
+/// Reads `window` from the shared reader off-GIL, dropping the whole-recording hot pixels (if
+/// any) before the per-slice op, so corner detectors never fire on stuck pixels.
 fn fetch_window(
     py: Python<'_>,
     reader: &Arc<Mutex<Reader>>,
     window: SliceWindow,
     op: Option<SliceOp>,
+    hot_pixel_mask: Option<Arc<[bool]>>,
 ) -> PyResult<EventStream> {
     let reader = Arc::clone(reader);
     py.detach(move || {
@@ -920,7 +943,13 @@ fn fetch_window(
             SliceWindow::Time(t0, t1) => guard.slice_time(t0, t1),
             SliceWindow::Index(i0, i1) => guard.slice_index(i0, i1),
         }
-        .map(|stream| apply_slice_op(op, stream))
+        .map(|stream| {
+            let stream = match &hot_pixel_mask {
+                Some(mask) => stream.drop_masked_pixels(mask),
+                None => stream,
+            };
+            apply_slice_op(op, stream)
+        })
     })
     .map_err(map_io_error)
 }
@@ -1077,6 +1106,7 @@ impl PyEventReader {
             slice_op: self.slice_op,
             offset_us: self.offset_us,
             base_index: self.base_index,
+            hot_pixel_mask: self.hot_pixel_mask.clone(),
         })
     }
 
@@ -1110,7 +1140,13 @@ impl PyEventReader {
         let mut frames = Vec::with_capacity(indices.len());
         for index in indices {
             let window = self.window_for_index(index)?;
-            let stream = fetch_window(py, &self.inner, window, self.slice_op)?;
+            let stream = fetch_window(
+                py,
+                &self.inner,
+                window,
+                self.slice_op,
+                self.hot_pixel_mask.clone(),
+            )?;
             let frame = py
                 .detach(|| spec.generate(&stream))
                 .map_err(map_representation_error)?;
@@ -1194,10 +1230,12 @@ impl PyEventReader {
     /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
     /// applying the per-slice op (e.g. `efast`) if one is set.
     fn fetch(&self, py: Python<'_>, window: SliceWindow) -> PyResult<PyEventStream> {
-        fetch_window(py, &self.inner, window, self.slice_op).map(|inner| PyEventStream {
-            inner,
-            repr: self.repr,
-        })
+        fetch_window(py, &self.inner, window, self.slice_op, self.hot_pixel_mask.clone()).map(
+            |inner| PyEventStream {
+                inner,
+                repr: self.repr,
+            },
+        )
     }
 
     /// A new reader over the same file (and mode/`repr`) that applies `op` to every slice.
@@ -1209,6 +1247,7 @@ impl PyEventReader {
             slice_op: Some(op),
             offset_us: self.offset_us,
             base_index: self.base_index,
+            hot_pixel_mask: self.hot_pixel_mask.clone(),
         }
     }
 
@@ -1219,6 +1258,7 @@ impl PyEventReader {
             cursor,
             slice_op: self.slice_op,
             repr: self.repr,
+            hot_pixel_mask: self.hot_pixel_mask.clone(),
         }
     }
 
@@ -1293,6 +1333,8 @@ struct PyWindowIterator {
     /// The reader's stored representation, carried onto each yielded window (so `open(repr=…)`
     /// survives `for w in reader.windows(): w.view()`).
     repr: Option<ReprSpec>,
+    /// The reader's whole-recording hot-pixel mask, applied to each yielded window.
+    hot_pixel_mask: Option<Arc<[bool]>>,
 }
 
 /// Walks a recording as consecutive time windows (`windows(step_ms=…)` / `dt_ms`
@@ -1350,7 +1392,13 @@ impl PyWindowIterator {
         let Some(window) = self.cursor.advance() else {
             return Ok(None);
         };
-        let stream = fetch_window(py, &self.reader, window, self.slice_op)?;
+        let stream = fetch_window(
+            py,
+            &self.reader,
+            window,
+            self.slice_op,
+            self.hot_pixel_mask.clone(),
+        )?;
         Ok(Some(PyEventStream {
             inner: stream,
             repr: self.repr,

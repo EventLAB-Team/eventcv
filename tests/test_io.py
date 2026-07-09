@@ -287,6 +287,56 @@ class OpenReaderTests(unittest.TestCase):
             self._frames().slice(0, t1_ms=5.0)
 
 
+class HotPixelReaderTests(unittest.TestCase):
+    """`open(hot_pixel_filter=True)` strips stuck pixels globally, across every slice."""
+
+    def _recording(self):
+        """8x8 `t x y p` file where (1,1) is stuck (fires every us) over single-event pixels.
+
+        (1,1)'s global count (50) dwarfs the 20 baseline pixels (1 each), so it exceeds
+        mean + 3*std; the events span 0..49 us -> five 10 us (dt_ms=0.01) frames."""
+        events = [(t, 1, 1, 1) for t in range(50)]  # stuck pixel, one event per microsecond
+        events += [(k, 2 + k % 6, 2 + k // 6, 0) for k in range(20)]  # sparse baseline
+        events.sort()  # in-place text slicing needs time-ordered events
+        rows = [f"{t} {x} {y} {p}" for (t, x, y, p) in events]
+        path = Path(tempfile.mkdtemp()) / "hot.txt"
+        path.write_text("\n".join(rows) + "\n")
+        return str(path)
+
+    def _has_hot_pixel(self, stream):
+        xy = stream.numpy()[:, :2]
+        return bool((xy == [1, 1]).all(axis=1).any())
+
+    def test_off_by_default(self):
+        reader = eventcv.open(self._recording(), sensor_size=(8, 8), time_unit="us")
+        self.assertTrue(self._has_hot_pixel(reader.slice()))  # (1,1) present, unfiltered
+
+    def test_removes_pixel_from_every_slice(self):
+        reader = eventcv.open(
+            self._recording(), dt_ms=0.01, sensor_size=(8, 8), time_unit="us", hot_pixel_filter=True
+        )
+        for n in range(reader.n_slices):
+            self.assertFalse(self._has_hot_pixel(reader.slice(n)), f"survived in slice {n}")
+        # Only the 50 stuck events go; the 20 baseline events remain, via both slice and windows.
+        self.assertEqual(sum(len(reader.slice(n)) for n in range(reader.n_slices)), 20)
+        self.assertEqual(sum(len(w) for w in reader.windows()), 20)
+
+    def test_composes_with_repr(self):
+        reader = eventcv.open(
+            self._recording(), dt_ms=0.01, sensor_size=(8, 8), time_unit="us",
+            hot_pixel_filter=True, repr="count",
+        )
+        self.assertEqual(sum(int(reader[n][:, 1, 1].sum()) for n in range(len(reader))), 0)
+
+    def test_std_controls_aggressiveness(self):
+        # A high threshold flags nothing, so even the stuck pixel survives.
+        reader = eventcv.open(
+            self._recording(), sensor_size=(8, 8), time_unit="us",
+            hot_pixel_filter=True, hot_pixel_std=100.0,
+        )
+        self.assertTrue(self._has_hot_pixel(reader.slice()))
+
+
 class DatasetReaderTests(unittest.TestCase):
     """`EventReader` as a PyTorch-style map dataset (Workstream D2)."""
 

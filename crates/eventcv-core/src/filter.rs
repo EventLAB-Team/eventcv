@@ -66,17 +66,48 @@ impl EventStream {
     /// `mean + n_std·std`, with the mean and standard deviation taken over the **active** pixels
     /// (those with at least one event). A uniform or empty stream removes nothing.
     pub fn hot_pixel_filter(&self, n_std: f64) -> EventStream {
+        self.drop_masked_pixels(&self.hot_pixel_mask(n_std))
+    }
+
+    /// The hot-pixel mask this stream would remove: `true` at each pixel whose total event count
+    /// exceeds `mean + n_std·std` (statistics over the **active** pixels), row-major `width·height`.
+    /// Degenerate sensors give an empty mask. Exposed on its own so a reader can compute the mask
+    /// **once** over a whole recording and apply it to every slice with [`Self::drop_masked_pixels`]
+    /// — a per-slice `hot_pixel_filter` instead re-thresholds each window, so hot pixels survive at
+    /// long accumulation times.
+    pub fn hot_pixel_mask(&self, n_std: f64) -> Vec<bool> {
         let (width, height) = self.sensor_size();
         if width == 0 || height == 0 {
-            return self.clone();
+            return Vec::new();
         }
         let mut counts = vec![0u64; width * height];
+        self.add_pixel_counts(&mut counts);
+        Self::hot_pixel_mask_from_counts(&counts, n_std)
+    }
+
+    /// Adds this stream's per-pixel event counts into `counts` (row-major `width·height` for this
+    /// stream's sensor); a mismatched buffer is left untouched. Lets a reader tally a whole
+    /// recording chunk-by-chunk — feeding [`Self::hot_pixel_mask_from_counts`] — without ever
+    /// materialising the full file, so the pre-scan stays within bounded memory.
+    pub fn add_pixel_counts(&self, counts: &mut [u64]) {
+        let (width, height) = self.sensor_size();
+        if counts.len() != width * height {
+            return;
+        }
         let (xs, ys) = (self.xs(), self.ys());
         for index in 0..self.len() {
             counts[ys[index] as usize * width + xs[index] as usize] += 1;
         }
+    }
 
+    /// The hot-pixel mask for pre-tallied per-pixel `counts`: `true` where a count exceeds
+    /// `mean + n_std·std` taken over the **active** (non-zero) pixels. All-zero counts flag nothing.
+    /// The chunked-scan counterpart of [`Self::hot_pixel_mask`].
+    pub fn hot_pixel_mask_from_counts(counts: &[u64], n_std: f64) -> Vec<bool> {
         let active: Vec<u64> = counts.iter().copied().filter(|&c| c > 0).collect();
+        if active.is_empty() {
+            return vec![false; counts.len()]; // no events -> nothing is hot
+        }
         let n = active.len() as f64;
         let mean = active.iter().sum::<u64>() as f64 / n;
         let variance = active
@@ -86,8 +117,20 @@ impl EventStream {
             / n;
         let threshold = mean + n_std * variance.sqrt();
 
+        counts.iter().map(|&c| c as f64 > threshold).collect()
+    }
+
+    /// Drops every event whose pixel is flagged `true` in `mask` (row-major `width·height`, as
+    /// [`Self::hot_pixel_mask`] returns), keeping `(x, y, p, t)` and order. A mask that does not
+    /// match the sensor grid (e.g. the empty mask of a degenerate sensor) removes nothing, so a
+    /// reader can carry one whole-recording mask and apply it to every slice unconditionally.
+    pub fn drop_masked_pixels(&self, mask: &[bool]) -> EventStream {
+        let (width, height) = self.sensor_size();
+        if width == 0 || height == 0 || mask.len() != width * height {
+            return self.clone();
+        }
         self.remap(width, height, |x, y, t, p| {
-            ((counts[y as usize * width + x as usize] as f64) <= threshold).then_some((x, y, t, p))
+            (!mask[y as usize * width + x as usize]).then_some((x, y, t, p))
         })
     }
 }
@@ -172,6 +215,25 @@ mod tests {
             .zip(filtered.ys())
             .all(|(&x, &y)| (x, y) != (1, 1)));
         assert_eq!(filtered.len(), 20); // only the baseline survives
+    }
+
+    #[test]
+    fn hot_pixel_mask_drops_the_pixel_from_a_window_where_it_would_survive() {
+        // Global view: (1,1) is hot. Its mask must still remove (1,1) from a short window where
+        // it fires just once — the window a per-slice hot_pixel_filter would leave untouched.
+        let mut events: Vec<(u16, u16, i64, bool)> =
+            (0..30).map(|t| (1, 1, t as i64, true)).collect();
+        for k in 0..20u16 {
+            events.push((10 + k % 5, 5 + k / 5, 1_000 + i64::from(k), false));
+        }
+        let mask = build(32, 32, &events).hot_pixel_mask(3.0);
+        assert!(mask[33]); // (x=1, y=1) on a 32-wide grid is flagged
+
+        let window = build(32, 32, &[(1, 1, 0, true), (10, 5, 1, false)]);
+        assert_eq!(window.hot_pixel_filter(3.0).len(), 2); // per-window: nothing stands out
+        let filtered = window.drop_masked_pixels(&mask); // global mask: (1,1) still goes
+        assert_eq!(filtered.len(), 1);
+        assert_eq!((filtered.xs()[0], filtered.ys()[0]), (10, 5));
     }
 
     #[test]

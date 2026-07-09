@@ -342,6 +342,93 @@ impl SliceSource for Hdf5SliceSource {
         let start = self.lower_bound_time(t0)?;
         self.read_window(start, t1)
     }
+
+    /// Tallies per-pixel counts reading only the `x`/`y` columns — skipping the `t` column (by
+    /// far the largest on disk) and `p`, plus timestamp conversion and stream construction, which
+    /// are the bulk of a slice's cost. Above [`SCAN_BUDGET`] events it further reads only
+    /// evenly-spaced segments rather than every event: the hot-pixel mask is an outlier test, and
+    /// stuck pixels fire throughout the recording, so they dominate any representative sample while
+    /// the threshold (`mean + n·std`) stays ~scale-invariant. This keeps a multi-GB scan bounded.
+    fn pixel_counts(&self) -> Result<Vec<u64>, IoError> {
+        let [x, y, ..] = &self.datasets;
+        let mut counts = vec![0u64; self.width * self.height];
+        if self.total <= SCAN_BUDGET {
+            let mut start = 0;
+            while start < self.total {
+                let end = (start + BLOCK).min(self.total);
+                add_xy_counts(x, y, start..end, self.width, self.height, &mut counts)?;
+                start = end;
+            }
+        } else {
+            // Read SCAN_SEGMENT-event windows spread evenly across the file (~SCAN_BUDGET total).
+            let segments = SCAN_BUDGET / SCAN_SEGMENT;
+            let stride = self.total / segments;
+            for i in 0..segments {
+                let start = i * stride;
+                let end = (start + SCAN_SEGMENT).min(self.total);
+                add_xy_counts(x, y, start..end, self.width, self.height, &mut counts)?;
+            }
+        }
+        Ok(counts)
+    }
+}
+
+/// Target events for the hot-pixel pre-scan. A recording larger than this is *sampled* as
+/// [`SCAN_SEGMENT`]-event windows spread evenly across it rather than read in full — enough to
+/// pin the count distribution's shape (all a stuck-pixel outlier test needs) while keeping the
+/// scan of a multi-GB file well under a second.
+const SCAN_BUDGET: usize = 32_000_000;
+/// Events per evenly-spaced sample window. Kept small (≈ one on-disk chunk) so the budget buys
+/// *many* windows: fine temporal coverage is what catches a hot pixel whose bursts of activity
+/// would fall between coarser, wider-spaced samples.
+const SCAN_SEGMENT: usize = 100_000;
+
+/// Adds the `x`/`y` columns over `range` into `counts`, dropping out-of-bounds events (matching
+/// [`read_range`]). Reads coordinates in their native small-int type — no widening to `i64`.
+fn add_xy_counts(
+    x: &Dataset,
+    y: &Dataset,
+    range: Range<usize>,
+    width: usize,
+    height: usize,
+    counts: &mut [u64],
+) -> Result<(), IoError> {
+    let xs = read_coords(x, range.clone())?;
+    let ys = read_coords(y, range)?;
+    for (&xi, &yi) in xs.iter().zip(&ys) {
+        if xi < width && yi < height {
+            counts[yi * width + xi] += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Reads a coordinate column over `range` as `usize`, dispatching on its on-disk width like
+/// [`column_max`] so a `u16` file is not widened through `i64`.
+fn read_coords(dataset: &Dataset, range: Range<usize>) -> Result<Vec<usize>, IoError> {
+    let descriptor = dataset
+        .dtype()
+        .and_then(|dtype| dtype.to_descriptor())
+        .map_err(map_hdf5_error)?;
+    Ok(match descriptor {
+        TypeDescriptor::Unsigned(IntSize::U1) => read_block::<u8>(dataset, range)?
+            .iter()
+            .map(|&v| usize::from(v))
+            .collect(),
+        TypeDescriptor::Unsigned(IntSize::U2) => read_block::<u16>(dataset, range)?
+            .iter()
+            .map(|&v| usize::from(v))
+            .collect(),
+        TypeDescriptor::Unsigned(IntSize::U4) => read_block::<u32>(dataset, range)?
+            .iter()
+            .map(|&v| v as usize)
+            .collect(),
+        // Wider or signed columns: reuse the general reader, clamping negatives out of bounds.
+        _ => read_integers(dataset, range)?
+            .iter()
+            .map(|&v| if v < 0 { usize::MAX } else { v as usize })
+            .collect(),
+    })
 }
 
 /// Cheaply confirms the timestamp column is non-decreasing by sampling, so in-place
@@ -919,6 +1006,45 @@ mod tests {
         assert_eq!(source.slice_index(4, 100).unwrap().ts(), &[5000, 6000]); // hi clamped
         assert!(source.slice_index(10, 20).unwrap().is_empty()); // wholly past the end
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn pixel_counts_reads_xy_only_and_drops_out_of_bounds() {
+        // The hot-pixel pre-scan tallies coordinates without the t/p columns; it must still drop
+        // out-of-bounds events exactly as read_range does. Small file -> the exact (non-sampled)
+        // branch. Events: (1,2), (3,0), (0,1), and (4,0) which is out of a 4x4 sensor.
+        let dir = temp_dir("h5counts");
+        let path = dir.join("events.h5");
+        {
+            let file = File::create(&path).unwrap();
+            let group = file.create_group("events").unwrap();
+            for (name, data) in [("x", vec![1u16, 3, 0, 4]), ("y", vec![2u16, 0, 1, 0])] {
+                group
+                    .new_dataset_builder()
+                    .with_data(&data[..])
+                    .create(name)
+                    .unwrap();
+            }
+            group
+                .new_dataset_builder()
+                .with_data(&[1000u64, 2000, 3000, 4000][..])
+                .create("t")
+                .unwrap();
+            group
+                .new_dataset_builder()
+                .with_data(&[true, false, true, false][..])
+                .create("p")
+                .unwrap();
+        }
+        let source = open_hdf5_slice(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap();
+
+        let counts = source.pixel_counts().unwrap();
+        assert_eq!(counts.len(), 16);
+        assert_eq!(counts.iter().sum::<u64>(), 3); // (4, 0) dropped: x == width
+        assert_eq!(counts[9], 1); // (x=1, y=2) -> 2*4 + 1
+        assert_eq!(counts[3], 1); // (x=3, y=0)
+        assert_eq!(counts[4], 1); // (x=0, y=1) -> 1*4 + 0
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
