@@ -157,9 +157,12 @@ def open(
     ``slice``/``windows``/``with_repr``. To render an algorithm as a video, map it over
     ``windows()`` and hand the frames to :func:`export_png` (then assemble with ffmpeg).
 
-    Note ``repr`` governs the **array/dataset** path (``reader[i]`` → NumPy). To *view* a slice
-    interactively, ``slice(i)`` returns the raw :class:`EventStream`, so name the representation
-    on the stream: ``data.slice(1000).view("flow")`` (or ``.slice(1000).optical_flow().view()``).
+    When ``repr`` is set, ``slice``/``slice_count``/``windows`` also apply it: each returns the
+    rendered :class:`EventFrame` (the rich object — ``.numpy()``, ``.view()``, ``.save()``),
+    while ``reader[i]``/``batch`` stay dense NumPy arrays for the ``DataLoader`` path. So
+    ``open(path, repr="mcts").slice(0)`` equals ``open(path).slice(0).mcts()``. Without ``repr``,
+    ``slice(i)`` returns the raw :class:`EventStream`, so name the representation on the stream:
+    ``data.slice(1000).view("flow")`` (or ``.slice(1000).optical_flow().view()``).
 
     Example::
 
