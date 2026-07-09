@@ -954,6 +954,30 @@ fn fetch_window(
     .map_err(map_io_error)
 }
 
+/// Wraps a freshly fetched slice for a public slice API. When the reader carries a
+/// representation (`open(repr=…)` / `with_repr`) the slice is rendered eagerly and returned as
+/// an `EventFrame` (so `open(repr="mcts").slice(0)` == the frame `open().slice(0).mcts()`
+/// yields); otherwise the raw `EventStream` is returned.
+fn render_slice(
+    py: Python<'_>,
+    repr: Option<ReprSpec>,
+    stream: EventStream,
+) -> PyResult<Py<PyAny>> {
+    match repr {
+        Some(spec) => {
+            let frame = py
+                .detach(|| spec.generate(&stream))
+                .map_err(map_representation_error)?;
+            Ok(Bound::new(py, PyEventFrame { inner: frame })?
+                .into_any()
+                .unbind())
+        }
+        None => Ok(Bound::new(py, PyEventStream { inner: stream, repr: None })?
+            .into_any()
+            .unbind()),
+    }
+}
+
 #[pymethods]
 impl PyEventReader {
     /// `n_slices` in the `dt_ms` / `max_events` frame-dataset modes (so `len(reader) ==
@@ -1026,12 +1050,13 @@ impl PyEventReader {
         self.offset_us.map(us_to_ms)
     }
 
-    /// One slice as an `EventStream`. With a positional index `n` (requires
-    /// `open(dt_ms=…)` or `open(max_events=…)`), returns the `n`-th fixed frame — the
-    /// `dt_ms`-long window `[t_min + n·dt, t_min + (n+1)·dt)`, or the `max_events`-sized
-    /// event chunk `[n·N, (n+1)·N)`; negative `n` counts from the end. Otherwise returns
-    /// the half-open time window `[t0_ms, t1_ms)`, with omitted bounds extending to the
-    /// recording's start / end.
+    /// One slice. With a positional index `n` (requires `open(dt_ms=…)` or
+    /// `open(max_events=…)`), returns the `n`-th fixed frame — the `dt_ms`-long window
+    /// `[t_min + n·dt, t_min + (n+1)·dt)`, or the `max_events`-sized event chunk
+    /// `[n·N, (n+1)·N)`; negative `n` counts from the end. Otherwise returns the half-open
+    /// time window `[t0_ms, t1_ms)`, with omitted bounds extending to the recording's start /
+    /// end. When the reader carries a representation (`open(repr=…)` / `with_repr`) the slice
+    /// is rendered to that `EventFrame`; otherwise it is a raw `EventStream`.
     #[pyo3(signature = (index=None, *, t0_ms=None, t1_ms=None))]
     fn slice(
         &self,
@@ -1039,7 +1064,7 @@ impl PyEventReader {
         index: Option<i64>,
         t0_ms: Option<f64>,
         t1_ms: Option<f64>,
-    ) -> PyResult<PyEventStream> {
+    ) -> PyResult<Py<PyAny>> {
         let window = if let Some(index) = index {
             if t0_ms.is_some() || t1_ms.is_some() {
                 return Err(PyValueError::new_err(
@@ -1054,7 +1079,7 @@ impl PyEventReader {
                 t1_ms.map_or(hi.saturating_add(1), ms_to_us), // +1 keeps the last event
             )
         };
-        self.fetch(py, window)
+        self.fetch_slice(py, window)
     }
 
     /// `reader[n]` — the `n`-th fixed frame (requires `open(dt_ms=…)` or
@@ -1167,14 +1192,16 @@ impl PyEventReader {
         stack_frames(py, &frames, template)
     }
 
-    /// Events whose index lies in `[i0, i1)` (clamped to the file).
+    /// Events whose index lies in `[i0, i1)` (clamped to the file). Rendered to the reader's
+    /// `EventFrame` when a representation is set (`open(repr=…)` / `with_repr`), else a raw
+    /// `EventStream`.
     #[pyo3(signature = (i0, i1))]
-    fn slice_count(&self, py: Python<'_>, i0: i64, i1: i64) -> PyResult<PyEventStream> {
+    fn slice_count(&self, py: Python<'_>, i0: i64, i1: i64) -> PyResult<Py<PyAny>> {
         let i0 =
             usize::try_from(i0).map_err(|_| PyValueError::new_err("i0 must be non-negative"))?;
         let i1 =
             usize::try_from(i1).map_err(|_| PyValueError::new_err("i1 must be non-negative"))?;
-        self.fetch(py, SliceWindow::Index(i0, i1))
+        self.fetch_slice(py, SliceWindow::Index(i0, i1))
     }
 
     /// Lazy iterator of consecutive windows: each is `[start, start + span_ms)` and
@@ -1182,7 +1209,8 @@ impl PyEventReader {
     /// (so `windows()` walks every `slice(n)`), and `span_ms` defaults to `step_ms`
     /// (non-overlapping). For a `max_events` reader, `windows()` without arguments walks
     /// the fixed-count slices instead. Streams a multi-GB file window-by-window without
-    /// loading it.
+    /// loading it. Each item is a rendered `EventFrame` when the reader carries a
+    /// representation (`open(repr=…)` / `with_repr`), else a raw `EventStream`.
     #[pyo3(signature = (*, step_ms=None, span_ms=None))]
     fn windows(&self, step_ms: Option<f64>, span_ms: Option<f64>) -> PyResult<PyWindowIterator> {
         let guard = self.inner.lock().unwrap();
@@ -1236,6 +1264,14 @@ impl PyEventReader {
                 repr: self.repr,
             },
         )
+    }
+
+    /// Reads `window` and wraps it for a public slice API: rendered to the reader's
+    /// `EventFrame` when a representation is set, else the raw `EventStream`.
+    fn fetch_slice(&self, py: Python<'_>, window: SliceWindow) -> PyResult<Py<PyAny>> {
+        let stream =
+            fetch_window(py, &self.inner, window, self.slice_op, self.hot_pixel_mask.clone())?;
+        render_slice(py, self.repr, stream)
     }
 
     /// A new reader over the same file (and mode/`repr`) that applies `op` to every slice.
@@ -1330,8 +1366,8 @@ struct PyWindowIterator {
     reader: Arc<Mutex<Reader>>,
     cursor: WindowCursor,
     slice_op: Option<SliceOp>,
-    /// The reader's stored representation, carried onto each yielded window (so `open(repr=…)`
-    /// survives `for w in reader.windows(): w.view()`).
+    /// The reader's stored representation. When set (`open(repr=…)` / `with_repr`) each yielded
+    /// window is rendered to that `EventFrame`; otherwise a raw `EventStream` is yielded.
     repr: Option<ReprSpec>,
     /// The reader's whole-recording hot-pixel mask, applied to each yielded window.
     hot_pixel_mask: Option<Arc<[bool]>>,
@@ -1388,7 +1424,7 @@ impl PyWindowIterator {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyEventStream>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let Some(window) = self.cursor.advance() else {
             return Ok(None);
         };
@@ -1399,10 +1435,7 @@ impl PyWindowIterator {
             self.slice_op,
             self.hot_pixel_mask.clone(),
         )?;
-        Ok(Some(PyEventStream {
-            inner: stream,
-            repr: self.repr,
-        }))
+        render_slice(py, self.repr, stream).map(Some)
     }
 }
 

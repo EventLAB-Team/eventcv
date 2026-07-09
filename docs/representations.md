@@ -54,9 +54,10 @@ ecv.flatten(stream, "polarity", normalize=False)
 
 Two channels, `[positive, negative]`: raw event counts per pixel per polarity (`uint64`), or
 `uint8` rescaled to the busiest pixel when `normalize=True` (the default). This is the frame
-rendered whenever no representation is requested and the stream has no stored `repr` (from
-`open(repr=...)`) — there is no dedicated `.polarity()` method, only the name form and the
-implicit default.
+rendered whenever no representation is requested or stored on the stream — there is no
+dedicated `.polarity()` method, only the name form and the implicit default. (A reader opened
+with `open(repr=...)` renders that representation on `slice()` directly instead of falling back
+to polarity.)
 
 ## Binary
 
@@ -221,7 +222,10 @@ reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")    # mcts, default max_win
 # parameters by name — only with_repr forwards them:
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("voxel", bins=5)
 array = reader[0]                                        # [5, H, W] voxel for frame 0
-frame = reader.slice(7).flatten("mcts")                  # name form on a stream → EventFrame
+frame = reader.slice(7)                                  # EventFrame — voxel(bins=5) applied
+
+# a repr-less reader yields a stream; name the representation on the slice:
+frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")   # → EventFrame
 ```
 
 `"pset"` and `"labels"` are not valid names here — `pset` is sparse (see above), and `labels`
