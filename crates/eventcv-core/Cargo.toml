@@ -21,6 +21,14 @@ png = "0.17"
 # Optional: `.h5`/`.hdf5` reading. Builds libhdf5 from source (needs cmake) and
 # bundles the LZF filter used by event datasets. Enable with `--features hdf5`.
 hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-features = false, features = ["static", "lzf", "zlib"] }
+# Raw libhdf5 FFI, pulled in alongside `hdf5` (same crate/version hdf5-metno depends on, so it
+# shares the one static libhdf5 build). Used only to read a compound event dataset's fields by
+# hyperslab — hdf5-metno's safe API can't decode an arbitrary compound generically.
+hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true, default-features = false, features = ["static"] }
+
+# The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
+[features]
+hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.
