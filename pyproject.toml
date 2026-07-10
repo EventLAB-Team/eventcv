@@ -20,7 +20,7 @@ classifiers = [
 
         # Intended audience
         'Intended Audience :: Developers',
-        'Intended Audience :: Science/Researcher',
+        'Intended Audience :: Science/Research',
 
         # Languages
         'Programming Language :: Rust',
