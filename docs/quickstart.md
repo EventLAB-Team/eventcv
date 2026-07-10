@@ -64,6 +64,15 @@ print(reader.n_slices)
 frame = reader.slice(50).voxel()           # the 50th 30 ms frame → voxel grid
 ```
 
+Stream ops apply to a reader too: `ecv.hot_pixel_filter(reader)` (or `reader.hot_pixel_filter()`)
+returns a new lazy reader that runs the op on every slice, so filtering/geometry compose with
+slicing without loading the file.
+
+```python
+clean = ecv.hot_pixel_filter(reader).flip_x()   # still lazy — nothing read yet
+frame = clean.slice(50).voxel()                 # 50th frame, hot pixels dropped + flipped
+```
+
 Slice by a fixed **event count** instead of a fixed duration with `max_events` — each
 slice holds exactly that many consecutive events (the last may be shorter), which keeps
 the number of events per frame constant rather than the time span. It is mutually
