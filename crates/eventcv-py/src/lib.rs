@@ -1419,7 +1419,7 @@ impl PyEventReader {
             py,
             &self.inner,
             window,
-            self.slice_op,
+            self.slice_ops,
             self.hot_pixel_mask.clone(),
         )
         .map(|inner| PyEventStream {
@@ -1435,7 +1435,7 @@ impl PyEventReader {
             py,
             &self.inner,
             window,
-            self.slice_op,
+            self.slice_ops,
             self.hot_pixel_mask.clone(),
         )?;
         render_slice(py, self.repr, stream)
