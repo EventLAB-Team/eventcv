@@ -19,6 +19,7 @@ def load(
     topic: str | None = None,
     max_events: int | None = None,
     offset: float | None = None,
+    keys: dict[str, str] | None = None,
 ) -> EventStream:
     """Load events from any supported file, detected by its extension.
 
@@ -31,13 +32,25 @@ def load(
     from the timestamps (a fractional text value means seconds) and the resolution
     from the coordinate range. Passing ``sensor_size`` for HDF5 also skips that scan.
     ``time_unit`` is ``seconds``/``milliseconds``/``microseconds``/``nanoseconds`` (or
-    ``auto``); ``order`` (``txyp``/``xytp``) applies to text. ``topic`` selects the
+    ``auto``); ``order`` (``txyp``/``xytp``) applies to headerless text. ``topic`` selects the
     rosbag topic (default ``/davis/left/events``). ``offset`` is an **absolute timestamp
     in milliseconds** (the file's own time base — the same base as ``stream.numpy()[:, 2]``
     scaled to ms): events before it are skipped, and ``max_events`` then caps how many are
     kept *after* it — together they read a window, handy for previewing a slice of a very
     large file. For a recording whose timestamps are epoch-based, pass the epoch time in ms
     (e.g. ``offset=1_587_540_271_650``); ``<= 0`` reads from the start.
+
+    **The x/y/t/p columns are found automatically**, whatever they're named or nested:
+    an HDF5 file's datasets are searched recursively and matched by synonym (``x``,
+    ``x_coordinates``, ``u``, …; ``t``/``timestamp``/``timestamps``; ``polarity``/``pol``;
+    etc.), and a single compound/structured dataset with those fields is read too — so the
+    common ROS ``dvs_msgs`` layout (``events/{x_coordinates, y_coordinates, timestamps,
+    polarities}``) just works. A ``.csv``/``.txt`` file with a header row is mapped by its
+    column names (comma **or** whitespace separated). When detection can't identify the
+    columns it raises, listing what the file contains. Pass ``keys`` to name them explicitly:
+    ``keys={"x": …, "y": …, "t": …, "p": …}`` — for HDF5 each value is a dataset path (or
+    ``dataset/field`` to pick a compound field); for text a header name or 0-based column
+    index. ``keys`` overrides auto-detection (and ``order``).
     """
     return _rust.load(
         path,
@@ -47,6 +60,7 @@ def load(
         topic=topic,
         max_events=max_events,
         offset=offset,
+        keys=keys,
     )
 
 
@@ -99,6 +113,7 @@ def open(
     topic: str | None = None,
     hot_pixel_filter: bool = False,
     hot_pixel_std: float = 3.0,
+    keys: dict[str, str] | None = None,
 ) -> EventReader:
     """Open a file for lazy slicing without loading it whole.
 
@@ -130,6 +145,12 @@ def open(
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted (see
     :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
     ``sensor_size`` to skip the one-time coordinate scan resolution inference needs.
+
+    The x/y/t/p columns are **found automatically** whatever their names or nesting (HDF5
+    synonym/recursive/compound detection; text header rows), exactly as in :func:`load`.
+    Pass ``keys={"x": …, "y": …, "t": …, "p": …}`` to name them explicitly when a file's
+    layout can't be guessed (HDF5 dataset paths or ``dataset/field``; text header names or
+    0-based indices).
 
     Pass ``hot_pixel_filter=True`` to strip *stuck* pixels consistently across the whole
     recording. ``open`` scans the file once up front, flags every pixel whose event count exceeds
@@ -194,6 +215,7 @@ def open(
         topic=topic,
         hot_pixel_filter=hot_pixel_filter,
         hot_pixel_std=hot_pixel_std,
+        keys=keys,
     )
 
 

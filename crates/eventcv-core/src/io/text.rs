@@ -1,9 +1,12 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::str::{FromStr, SplitWhitespace};
+use std::str::FromStr;
 
-use super::{read_all, read_capped, EventSource, IoError, LoadOptions, RawEvent, SliceSource};
+use super::{
+    read_all, read_capped, role_of, EventKeys, EventSource, IoError, LoadOptions, RawEvent,
+    SliceSource, P, T, X, Y,
+};
 use crate::{EventStream, EventStreamBuilder};
 
 /// Writes a stream as whitespace-separated `t x y p` lines (the reader's default
@@ -110,22 +113,134 @@ pub enum ColumnOrder {
     Xytp,
 }
 
+/// The field index of each event column within a row (0-based). A [`ColumnOrder`] is the
+/// fixed-position case; a detected header or explicit `keys` produce arbitrary indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnMap {
+    pub t: usize,
+    pub x: usize,
+    pub y: usize,
+    pub p: usize,
+}
+
+impl ColumnMap {
+    /// The layout implied by a positional [`ColumnOrder`].
+    fn from_order(order: ColumnOrder) -> Self {
+        match order {
+            ColumnOrder::Txyp => Self {
+                t: 0,
+                x: 1,
+                y: 2,
+                p: 3,
+            },
+            ColumnOrder::Xytp => Self {
+                x: 0,
+                y: 1,
+                t: 2,
+                p: 3,
+            },
+        }
+    }
+}
+
+/// Splits a text line into fields on commas or whitespace, so both `.txt` (space/tab) and
+/// `.csv` (comma) parse. Empty fields (e.g. from doubled delimiters) are skipped.
+fn split_fields(line: &str) -> impl Iterator<Item = &str> {
+    line.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|field| !field.is_empty())
+}
+
+/// Whether a line is a column header rather than data — true when any field isn't a number.
+fn is_header_line(line: &str) -> bool {
+    split_fields(line).any(|field| field.parse::<f64>().is_err())
+}
+
+/// Builds a [`ColumnMap`] from a header line by matching each name to an x/y/t/p synonym;
+/// `None` if the header doesn't name all four.
+fn header_map(line: &str) -> Option<ColumnMap> {
+    let mut indices = [None; 4];
+    for (index, field) in split_fields(line).enumerate() {
+        if let Some(role) = role_of(field) {
+            indices[role].get_or_insert(index);
+        }
+    }
+    Some(ColumnMap {
+        x: indices[X]?,
+        y: indices[Y]?,
+        t: indices[T]?,
+        p: indices[P]?,
+    })
+}
+
+/// Builds a [`ColumnMap`] from explicit `keys`, each a 0-based column index or a header name.
+fn keys_map(keys: &EventKeys, header: Option<&str>) -> Result<ColumnMap, IoError> {
+    let resolve = |value: &str, field: &str| -> Result<usize, IoError> {
+        if let Ok(index) = value.parse::<usize>() {
+            return Ok(index);
+        }
+        if let Some(names) = header {
+            if let Some(index) =
+                split_fields(names).position(|name| name.eq_ignore_ascii_case(value))
+            {
+                return Ok(index);
+            }
+        }
+        Err(IoError::Format(format!(
+            "text key for '{field}' ({value:?}) is neither a column index nor a header name"
+        )))
+    };
+    Ok(ColumnMap {
+        x: resolve(&keys.x, "x")?,
+        y: resolve(&keys.y, "y")?,
+        t: resolve(&keys.t, "t")?,
+        p: resolve(&keys.p, "p")?,
+    })
+}
+
+/// Resolves the column layout and whether the first data-bearing line is a header to skip.
+/// `keys` win; otherwise a non-numeric first line is a header matched by synonym; otherwise
+/// the positional `order`. `first_line` is the first non-blank, non-`#` line (or `None`).
+fn resolve_column_map(
+    first_line: Option<&str>,
+    order: ColumnOrder,
+    keys: Option<&EventKeys>,
+) -> Result<(ColumnMap, bool), IoError> {
+    let has_header = first_line.is_some_and(is_header_line);
+    let header = has_header.then(|| first_line.unwrap());
+    let map = match keys {
+        Some(keys) => keys_map(keys, header)?,
+        None if has_header => header_map(header.unwrap()).ok_or_else(|| {
+            IoError::Format(format!(
+                "text header {:?} does not name all of x/y/t/p; pass order= or keys= to map the \
+                 columns",
+                header.unwrap()
+            ))
+        })?,
+        None => ColumnMap::from_order(order),
+    };
+    Ok((map, has_header))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TextOptions {
     pub width: usize,
     pub height: usize,
     pub time_unit: TimeUnit,
-    pub order: ColumnOrder,
+    /// Which field is x/y/t/p in each row.
+    pub map: ColumnMap,
+    /// Skip the first non-blank, non-`#` line (a column header) before parsing data.
+    pub has_header: bool,
 }
 
 impl TextOptions {
-    /// Defaults to seconds timestamps in `t x y p` order (the EV-IMO layout).
+    /// Defaults to seconds timestamps in `t x y p` order (the EV-IMO layout), no header.
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
             time_unit: TimeUnit::Seconds,
-            order: ColumnOrder::Txyp,
+            map: ColumnMap::from_order(ColumnOrder::Txyp),
+            has_header: false,
         }
     }
 }
@@ -139,6 +254,9 @@ pub struct TextReader<R> {
     options: TextOptions,
     buffer: String,
     line: usize,
+    /// Set until the first data line has been reached, at which point a leading header
+    /// (`options.has_header`) is skipped.
+    header_pending: bool,
 }
 
 impl<R: BufRead> TextReader<R> {
@@ -148,6 +266,7 @@ impl<R: BufRead> TextReader<R> {
         }
         Ok(Self {
             reader,
+            header_pending: options.has_header,
             options,
             buffer: String::new(),
             line: 0,
@@ -155,43 +274,22 @@ impl<R: BufRead> TextReader<R> {
     }
 
     fn parse_line(&self, line: &str) -> Result<RawEvent, IoError> {
-        let mut fields = line.split_whitespace();
-        let (t, x, y, p) = match self.options.order {
-            ColumnOrder::Txyp => {
-                let t = self.field(&mut fields, "t")?;
-                (
-                    t,
-                    self.field(&mut fields, "x")?,
-                    self.field(&mut fields, "y")?,
-                    self.field(&mut fields, "p")?,
-                )
-            }
-            ColumnOrder::Xytp => {
-                let x = self.field(&mut fields, "x")?;
-                let y = self.field(&mut fields, "y")?;
-                (
-                    self.field(&mut fields, "t")?,
-                    x,
-                    y,
-                    self.field(&mut fields, "p")?,
-                )
-            }
+        let fields: Vec<&str> = split_fields(line).collect();
+        let map = self.options.map;
+        let pick = |index: usize, name: &str| -> Result<&str, IoError> {
+            fields.get(index).copied().ok_or_else(|| IoError::Parse {
+                line: self.line,
+                message: format!("missing {name}"),
+            })
         };
         Ok(RawEvent {
-            x: self.parse(x, "x")?,
-            y: self.parse(y, "y")?,
+            x: self.parse(pick(map.x, "x")?, "x")?,
+            y: self.parse(pick(map.y, "y")?, "y")?,
             t: self
                 .options
                 .time_unit
-                .to_microseconds(self.parse::<f64>(t, "t")?),
-            p: self.parse::<i32>(p, "p")? > 0,
-        })
-    }
-
-    fn field<'a>(&self, fields: &mut SplitWhitespace<'a>, name: &str) -> Result<&'a str, IoError> {
-        fields.next().ok_or_else(|| IoError::Parse {
-            line: self.line,
-            message: format!("missing {name}"),
+                .to_microseconds(self.parse::<f64>(pick(map.t, "t")?, "t")?),
+            p: self.parse::<i32>(pick(map.p, "p")?, "p")? > 0,
         })
     }
 
@@ -222,6 +320,10 @@ impl<R: BufRead> EventSource for TextReader<R> {
             let trimmed = self.buffer.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
+            }
+            if self.header_pending {
+                self.header_pending = false;
+                continue; // the first data line is a column header — skip it
             }
             return self.parse_line(trimmed).map(Some);
         }
@@ -256,18 +358,37 @@ pub struct RawRow {
 /// left unset. A fully-specified load streams without buffering; inference reads the
 /// rows once into memory.
 pub fn load_text(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
+    let path = path.as_ref();
+    let first_line = peek_first_line(path)?;
+    let (map, has_header) =
+        resolve_column_map(first_line.as_deref(), options.order, options.keys.as_ref())?;
     if let (Some((width, height)), Some(time_unit)) = (options.sensor_size, options.time_unit) {
         let text_options = TextOptions {
             width,
             height,
             time_unit,
-            order: options.order,
+            map,
+            has_header,
         };
-        return read_capped(open(path.as_ref(), text_options)?, options.max_events);
+        return read_capped(open(path, text_options)?, options.max_events);
     }
 
-    let rows = read_raw_rows(path.as_ref(), options.order)?;
+    let rows = read_raw_rows(path, map, has_header)?;
     load_rows(&rows, options)
+}
+
+/// Reads the first non-blank, non-`#` line (trimmed), or `None` for an empty/comment-only file
+/// — enough to decide the column layout (header vs positional) before the full parse.
+fn peek_first_line(path: &Path) -> Result<Option<String>, IoError> {
+    let reader = BufReader::new(File::open(path)?);
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            return Ok(Some(trimmed.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// Builds an [`EventStream`] from already-parsed rows, inferring whichever of
@@ -322,24 +443,13 @@ fn infer_time_unit(rows: &[RawRow]) -> TimeUnit {
 
 /// Parses one non-blank line into a [`RawRow`] (no unit conversion or bounds check).
 /// Shared by the buffered [`load_text`] and the [`TextSliceSource`] index scan.
-fn parse_raw_row(trimmed: &str, order: ColumnOrder, number: usize) -> Result<RawRow, IoError> {
-    let mut fields = trimmed.split_whitespace();
-    let mut next = |name: &str| {
-        fields.next().ok_or(IoError::Parse {
+fn parse_raw_row(trimmed: &str, map: ColumnMap, number: usize) -> Result<RawRow, IoError> {
+    let fields: Vec<&str> = split_fields(trimmed).collect();
+    let pick = |index: usize, name: &str| -> Result<&str, IoError> {
+        fields.get(index).copied().ok_or(IoError::Parse {
             line: number,
             message: format!("missing {name}"),
         })
-    };
-    let (t, x, y, p) = match order {
-        ColumnOrder::Txyp => {
-            let t = next("t")?;
-            (t, next("x")?, next("y")?, next("p")?)
-        }
-        ColumnOrder::Xytp => {
-            let x = next("x")?;
-            let y = next("y")?;
-            (next("t")?, x, y, next("p")?)
-        }
     };
     let parse = |value: &str, field: &str| {
         value.parse::<f64>().map_err(|_| IoError::Parse {
@@ -348,23 +458,28 @@ fn parse_raw_row(trimmed: &str, order: ColumnOrder, number: usize) -> Result<Raw
         })
     };
     Ok(RawRow {
-        x: parse(x, "x")? as u16,
-        y: parse(y, "y")? as u16,
-        t: parse(t, "t")?,
-        p: parse(p, "p")? > 0.0,
+        x: parse(pick(map.x, "x")?, "x")? as u16,
+        y: parse(pick(map.y, "y")?, "y")? as u16,
+        t: parse(pick(map.t, "t")?, "t")?,
+        p: parse(pick(map.p, "p")?, "p")? > 0.0,
     })
 }
 
-fn read_raw_rows(path: &Path, order: ColumnOrder) -> Result<Vec<RawRow>, IoError> {
+fn read_raw_rows(path: &Path, map: ColumnMap, has_header: bool) -> Result<Vec<RawRow>, IoError> {
     let reader = BufReader::new(File::open(path)?);
     let mut rows = Vec::new();
+    let mut header_pending = has_header;
     for (index, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        rows.push(parse_raw_row(trimmed, order, index + 1)?);
+        if header_pending {
+            header_pending = false;
+            continue;
+        }
+        rows.push(parse_raw_row(trimmed, map, index + 1)?);
     }
     Ok(rows)
 }
@@ -386,7 +501,7 @@ struct TextIndexEntry {
 /// forward. Bounded memory; assumes events are time-ordered (errors otherwise).
 pub struct TextSliceSource {
     path: PathBuf,
-    order: ColumnOrder,
+    map: ColumnMap,
     time_unit: TimeUnit,
     sensor: (usize, usize),
     total: usize,
@@ -402,11 +517,17 @@ pub fn open_text_slice(
     options: &LoadOptions,
 ) -> Result<TextSliceSource, IoError> {
     let path = path.as_ref();
+    let (map, has_header) = resolve_column_map(
+        peek_first_line(path)?.as_deref(),
+        options.order,
+        options.keys.as_ref(),
+    )?;
     let mut reader = BufReader::new(File::open(path)?);
     let mut buffer = String::new();
     let mut offset = 0u64;
     let mut line_no = 0usize;
     let mut kept = 0usize;
+    let mut header_pending = has_header;
     let mut samples: Vec<(u64, usize, f64)> = Vec::new();
     let (mut max_x, mut max_y) = (0u16, 0u16);
     let (mut min_t, mut max_t) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -427,7 +548,11 @@ pub fn open_text_slice(
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let row = parse_raw_row(trimmed, options.order, line_no)?;
+        if header_pending {
+            header_pending = false;
+            continue; // the header line is not indexed and not counted
+        }
+        let row = parse_raw_row(trimmed, map, line_no)?;
         if let Some((width, height)) = options.sensor_size {
             if usize::from(row.x) >= width || usize::from(row.y) >= height {
                 continue; // matches the OOB drop a load with this size would do
@@ -484,7 +609,7 @@ pub fn open_text_slice(
     };
     Ok(TextSliceSource {
         path: path.to_path_buf(),
-        order: options.order,
+        map,
         time_unit,
         sensor,
         total: kept,
@@ -504,7 +629,8 @@ impl TextSliceSource {
                 width: self.sensor.0,
                 height: self.sensor.1,
                 time_unit: self.time_unit,
-                order: self.order,
+                map: self.map,
+                has_header: false, // seeks land on data lines; the header was skipped at open
             },
         )
     }
@@ -586,7 +712,9 @@ impl SliceSource for TextSliceSource {
 mod tests {
     use std::io::Cursor;
 
-    use super::{load_text, open_text_slice, ColumnOrder, TextOptions, TextReader, TimeUnit};
+    use super::{
+        load_text, open_text_slice, ColumnMap, ColumnOrder, TextOptions, TextReader, TimeUnit,
+    };
     use crate::io::{read_all, IoError, LoadOptions, SliceSource};
     use crate::EventStream;
 
@@ -611,7 +739,7 @@ mod tests {
     #[test]
     fn supports_xytp_order_and_negative_polarity() {
         let options = TextOptions {
-            order: ColumnOrder::Xytp,
+            map: ColumnMap::from_order(ColumnOrder::Xytp),
             ..TextOptions::new(8, 8)
         };
         let stream = read("1 2 0.5 -1\n", options).unwrap();
@@ -827,5 +955,84 @@ mod tests {
         assert_eq!(loaded.ps(), stream.ps());
         assert_eq!(loaded.sensor_size(), (16, 12));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_text_reads_csv_with_header_in_any_order() {
+        // A `.csv` with a header naming the columns out of the default order and commas.
+        let path = write_temp("txtcsvhdr", "x,y,t,p\n1,2,1000,1\n3,0,2000,0\n0,1,3000,1\n");
+        let options = LoadOptions {
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let stream = load_text(&path, &options).unwrap();
+
+        assert_eq!(stream.len(), 3); // header skipped, three data rows
+        assert_eq!(stream.xs(), &[1, 3, 0]);
+        assert_eq!(stream.ys(), &[2, 0, 1]);
+        assert_eq!(stream.ts(), &[1000, 2000, 3000]);
+        assert_eq!(stream.ps(), &[true, false, true]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn load_text_matches_synonym_header_names() {
+        // Whitespace-separated with synonym header names (timestamp/polarity), reordered.
+        let path = write_temp(
+            "txtsynhdr",
+            "timestamp x y polarity\n1000 1 2 1\n2000 3 0 0\n",
+        );
+        let options = LoadOptions {
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let stream = load_text(&path, &options).unwrap();
+        assert_eq!(stream.xs(), &[1, 3]);
+        assert_eq!(stream.ts(), &[1000, 2000]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn text_keys_override_selects_columns_by_index() {
+        // No header; a non-default column order named explicitly by 0-based index.
+        let path = write_temp("txtkeys", "1 2 1000 1\n3 0 2000 0\n"); // x y t p
+        let options = LoadOptions {
+            time_unit: Some(TimeUnit::Microseconds),
+            keys: Some(crate::io::EventKeys {
+                x: "0".to_owned(),
+                y: "1".to_owned(),
+                t: "2".to_owned(),
+                p: "3".to_owned(),
+            }),
+            ..LoadOptions::default()
+        };
+        let stream = load_text(&path, &options).unwrap();
+        assert_eq!(stream.xs(), &[1, 3]);
+        assert_eq!(stream.ys(), &[2, 0]);
+        assert_eq!(stream.ts(), &[1000, 2000]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn text_slice_over_headed_csv_matches_load() {
+        let mut data = String::from("t,x,y,p\n");
+        for i in 0..10 {
+            data.push_str(&format!("{},{},{},{}\n", i * 1000, i, i % 5, i % 2));
+        }
+        let path = write_temp("txtslicehdr", &data);
+        let options = LoadOptions {
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let source = open_text_slice(&path, &options).unwrap();
+        let full = load_text(&path, &options).unwrap();
+
+        assert_eq!(source.n_events(), full.len()); // header excluded from the count
+        assert_eq!(source.time_span(), (0, 9000));
+        assert_eq!(
+            source.slice_time(2000, 5000).unwrap().ts(),
+            &[2000, 3000, 4000]
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

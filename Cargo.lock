@@ -588,6 +588,7 @@ name = "eventcv-core"
 version = "1.0.1"
 dependencies = [
  "hdf5-metno",
+ "hdf5-metno-sys",
  "ndarray",
  "npyz",
  "png",
