@@ -1,5 +1,6 @@
 mod viewer;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use eventcv_core::{
@@ -8,8 +9,8 @@ use eventcv_core::{
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
-        load_rows, open as open_reader, ColumnOrder, IoError, LoadOptions, RawRow, Reader,
-        SaveOptions, TimeUnit,
+        load_rows, open as open_reader, ColumnOrder, EventKeys, IoError, LoadOptions, RawRow,
+        Reader, SaveOptions, TimeUnit,
     },
     representation::{
         AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, EventPointSet, Mcts,
@@ -635,6 +636,31 @@ fn parse_order(order: &str) -> PyResult<ColumnOrder> {
     })
 }
 
+/// Turns a `keys={"x": …, "y": …, "t": …, "p": …}` mapping into [`EventKeys`], requiring all
+/// four fields. Values are format-specific column names (HDF5 dataset paths / `dataset/field`;
+/// text header names or indices) — see `eventcv.load`.
+fn parse_keys(keys: Option<HashMap<String, String>>) -> PyResult<Option<EventKeys>> {
+    let Some(mut keys) = keys else {
+        return Ok(None);
+    };
+    let mut take = |field: &str| -> PyResult<String> {
+        keys.remove(field)
+            .ok_or_else(|| PyValueError::new_err(format!("keys is missing '{field}'")))
+    };
+    let parsed = EventKeys {
+        x: take("x")?,
+        y: take("y")?,
+        t: take("t")?,
+        p: take("p")?,
+    };
+    if let Some(extra) = keys.keys().next() {
+        return Err(PyValueError::new_err(format!(
+            "keys has an unexpected entry '{extra}' (only x/y/t/p are used)"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
 fn ms_to_us(ms: f64) -> i64 {
     (ms * 1000.0).round() as i64
 }
@@ -655,7 +681,7 @@ fn parse_offset(offset_ms: Option<f64>) -> PyResult<Option<i64>> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None))]
+#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None, keys=None))]
 #[allow(clippy::too_many_arguments)]
 fn load(
     py: Python<'_>,
@@ -666,6 +692,7 @@ fn load(
     topic: Option<String>,
     max_events: Option<i64>,
     offset: Option<f64>,
+    keys: Option<HashMap<String, String>>,
 ) -> PyResult<PyEventStream> {
     let max_events = max_events
         .map(|count| {
@@ -680,6 +707,7 @@ fn load(
         topic,
         max_events,
         offset: parse_offset(offset)?,
+        keys: parse_keys(keys)?,
     };
     py.detach(|| eventcv_core::io::load(path, options))
         .map(|inner| PyEventStream { inner, repr: None })
@@ -706,6 +734,7 @@ fn from_numpy(
         topic: None,
         max_events: None,
         offset: None,
+        keys: None,
     };
     let rows = numpy_rows(events, options.order)?;
     py.detach(|| load_rows(&rows, &options))
@@ -772,7 +801,7 @@ fn parse_dt_ms(dt_ms: Option<f64>) -> PyResult<Option<i64>> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0))]
+#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -787,6 +816,7 @@ fn open(
     topic: Option<String>,
     hot_pixel_filter: bool,
     hot_pixel_std: f64,
+    keys: Option<HashMap<String, String>>,
 ) -> PyResult<PyEventReader> {
     let mode = match (parse_dt_ms(dt_ms)?, max_events) {
         (Some(_), Some(_)) => {
@@ -814,6 +844,7 @@ fn open(
         topic,
         max_events: None,
         offset: None,
+        keys: parse_keys(keys)?,
     };
     let reader = py
         .detach(|| open_reader(path, options))
@@ -972,9 +1003,15 @@ fn render_slice(
                 .into_any()
                 .unbind())
         }
-        None => Ok(Bound::new(py, PyEventStream { inner: stream, repr: None })?
-            .into_any()
-            .unbind()),
+        None => Ok(Bound::new(
+            py,
+            PyEventStream {
+                inner: stream,
+                repr: None,
+            },
+        )?
+        .into_any()
+        .unbind()),
     }
 }
 
@@ -1258,19 +1295,29 @@ impl PyEventReader {
     /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
     /// applying the per-slice op (e.g. `efast`) if one is set.
     fn fetch(&self, py: Python<'_>, window: SliceWindow) -> PyResult<PyEventStream> {
-        fetch_window(py, &self.inner, window, self.slice_op, self.hot_pixel_mask.clone()).map(
-            |inner| PyEventStream {
-                inner,
-                repr: self.repr,
-            },
+        fetch_window(
+            py,
+            &self.inner,
+            window,
+            self.slice_op,
+            self.hot_pixel_mask.clone(),
         )
+        .map(|inner| PyEventStream {
+            inner,
+            repr: self.repr,
+        })
     }
 
     /// Reads `window` and wraps it for a public slice API: rendered to the reader's
     /// `EventFrame` when a representation is set, else the raw `EventStream`.
     fn fetch_slice(&self, py: Python<'_>, window: SliceWindow) -> PyResult<Py<PyAny>> {
-        let stream =
-            fetch_window(py, &self.inner, window, self.slice_op, self.hot_pixel_mask.clone())?;
+        let stream = fetch_window(
+            py,
+            &self.inner,
+            window,
+            self.slice_op,
+            self.hot_pixel_mask.clone(),
+        )?;
         render_slice(py, self.repr, stream)
     }
 

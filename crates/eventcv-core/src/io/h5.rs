@@ -3,11 +3,19 @@ use std::path::Path;
 
 use std::str::FromStr;
 
-use hdf5::types::{IntSize, TypeDescriptor, VarLenUnicode};
+use hdf5::datatype::{ByteOrder, Datatype};
+use hdf5::types::{CompoundType, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
 use hdf5::{Dataset, File, Group, H5Type};
+use hdf5_sys::h5::hsize_t;
+use hdf5_sys::h5d::H5Dread;
+use hdf5_sys::h5p::H5P_DEFAULT;
+use hdf5_sys::h5s::H5S_seloper_t::H5S_SELECT_SET;
+use hdf5_sys::h5s::{H5Sclose, H5Screate_simple, H5Sselect_hyperslab};
 use ndarray::Array1;
 
-use super::{IoError, LoadOptions, SliceSource, TimeUnit};
+use super::{
+    role_of, role_rank, EventKeys, IoError, LoadOptions, SliceSource, TimeUnit, P, T, X, Y,
+};
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
 use crate::{EventStream, EventStreamBuilder};
 
@@ -19,19 +27,19 @@ const BLOCK: usize = 1_000_000;
 /// `events/` group, then at the root). `sensor_size` and `time_unit` are inferred when
 /// left `None` — the unit from the timestamp span, the size from the coordinate range.
 pub fn read_hdf5(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
-    let opened = open_validated(path.as_ref())?;
+    let opened = open_validated(path.as_ref(), options.keys.as_ref())?;
     let ((width, height), time_unit) = resolve_params(&opened, options)?;
     let target = options
         .max_events
         .map_or(opened.total, |max| max.min(opened.total));
-    read_range(&opened.datasets, 0..target, width, height, time_unit)
+    read_range(&opened.columns, 0..target, width, height, time_unit)
 }
 
-/// The open file, its `x`/`y`/`t`/`p` datasets, and the event count — the shared
-/// result of opening an HDF5 file. The `file` must outlive use of the datasets.
+/// The open file, its resolved x/y/t/p [`EventColumns`], and the event count — the shared
+/// result of opening an HDF5 file. The `file` must outlive use of the columns.
 struct OpenedFile {
     file: File,
-    datasets: [Dataset; 4],
+    columns: EventColumns,
     total: usize,
 }
 
@@ -44,9 +52,9 @@ struct OpenedFile {
 const CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const CHUNK_CACHE_SLOTS: usize = 8009;
 
-/// Opens the file, locates the `x`/`y`/`t`/`p` datasets, and checks their lengths
-/// agree. Shared by the eager [`read_hdf5`] and the lazy [`Hdf5SliceSource`].
-fn open_validated(path: &Path) -> Result<OpenedFile, IoError> {
+/// Opens the file and resolves its x/y/t/p [`EventColumns`] — auto-detected, or named
+/// explicitly via `keys`. Shared by the eager [`read_hdf5`] and the lazy [`Hdf5SliceSource`].
+fn open_validated(path: &Path, keys: Option<&EventKeys>) -> Result<OpenedFile, IoError> {
     if !path.exists() {
         return Err(IoError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -58,22 +66,11 @@ fn open_validated(path: &Path) -> Result<OpenedFile, IoError> {
         .with_fapl(|fapl| fapl.chunk_cache(CHUNK_CACHE_SLOTS, CHUNK_CACHE_BYTES, 0.75))
         .open(path)
         .map_err(map_hdf5_error)?;
-    let datasets = open_event_datasets(&file)?;
-    let total = datasets[0].shape().first().copied().unwrap_or(0);
-    for (axis, dataset) in [
-        ("y", &datasets[1]),
-        ("t", &datasets[2]),
-        ("p", &datasets[3]),
-    ] {
-        if dataset.shape().first().copied().unwrap_or(0) != total {
-            return Err(IoError::Format(format!(
-                "event column '{axis}' length does not match 'x'"
-            )));
-        }
-    }
+    let columns = resolve_columns(&file, keys)?;
+    let total = columns.len();
     Ok(OpenedFile {
         file,
-        datasets,
+        columns,
         total,
     })
 }
@@ -96,8 +93,10 @@ fn resolve_params(
             Some(unit) => unit,
             None if opened.total == 0 => TimeUnit::Microseconds,
             None => {
-                let first = read_integers(&opened.datasets[2], 0..1)?[0];
-                let last = read_integers(&opened.datasets[2], opened.total - 1..opened.total)?[0];
+                let first = opened.columns.read_ints(T, 0..1)?[0];
+                let last = opened
+                    .columns
+                    .read_ints(T, opened.total - 1..opened.total)?[0];
                 TimeUnit::infer_from_span(last - first)
             }
         },
@@ -110,7 +109,7 @@ fn resolve_params(
             read_scalar_attr::<u64>(&opened.file, "height")?,
         ) {
             (Some(width), Some(height)) => (width as usize, height as usize),
-            _ => infer_sensor_size(&opened.datasets, opened.total)?,
+            _ => infer_sensor_size(&opened.columns, opened.total)?,
         },
     };
     Ok((sensor, time_unit))
@@ -121,15 +120,18 @@ fn resolve_params(
 /// every row/column within the first/last second, so head+tail matches the true
 /// resolution in practice; for files up to `2 * BLOCK` events it covers everything
 /// exactly. Pass `sensor_size` if a border pixel is silent at both ends of the recording.
-fn infer_sensor_size(datasets: &[Dataset; 4], total: usize) -> Result<(usize, usize), IoError> {
+fn infer_sensor_size(columns: &EventColumns, total: usize) -> Result<(usize, usize), IoError> {
     if total == 0 {
         return Ok((1, 1));
     }
-    let [x, y, ..] = datasets;
     let head = 0..BLOCK.min(total);
     let tail = total.saturating_sub(BLOCK)..total;
-    let max_x = column_max(x, head.clone())?.max(column_max(x, tail.clone())?);
-    let max_y = column_max(y, head)?.max(column_max(y, tail)?);
+    let max_x = columns
+        .column_max(X, head.clone())?
+        .max(columns.column_max(X, tail.clone())?);
+    let max_y = columns
+        .column_max(Y, head)?
+        .max(columns.column_max(Y, tail)?);
     Ok((max_x + 1, max_y + 1))
 }
 
@@ -165,21 +167,20 @@ fn column_max(dataset: &Dataset, range: Range<usize>) -> Result<usize, IoError> 
 /// microseconds and dropping out-of-bounds events. The single read path for both a
 /// whole-file load (`0..total`) and a slice (`[i0, i1)`); blocks bound peak memory.
 fn read_range(
-    datasets: &[Dataset; 4],
+    columns: &EventColumns,
     range: Range<usize>,
     width: usize,
     height: usize,
     time_unit: TimeUnit,
 ) -> Result<EventStream, IoError> {
-    let [x, y, t, p] = datasets;
     let mut builder = EventStreamBuilder::with_capacity(width, height, 0.001, range.len());
     let mut start = range.start;
     while start < range.end {
         let end = (start + BLOCK).min(range.end);
-        let xs = read_integers(x, start..end)?;
-        let ys = read_integers(y, start..end)?;
-        let ts = read_integers(t, start..end)?;
-        let ps = read_polarities(p, start..end)?;
+        let xs = columns.read_ints(X, start..end)?;
+        let ys = columns.read_ints(Y, start..end)?;
+        let ts = columns.read_ints(T, start..end)?;
+        let ps = columns.read_polarity(start..end)?;
         for index in 0..(end - start) {
             builder.push(
                 xs[index] as u16,
@@ -200,7 +201,7 @@ fn read_range(
 pub struct Hdf5SliceSource {
     // The open file keeps the dataset handles valid; it is not read from directly.
     _file: File,
-    datasets: [Dataset; 4],
+    columns: EventColumns,
     width: usize,
     height: usize,
     time_unit: TimeUnit,
@@ -215,14 +216,16 @@ pub fn open_hdf5_slice(
     path: impl AsRef<Path>,
     options: &LoadOptions,
 ) -> Result<Hdf5SliceSource, IoError> {
-    let opened = open_validated(path.as_ref())?;
-    assert_sorted(&opened.datasets[2], opened.total)?;
+    let opened = open_validated(path.as_ref(), options.keys.as_ref())?;
+    assert_sorted(&opened.columns, opened.total)?;
     let ((width, height), time_unit) = resolve_params(&opened, options)?;
     let span = if opened.total == 0 {
         (0, 0)
     } else {
-        let first = read_integers(&opened.datasets[2], 0..1)?[0];
-        let last = read_integers(&opened.datasets[2], opened.total - 1..opened.total)?[0];
+        let first = opened.columns.read_ints(T, 0..1)?[0];
+        let last = opened
+            .columns
+            .read_ints(T, opened.total - 1..opened.total)?[0];
         (
             time_unit.microseconds_from_int(first),
             time_unit.microseconds_from_int(last),
@@ -230,12 +233,12 @@ pub fn open_hdf5_slice(
     };
     let OpenedFile {
         file,
-        datasets,
+        columns,
         total,
     } = opened;
     Ok(Hdf5SliceSource {
         _file: file,
-        datasets,
+        columns,
         width,
         height,
         time_unit,
@@ -258,7 +261,6 @@ impl Hdf5SliceSource {
     /// ~log2(total). The `hi - 1` clamp guarantees the range shrinks every step, so uneven
     /// event density degrades gracefully rather than looping.
     fn lower_bound_time(&self, target_us: i64) -> Result<usize, IoError> {
-        let t = &self.datasets[2];
         if self.total == 0 || target_us <= self.span.0 {
             return Ok(0);
         }
@@ -273,7 +275,7 @@ impl Hdf5SliceSource {
             let mid = (lo + (frac.clamp(0.0, 1.0) * (hi - lo) as f64) as usize).clamp(lo, hi - 1);
             let mid_t = self
                 .time_unit
-                .microseconds_from_int(read_integers(t, mid..mid + 1)?[0]);
+                .microseconds_from_int(self.columns.read_ints(T, mid..mid + 1)?[0]);
             if mid_t < target_us {
                 (lo, lo_t) = (mid + 1, mid_t);
             } else {
@@ -287,15 +289,14 @@ impl Hdf5SliceSource {
     /// window end is discovered while reading the events we return, so `slice_time` needs
     /// only one binary search (for the start) instead of two.
     fn read_window(&self, start: usize, t1_us: i64) -> Result<EventStream, IoError> {
-        let [x, y, t, p] = &self.datasets;
         let mut builder = EventStreamBuilder::with_capacity(self.width, self.height, 0.001, 0);
         let mut s = start;
         'scan: while s < self.total {
             let end = (s + SCAN_BLOCK).min(self.total);
-            let xs = read_integers(x, s..end)?;
-            let ys = read_integers(y, s..end)?;
-            let ts = read_integers(t, s..end)?;
-            let ps = read_polarities(p, s..end)?;
+            let xs = self.columns.read_ints(X, s..end)?;
+            let ys = self.columns.read_ints(Y, s..end)?;
+            let ts = self.columns.read_ints(T, s..end)?;
+            let ps = self.columns.read_polarity(s..end)?;
             for index in 0..(end - s) {
                 let t_us = self.time_unit.microseconds_from_int(ts[index]);
                 if t_us >= t1_us {
@@ -330,7 +331,7 @@ impl SliceSource for Hdf5SliceSource {
         let i0 = i0.min(self.total);
         let i1 = i1.clamp(i0, self.total);
         read_range(
-            &self.datasets,
+            &self.columns,
             i0..i1,
             self.width,
             self.height,
@@ -350,13 +351,18 @@ impl SliceSource for Hdf5SliceSource {
     /// stuck pixels fire throughout the recording, so they dominate any representative sample while
     /// the threshold (`mean + n·std`) stays ~scale-invariant. This keeps a multi-GB scan bounded.
     fn pixel_counts(&self) -> Result<Vec<u64>, IoError> {
-        let [x, y, ..] = &self.datasets;
         let mut counts = vec![0u64; self.width * self.height];
         if self.total <= SCAN_BUDGET {
             let mut start = 0;
             while start < self.total {
                 let end = (start + BLOCK).min(self.total);
-                add_xy_counts(x, y, start..end, self.width, self.height, &mut counts)?;
+                add_xy_counts(
+                    &self.columns,
+                    start..end,
+                    self.width,
+                    self.height,
+                    &mut counts,
+                )?;
                 start = end;
             }
         } else {
@@ -366,7 +372,13 @@ impl SliceSource for Hdf5SliceSource {
             for i in 0..segments {
                 let start = i * stride;
                 let end = (start + SCAN_SEGMENT).min(self.total);
-                add_xy_counts(x, y, start..end, self.width, self.height, &mut counts)?;
+                add_xy_counts(
+                    &self.columns,
+                    start..end,
+                    self.width,
+                    self.height,
+                    &mut counts,
+                )?;
             }
         }
         Ok(counts)
@@ -386,15 +398,14 @@ const SCAN_SEGMENT: usize = 100_000;
 /// Adds the `x`/`y` columns over `range` into `counts`, dropping out-of-bounds events (matching
 /// [`read_range`]). Reads coordinates in their native small-int type — no widening to `i64`.
 fn add_xy_counts(
-    x: &Dataset,
-    y: &Dataset,
+    columns: &EventColumns,
     range: Range<usize>,
     width: usize,
     height: usize,
     counts: &mut [u64],
 ) -> Result<(), IoError> {
-    let xs = read_coords(x, range.clone())?;
-    let ys = read_coords(y, range)?;
+    let xs = columns.read_coords(X, range.clone())?;
+    let ys = columns.read_coords(Y, range)?;
     for (&xi, &yi) in xs.iter().zip(&ys) {
         if xi < width && yi < height {
             counts[yi * width + xi] += 1;
@@ -433,7 +444,7 @@ fn read_coords(dataset: &Dataset, range: Range<usize>) -> Result<Vec<usize>, IoE
 
 /// Cheaply confirms the timestamp column is non-decreasing by sampling, so in-place
 /// time slicing (which assumes a sorted `t`) cannot silently return wrong events.
-fn assert_sorted(t: &Dataset, total: usize) -> Result<(), IoError> {
+fn assert_sorted(columns: &EventColumns, total: usize) -> Result<(), IoError> {
     if total < 2 {
         return Ok(());
     }
@@ -442,7 +453,7 @@ fn assert_sorted(t: &Dataset, total: usize) -> Result<(), IoError> {
     let mut previous = i64::MIN;
     let mut index = 0;
     while index < total {
-        let value = read_integers(t, index..index + 1)?[0];
+        let value = columns.read_ints(T, index..index + 1)?[0];
         if value < previous {
             return Err(IoError::Format(
                 "HDF5 't' is not sorted; in-place time slicing requires a time-ordered \
@@ -456,21 +467,466 @@ fn assert_sorted(t: &Dataset, total: usize) -> Result<(), IoError> {
     Ok(())
 }
 
-fn open_event_datasets(file: &File) -> Result<[Dataset; 4], IoError> {
-    for prefix in ["events/", ""] {
-        let names = ["x", "y", "t", "p"].map(|axis| format!("{prefix}{axis}"));
-        if let (Ok(x), Ok(y), Ok(t), Ok(p)) = (
-            file.dataset(&names[0]),
-            file.dataset(&names[1]),
-            file.dataset(&names[2]),
-            file.dataset(&names[3]),
-        ) {
-            return Ok([x, y, t, p]);
+/// The four event columns, however the file stores them: as four separate 1-D datasets
+/// (the common layout) or as fields of one compound dataset. Presents a uniform
+/// read/inference interface so the rest of the reader is agnostic to the on-disk shape.
+enum EventColumns {
+    /// `[x, y, t, p]` as four separate datasets.
+    Separate([Dataset; 4]),
+    /// One compound dataset whose `[x, y, t, p]` fields are read by hyperslab.
+    Compound(CompoundColumns),
+}
+
+impl EventColumns {
+    /// Number of events (the first dimension shared by all four columns).
+    fn len(&self) -> usize {
+        match self {
+            Self::Separate(datasets) => datasets[X].shape().first().copied().unwrap_or(0),
+            Self::Compound(compound) => compound.total,
         }
     }
-    Err(IoError::Format(
-        "could not find event datasets x/y/t/p (looked under 'events/' and the root)".to_owned(),
-    ))
+
+    /// Reads column `col` (`X`/`Y`/`T`/`P`) over `range` as `i64` — the shared path for
+    /// timestamps and coordinates.
+    fn read_ints(&self, col: usize, range: Range<usize>) -> Result<Vec<i64>, IoError> {
+        match self {
+            Self::Separate(datasets) => read_integers(&datasets[col], range),
+            Self::Compound(compound) => compound.read_ints(col, range),
+        }
+    }
+
+    /// Reads coordinate column `col` (`X`/`Y`) over `range` as `usize`, negatives mapped to
+    /// `usize::MAX` so they drop out of bounds (matching the separate-dataset reader).
+    fn read_coords(&self, col: usize, range: Range<usize>) -> Result<Vec<usize>, IoError> {
+        match self {
+            Self::Separate(datasets) => read_coords(&datasets[col], range),
+            Self::Compound(compound) => Ok(compound
+                .read_ints(col, range)?
+                .into_iter()
+                .map(|v| if v < 0 { usize::MAX } else { v as usize })
+                .collect()),
+        }
+    }
+
+    /// Reads the polarity column over `range` as `bool` (non-zero is positive).
+    fn read_polarity(&self, range: Range<usize>) -> Result<Vec<bool>, IoError> {
+        match self {
+            Self::Separate(datasets) => read_polarities(&datasets[P], range),
+            Self::Compound(compound) => Ok(compound
+                .read_ints(P, range)?
+                .into_iter()
+                .map(|v| v != 0)
+                .collect()),
+        }
+    }
+
+    /// Largest value in `range` of coordinate column `col`, negatives clamped to 0.
+    fn column_max(&self, col: usize, range: Range<usize>) -> Result<usize, IoError> {
+        match self {
+            Self::Separate(datasets) => column_max(&datasets[col], range),
+            Self::Compound(compound) => Ok(compound
+                .read_ints(col, range)?
+                .into_iter()
+                .map(|v| v.max(0) as usize)
+                .max()
+                .unwrap_or(0)),
+        }
+    }
+}
+
+/// Locates the x/y/t/p columns. With `keys` the caller names them explicitly; otherwise
+/// they are auto-detected across arbitrary dataset names (synonyms) and nesting, and a
+/// single compound dataset is recognised too. Replaces the old fixed `x`/`y`/`t`/`p` lookup.
+fn resolve_columns(file: &File, keys: Option<&EventKeys>) -> Result<EventColumns, IoError> {
+    if let Some(keys) = keys {
+        return resolve_named_columns(file, keys);
+    }
+    let mut datasets = Vec::new();
+    collect_datasets(file, &mut datasets)?;
+
+    // Prefer four separate arrays (the common, FFI-free path); fall back to a compound dataset.
+    if let Some(columns) = detect_separate(&datasets)? {
+        return Ok(columns);
+    }
+    if let Some(columns) = detect_compound(&datasets)? {
+        return Ok(columns);
+    }
+    Err(IoError::Format(unresolved_message(&datasets)))
+}
+
+/// Recursively collects every dataset in the file (depth-first from the root group).
+fn collect_datasets(group: &Group, out: &mut Vec<Dataset>) -> Result<(), IoError> {
+    for dataset in group.datasets().map_err(map_hdf5_error)? {
+        out.push(dataset);
+    }
+    for subgroup in group.groups().map_err(map_hdf5_error)? {
+        collect_datasets(&subgroup, out)?;
+    }
+    Ok(())
+}
+
+/// The base name (final path component) and parent path of a dataset, e.g.
+/// `/events/x_coordinates` → (`x_coordinates`, `/events`).
+fn split_path(name: &str) -> (&str, &str) {
+    match name.rsplit_once('/') {
+        Some((parent, base)) => (base, parent),
+        None => (name, ""),
+    }
+}
+
+/// Finds four separate 1-D datasets whose names match the x/y/t/p synonyms and that share a
+/// parent group and length. Among qualifying groups the one with the most events wins (so a
+/// full stream beats a decimated preview); ties break toward the shallower, then earlier path.
+fn detect_separate(datasets: &[Dataset]) -> Result<Option<EventColumns>, IoError> {
+    use std::collections::HashMap;
+    // parent path -> [best (rank, dataset index) per role]
+    let mut groups: HashMap<String, [Option<(usize, usize)>; 4]> = HashMap::new();
+    for (index, dataset) in datasets.iter().enumerate() {
+        // Skip compound datasets and anything not 1-D here — they are not separate columns.
+        if dataset.shape().len() != 1 || is_compound(dataset) {
+            continue;
+        }
+        let name = dataset.name();
+        let (base, parent) = split_path(&name);
+        if let Some(role) = role_of(base) {
+            let rank = role_rank(role, base).unwrap_or(usize::MAX);
+            let slot = &mut groups.entry(parent.to_owned()).or_default()[role];
+            if slot.is_none_or(|(best, _)| rank < best) {
+                *slot = Some((rank, index));
+            }
+        }
+    }
+
+    let mut best: Option<(usize, usize, [usize; 4])> = None; // (len, shallowness, indices)
+    for (parent, roles) in &groups {
+        let Some(indices) = all_roles(roles) else {
+            continue;
+        };
+        let len = datasets[indices[0]].shape().first().copied().unwrap_or(0);
+        if indices[1..]
+            .iter()
+            .any(|&i| datasets[i].shape().first().copied().unwrap_or(0) != len)
+        {
+            continue; // columns of a group must agree in length to be one event stream
+        }
+        let shallowness = usize::MAX - parent.matches('/').count();
+        if best
+            .is_none_or(|(best_len, best_shallow, _)| (len, shallowness) > (best_len, best_shallow))
+        {
+            best = Some((len, shallowness, indices));
+        }
+    }
+
+    Ok(best.map(|(_, _, indices)| EventColumns::Separate(indices.map(|i| datasets[i].clone()))))
+}
+
+/// Returns the four dataset indices if every role slot is filled, else `None`.
+fn all_roles(roles: &[Option<(usize, usize)>; 4]) -> Option<[usize; 4]> {
+    Some([roles[X]?.1, roles[Y]?.1, roles[T]?.1, roles[P]?.1])
+}
+
+/// Finds a compound dataset whose member names cover x/y/t/p and reads its fields by
+/// hyperslab (see [`CompoundColumns`]).
+fn detect_compound(datasets: &[Dataset]) -> Result<Option<EventColumns>, IoError> {
+    for dataset in datasets {
+        if let Some(columns) = CompoundColumns::try_new(dataset)? {
+            return Ok(Some(EventColumns::Compound(columns)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a dataset stores a compound (structured) type.
+fn is_compound(dataset: &Dataset) -> bool {
+    matches!(
+        dataset.dtype().and_then(|dtype| dtype.to_descriptor()),
+        Ok(TypeDescriptor::Compound(_))
+    )
+}
+
+/// The "couldn't identify the columns" error, listing what the file actually contains so the
+/// user can see what to rename or name via `keys`.
+fn unresolved_message(datasets: &[Dataset]) -> String {
+    let mut listing = String::new();
+    for dataset in datasets {
+        let dtype = dataset
+            .dtype()
+            .and_then(|dtype| dtype.to_descriptor())
+            .map(|descriptor| format!("{descriptor:?}"))
+            .unwrap_or_else(|_| "?".to_owned());
+        listing.push_str(&format!(
+            "\n  {} ({dtype}, shape {:?})",
+            dataset.name(),
+            dataset.shape()
+        ));
+    }
+    if listing.is_empty() {
+        listing.push_str(" (none)");
+    }
+    format!(
+        "could not identify the x/y/t/p event columns. Datasets present:{listing}\nPass \
+         keys={{\"x\": …, \"y\": …, \"t\": …, \"p\": …}} to name them explicitly (an HDF5 value \
+         is a dataset path, or `dataset/field` for a compound dataset)."
+    )
+}
+
+/// Resolves user-named columns: either four separate dataset paths, or four fields of one
+/// compound dataset (`dataset/field`). Mixing the two is rejected.
+fn resolve_named_columns(file: &File, keys: &EventKeys) -> Result<EventColumns, IoError> {
+    let paths = [&keys.x, &keys.y, &keys.t, &keys.p];
+    // Try four separate datasets first.
+    let separate: Vec<Option<Dataset>> = paths.iter().map(|path| file.dataset(path).ok()).collect();
+    if separate.iter().all(Option::is_some) {
+        let datasets = [
+            separate[X].clone().unwrap(),
+            separate[Y].clone().unwrap(),
+            separate[T].clone().unwrap(),
+            separate[P].clone().unwrap(),
+        ];
+        return Ok(EventColumns::Separate(datasets));
+    }
+
+    // Otherwise interpret each as `dataset/field` into a single compound dataset.
+    let mut fields = [""; 4];
+    let mut dataset_path = None;
+    for (role, path) in paths.iter().enumerate() {
+        let (field, parent) = split_path(path);
+        fields[role] = field;
+        match dataset_path {
+            None => dataset_path = Some(parent.to_owned()),
+            Some(ref existing) if existing == parent => {}
+            Some(_) => {
+                return Err(IoError::Format(
+                    "keys must be four separate dataset paths or four fields of the same \
+                     compound dataset"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+    let dataset_path = dataset_path.unwrap_or_default();
+    let dataset = file
+        .dataset(&dataset_path)
+        .map_err(|_| IoError::Format(format!("no dataset '{dataset_path}' for the named keys")))?;
+    let named = fields.map(str::to_owned);
+    CompoundColumns::with_fields(&dataset, &named)?
+        .map(EventColumns::Compound)
+        .ok_or_else(|| {
+            IoError::Format(format!(
+                "compound dataset '{dataset_path}' has no fields {named:?}"
+            ))
+        })
+}
+
+/// One field of a compound event dataset: where it sits in each packed record and how to
+/// decode it.
+#[derive(Clone)]
+struct FieldDecode {
+    offset: usize,
+    descriptor: TypeDescriptor,
+}
+
+/// Reads x/y/t/p from a single compound (structured) dataset. hdf5-metno's safe API can't
+/// decode an arbitrary compound generically, so a slice reads the packed records for its range
+/// with a raw `H5Dread` (memory type = the file datatype, so no conversion — records land in the
+/// file's byte order at the offsets [`to_descriptor`](Datatype::to_descriptor) reports) and
+/// decodes each field in place.
+struct CompoundColumns {
+    dataset: Dataset,
+    // Held so its id stays valid as the `H5Dread` memory datatype for the lifetime of the reads.
+    dtype: Datatype,
+    record_size: usize,
+    order: ByteOrder,
+    fields: [FieldDecode; 4],
+    total: usize,
+}
+
+impl CompoundColumns {
+    /// Auto-detects x/y/t/p among a compound dataset's member names (synonym match); `Ok(None)`
+    /// if the dataset isn't compound or doesn't carry all four.
+    fn try_new(dataset: &Dataset) -> Result<Option<Self>, IoError> {
+        let Some(compound) = compound_of(dataset) else {
+            return Ok(None);
+        };
+        let mut chosen: [Option<(usize, FieldDecode)>; 4] = [None, None, None, None];
+        for field in &compound.fields {
+            if let Some(role) = role_of(&field.name) {
+                let rank = role_rank(role, &field.name).unwrap_or(usize::MAX);
+                if chosen[role].as_ref().is_none_or(|(best, _)| rank < *best) {
+                    chosen[role] = Some((
+                        rank,
+                        FieldDecode {
+                            offset: field.offset,
+                            descriptor: field.ty.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        Self::from_chosen(dataset, chosen)
+    }
+
+    /// Resolves explicitly named compound fields (the `keys` path).
+    fn with_fields(dataset: &Dataset, names: &[String; 4]) -> Result<Option<Self>, IoError> {
+        let Some(compound) = compound_of(dataset) else {
+            return Ok(None);
+        };
+        let mut chosen: [Option<(usize, FieldDecode)>; 4] = [None, None, None, None];
+        for (role, wanted) in names.iter().enumerate() {
+            if let Some(field) = compound.fields.iter().find(|field| field.name == *wanted) {
+                chosen[role] = Some((
+                    0,
+                    FieldDecode {
+                        offset: field.offset,
+                        descriptor: field.ty.clone(),
+                    },
+                ));
+            }
+        }
+        Self::from_chosen(dataset, chosen)
+    }
+
+    fn from_chosen(
+        dataset: &Dataset,
+        chosen: [Option<(usize, FieldDecode)>; 4],
+    ) -> Result<Option<Self>, IoError> {
+        let [x, y, t, p] = chosen;
+        let (Some((_, x)), Some((_, y)), Some((_, t)), Some((_, p))) = (x, y, t, p) else {
+            return Ok(None);
+        };
+        let dtype = dataset.dtype().map_err(map_hdf5_error)?;
+        let record_size = dtype.size();
+        let order = dtype.byte_order();
+        let total = dataset.shape().first().copied().unwrap_or(0);
+        Ok(Some(Self {
+            dataset: dataset.clone(),
+            dtype,
+            record_size,
+            order,
+            fields: [x, y, t, p],
+            total,
+        }))
+    }
+
+    /// Reads column `col` (`X`/`Y`/`T`/`P`) over `range` as `i64` by decoding the packed records.
+    fn read_ints(&self, col: usize, range: Range<usize>) -> Result<Vec<i64>, IoError> {
+        let n = range.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = self.read_records(range)?;
+        let field = &self.fields[col];
+        Ok(bytes
+            .chunks_exact(self.record_size)
+            .map(|record| decode_scalar(&record[field.offset..], &field.descriptor, self.order))
+            .collect())
+    }
+
+    /// Reads the packed compound records for `range` into a byte buffer via `H5Dread`.
+    fn read_records(&self, range: Range<usize>) -> Result<Vec<u8>, IoError> {
+        let n = range.len();
+        let mut buffer = vec![0u8; n * self.record_size];
+        // Fresh copy of the dataset's dataspace (mutating its selection is local to this read),
+        // with a [start, start+n) hyperslab; a matching 1-D memory space receives the records.
+        let file_space = self.dataset.space().map_err(map_hdf5_error)?;
+        let start = [range.start as hsize_t];
+        let count = [n as hsize_t];
+        let dims = [n as hsize_t];
+        // The static libhdf5 build is not thread-safe; every call must hold the library's global
+        // lock. hdf5-metno wraps its own calls in `sync`, so the raw FFI here must too, or it races
+        // the safe API on other threads (corrupting internal state).
+        // SAFETY: `file_space`/`self.dtype`/`self.dataset` are live HDF5 handles; the buffer holds
+        // exactly `n * record_size` bytes, matching the selected element count and record stride.
+        hdf5::sync::sync(|| unsafe {
+            if H5Sselect_hyperslab(
+                file_space.id(),
+                H5S_SELECT_SET,
+                start.as_ptr(),
+                std::ptr::null(),
+                count.as_ptr(),
+                std::ptr::null(),
+            ) < 0
+            {
+                return Err(IoError::Format(
+                    "hdf5: hyperslab selection failed on compound dataset".to_owned(),
+                ));
+            }
+            let mem_space = H5Screate_simple(1, dims.as_ptr(), std::ptr::null());
+            if mem_space < 0 {
+                return Err(IoError::Format(
+                    "hdf5: could not create memory dataspace for compound read".to_owned(),
+                ));
+            }
+            let status = H5Dread(
+                self.dataset.id(),
+                self.dtype.id(),
+                mem_space,
+                file_space.id(),
+                H5P_DEFAULT,
+                buffer.as_mut_ptr().cast(),
+            );
+            H5Sclose(mem_space);
+            if status < 0 {
+                return Err(IoError::Format(
+                    "hdf5: reading compound dataset records failed".to_owned(),
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(buffer)
+    }
+}
+
+/// The compound layout of a dataset, or `None` if it isn't a compound type.
+fn compound_of(dataset: &Dataset) -> Option<CompoundType> {
+    match dataset.dtype().and_then(|dtype| dtype.to_descriptor()) {
+        Ok(TypeDescriptor::Compound(compound)) => Some(compound),
+        _ => None,
+    }
+}
+
+/// Decodes one scalar as `i64`; `b` starts at the field's byte offset within a packed record.
+/// Covers the integer / float / boolean / enum member types an event column may use, honouring
+/// the compound's byte order.
+fn decode_scalar(b: &[u8], descriptor: &TypeDescriptor, order: ByteOrder) -> i64 {
+    use TypeDescriptor as TD;
+    let be = matches!(order, ByteOrder::BigEndian);
+    macro_rules! int {
+        ($t:ty, $n:literal) => {{
+            let mut bytes = [0u8; $n];
+            bytes.copy_from_slice(&b[..$n]);
+            (if be {
+                <$t>::from_be_bytes(bytes)
+            } else {
+                <$t>::from_le_bytes(bytes)
+            }) as i64
+        }};
+    }
+    match descriptor {
+        TD::Unsigned(IntSize::U1) => b[0] as i64,
+        TD::Unsigned(IntSize::U2) => int!(u16, 2),
+        TD::Unsigned(IntSize::U4) => int!(u32, 4),
+        TD::Unsigned(IntSize::U8) => int!(u64, 8),
+        TD::Integer(IntSize::U1) => b[0] as i8 as i64,
+        TD::Integer(IntSize::U2) => int!(i16, 2),
+        TD::Integer(IntSize::U4) => int!(i32, 4),
+        TD::Integer(IntSize::U8) => int!(i64, 8),
+        TD::Float(FloatSize::U4) => int!(f32, 4),
+        TD::Float(FloatSize::U8) => int!(f64, 8),
+        TD::Boolean => i64::from(b[0] != 0),
+        // An enum stores an integer of its base width/signedness (e.g. an HDF5 boolean polarity).
+        TD::Enum(enumeration) => match (enumeration.size, enumeration.signed) {
+            (IntSize::U1, true) => b[0] as i8 as i64,
+            (IntSize::U1, false) => b[0] as i64,
+            (IntSize::U2, true) => int!(i16, 2),
+            (IntSize::U2, false) => int!(u16, 2),
+            (IntSize::U4, true) => int!(i32, 4),
+            (IntSize::U4, false) => int!(u32, 4),
+            (IntSize::U8, true) => int!(i64, 8),
+            (IntSize::U8, false) => int!(u64, 8),
+        },
+        _ => 0,
+    }
 }
 
 /// Reads an integer (or unsigned) column as `i64`, dispatching on its on-disk width.
@@ -898,6 +1354,172 @@ mod tests {
     fn missing_file_is_reported() {
         let error = read_hdf5("missing.h5", &LoadOptions::default()).unwrap_err();
         assert!(matches!(error, IoError::Io(_)));
+    }
+
+    /// Writes four separate columns with the given dataset names under `group_path` (empty =
+    /// root), microsecond timestamps `1000..`, returning the file path.
+    fn write_named(tag: &str, group_path: &str, names: [&str; 4]) -> std::path::PathBuf {
+        let dir = temp_dir(tag);
+        let path = dir.join("events.h5");
+        let file = File::create(&path).unwrap();
+        let group = if group_path.is_empty() {
+            None
+        } else {
+            Some(file.create_group(group_path).unwrap())
+        };
+        let container: &Group = group.as_ref().unwrap_or(&file);
+        container
+            .new_dataset_builder()
+            .with_data(&[1u16, 3, 0][..])
+            .create(names[0])
+            .unwrap();
+        container
+            .new_dataset_builder()
+            .with_data(&[2u16, 0, 1][..])
+            .create(names[1])
+            .unwrap();
+        container
+            .new_dataset_builder()
+            .with_data(&[1000i64, 2000, 3000][..])
+            .create(names[2])
+            .unwrap();
+        container
+            .new_dataset_builder()
+            .with_data(&[1u8, 0, 1][..])
+            .create(names[3])
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn detects_synonym_columns_under_a_nested_group() {
+        // The QCR Fast-Slow / ROS dvs_msgs layout: events/{x_coordinates, …}, not x/y/t/p.
+        let path = write_named(
+            "h5syn",
+            "events",
+            ["x_coordinates", "y_coordinates", "timestamps", "polarities"],
+        );
+        let stream = read_hdf5(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap();
+        assert_eq!(stream.xs(), &[1, 3, 0]);
+        assert_eq!(stream.ys(), &[2, 0, 1]);
+        assert_eq!(stream.ts(), &[1000, 2000, 3000]);
+        assert_eq!(stream.ps(), &[true, false, true]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn detects_root_level_synonyms() {
+        let path = write_named("h5rootsyn", "", ["xs", "ys", "ts", "ps"]);
+        let stream = read_hdf5(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap();
+        assert_eq!(stream.len(), 3);
+        assert_eq!(stream.ts(), &[1000, 2000, 3000]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn keys_override_names_arbitrary_datasets() {
+        // Names that match no synonym: only an explicit `keys` mapping can resolve them.
+        let path = write_named("h5keys", "raw", ["aa", "bb", "cc", "dd"]);
+        let keys = EventKeys {
+            x: "raw/aa".to_owned(),
+            y: "raw/bb".to_owned(),
+            t: "raw/cc".to_owned(),
+            p: "raw/dd".to_owned(),
+        };
+        // Auto-detection fails and lists the datasets present.
+        let error = read_hdf5(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap_err();
+        match error {
+            IoError::Format(message) => {
+                assert!(message.contains("could not identify"));
+                assert!(message.contains("raw/aa"));
+            }
+            other => panic!("expected a format error, got {other:?}"),
+        }
+        // With keys it loads.
+        let opts = LoadOptions {
+            keys: Some(keys),
+            ..options(4, 4, TimeUnit::Microseconds)
+        };
+        let stream = read_hdf5(&path, &opts).unwrap();
+        assert_eq!(stream.ts(), &[1000, 2000, 3000]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[derive(hdf5::H5Type, Clone, Copy)]
+    #[repr(C)]
+    struct CdEvent {
+        x: u16,
+        y: u16,
+        p: u8,
+        t: i64,
+    }
+
+    #[test]
+    fn detects_and_reads_a_compound_dataset() {
+        let dir = temp_dir("h5compound");
+        let path = dir.join("events.h5");
+        let events = [
+            CdEvent {
+                x: 1,
+                y: 2,
+                p: 1,
+                t: 1000,
+            },
+            CdEvent {
+                x: 3,
+                y: 0,
+                p: 0,
+                t: 2000,
+            },
+            CdEvent {
+                x: 0,
+                y: 1,
+                p: 1,
+                t: 3000,
+            },
+            CdEvent {
+                x: 4,
+                y: 0,
+                p: 1,
+                t: 4000,
+            }, // out of a 4x4 sensor -> dropped
+        ];
+        {
+            let file = File::create(&path).unwrap();
+            file.new_dataset_builder()
+                .with_data(&events[..])
+                .create("CD")
+                .unwrap();
+        }
+        // Auto-detected via the compound member names x/y/t/p, read by hyperslab + decode.
+        let stream = read_hdf5(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap();
+        assert_eq!(stream.len(), 3); // (4, 0) dropped
+        assert_eq!(stream.xs(), &[1, 3, 0]);
+        assert_eq!(stream.ys(), &[2, 0, 1]);
+        assert_eq!(stream.ts(), &[1000, 2000, 3000]);
+        assert_eq!(stream.ps(), &[true, false, true]);
+
+        // Slicing over the same compound dataset agrees with the full load.
+        let source = open_hdf5_slice(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap();
+        assert_eq!(source.n_events(), 4);
+        assert_eq!(source.slice_time(2000, 4000).unwrap().ts(), &[2000, 3000]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_compound_dataset_reads_empty() {
+        let dir = temp_dir("h5compoundempty");
+        let path = dir.join("events.h5");
+        {
+            let file = File::create(&path).unwrap();
+            file.new_dataset_builder()
+                .with_data(&[] as &[CdEvent])
+                .create("CD")
+                .unwrap();
+        }
+        let stream = read_hdf5(&path, &options(4, 4, TimeUnit::Microseconds)).unwrap();
+        assert!(stream.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

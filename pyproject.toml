@@ -64,3 +64,6 @@ exclude = [
     "data/**",
     "assets/**"
 ]
+
+[tool.uv.extra-build-dependencies]
+eventcv = ["maturin"]
