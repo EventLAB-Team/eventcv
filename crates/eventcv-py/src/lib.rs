@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 mod viewer;
 
 use std::collections::HashMap;
@@ -21,6 +22,9 @@ use eventcv_core::{
 };
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+// PyRuntimeError is only reached via the native viewer (and the hdf5-feature FrameSink), so on
+// a wasm build without that feature it goes unused.
+#[cfg_attr(target_family = "wasm", allow(unused_imports))]
 use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
@@ -331,6 +335,7 @@ impl PyEventStream {
     /// to show — `stream.view("flow")`, `stream.view("count")`, `stream.view("voxel")`, … — or
     /// omit it to use the stream's stored representation (from `open(repr=…)`), falling back to
     /// the polarity image. (Equivalent to `stream.<repr>().view()`.)
+    #[cfg(not(target_family = "wasm"))]
     #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=None))]
     fn view(
         &self,
@@ -345,6 +350,21 @@ impl PyEventStream {
         };
         // Rendering always auto-contrasts unless the caller opts out explicitly.
         frame.view(py, colormap, normalize.unwrap_or(true))
+    }
+
+    /// The GPU viewer needs a native window (winit has no wasm backend) — unavailable here.
+    #[cfg(target_family = "wasm")]
+    #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=None))]
+    #[allow(unused_variables)]
+    fn view(
+        &self,
+        representation: Option<&Bound<'_, PyAny>>,
+        colormap: &str,
+        normalize: Option<bool>,
+    ) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "the GPU viewer isn't available in the browser build",
+        ))
     }
 }
 
@@ -557,11 +577,22 @@ impl PyEventFrame {
     /// Opens the interactive GPU viewer. Image reprs are shown colour-mapped (`colormap`:
     /// `viridis`/`turbo`/`grayscale`/`redblue`; `normalize` auto-contrasts); volumetric
     /// reprs become an orbitable 3-D point cloud (drag to rotate, Esc to close).
+    #[cfg(not(target_family = "wasm"))]
     #[pyo3(signature = (*, colormap="viridis", normalize=true))]
     fn view(&self, py: Python<'_>, colormap: &str, normalize: bool) -> PyResult<()> {
         let colormap = parse_colormap(colormap)?;
         py.detach(|| viewer::view(&self.inner, colormap, normalize))
             .map_err(PyRuntimeError::new_err)
+    }
+
+    /// The GPU viewer needs a native window (winit has no wasm backend) — unavailable here.
+    #[cfg(target_family = "wasm")]
+    #[pyo3(signature = (*, colormap="viridis", normalize=true))]
+    #[allow(unused_variables)]
+    fn view(&self, colormap: &str, normalize: bool) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "the GPU viewer isn't available in the browser build",
+        ))
     }
 }
 
@@ -588,9 +619,18 @@ impl PyEventPointSet {
             .into_pyarray(py)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn view(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| viewer::view_point_set(&self.inner))
             .map_err(PyRuntimeError::new_err)
+    }
+
+    /// The GPU viewer needs a native window (winit has no wasm backend) — unavailable here.
+    #[cfg(target_family = "wasm")]
+    fn view(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "the GPU viewer isn't available in the browser build",
+        ))
     }
 }
 

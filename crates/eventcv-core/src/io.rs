@@ -3,6 +3,9 @@ use std::{error::Error, fmt, io, path::Path};
 use crate::{EventStream, EventStreamBuilder};
 
 mod aedat;
+// rosbag mmaps the file (`memmap2`), unavailable under wasm — see the target-conditional
+// dependency in Cargo.toml.
+#[cfg(not(target_family = "wasm"))]
 mod bag;
 #[cfg(feature = "hdf5")]
 mod h5;
@@ -11,6 +14,7 @@ mod prophesee;
 mod text;
 
 pub use aedat::read_aedat;
+#[cfg(not(target_family = "wasm"))]
 pub use bag::{open_bag_slice, read_bag, write_bag, BagSliceSource};
 #[cfg(feature = "hdf5")]
 pub use h5::{
@@ -247,7 +251,18 @@ fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoErro
     match detect_format(path)? {
         Format::Npz => npz::read_npz(path, options.sensor_size),
         Format::Text => text::load_text(path, options),
-        Format::Rosbag => bag::read_bag(path, options),
+        Format::Rosbag => {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                bag::read_bag(path, options)
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                Err(IoError::Unsupported(
+                    "rosbag (.bag) reading is not available in the wasm build".to_owned(),
+                ))
+            }
+        }
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {
@@ -401,6 +416,7 @@ pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoEr
             }
         }
         Format::Text => Ok(Box::new(text::open_text_slice(path, &options)?)),
+        #[cfg(not(target_family = "wasm"))]
         Format::Rosbag => Ok(Box::new(bag::open_bag_slice(path, &options)?)),
         _ => Ok(Box::new(MemorySliceSource::new(load(path, options)?))),
     }
@@ -422,6 +438,7 @@ pub struct SaveOptions {
 /// Persists an [`EventStream`] to `path`, the format chosen by extension — the symmetric
 /// counterpart of [`load`]. npz/HDF5/rosbag round-trip exactly (metadata stored); txt
 /// stores `t x y p` and recovers sensor size / time unit on load via inference or options.
+#[cfg_attr(target_family = "wasm", allow(unused_variables))]
 pub fn save_stream(
     path: impl AsRef<Path>,
     stream: &EventStream,
@@ -431,7 +448,18 @@ pub fn save_stream(
     match detect_format(path)? {
         Format::Npz => npz::write_npz_stream(path, stream),
         Format::Text => text::write_text_stream(path, stream),
-        Format::Rosbag => bag::write_bag(path, stream, options.topic.as_deref()),
+        Format::Rosbag => {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                bag::write_bag(path, stream, options.topic.as_deref())
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                Err(IoError::Unsupported(
+                    "rosbag (.bag) writing is not available in the wasm build".to_owned(),
+                ))
+            }
+        }
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {

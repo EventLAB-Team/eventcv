@@ -11,8 +11,6 @@ categories = ["computer-vision"]
 [dependencies]
 ndarray = "0.17"
 npyz = { version = "0.9", features = ["derive", "npz"] }
-rayon = "1.10"
-rosbag = "0.6.3"
 # Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.
 # Same major version npyz already pulls transitively; only `FileOptions` is named here.
 zip = { version = "0.6", default-features = false }
@@ -25,6 +23,12 @@ hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-feat
 # shares the one static libhdf5 build). Used only to read a compound event dataset's fields by
 # hyperslab — hdf5-metno's safe API can't decode an arbitrary compound generically.
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true, default-features = false, features = ["static"] }
+
+# rosbag mmaps the file internally (`memmap2`), which isn't available under wasm — excluded
+# from that target at the dependency level so the crate compiles there at all, not just the
+# `.bag` reader disabled at runtime.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rosbag = "0.6.3"
 
 # The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
 [features]

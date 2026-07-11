@@ -1,7 +1,7 @@
 [build-system]
 # cmake builds the bundled libhdf5 from source so `.h5`/`.hdf5` support is compiled
 # into the wheel; end users install nothing extra.
-requires = ["maturin>=1.8,<2", "cmake>=3.18"]
+requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
@@ -45,8 +45,8 @@ classifiers = [
 
 # Test-only tools (writing/inspecting HDF5 fixtures). Not needed to use eventcv —
 # the Rust reader links its own libhdf5.
-[project.optional-dependencies]
-test = ["h5py>=3", "hdf5plugin"]
+# [project.optional-dependencies]
+# test = ["h5py>=3", "hdf5plugin"]
 
 [tool.maturin]
 bindings = "pyo3"
@@ -54,7 +54,7 @@ manifest-path = "crates/eventcv-py/Cargo.toml"
 python-source = "python"
 module-name = "eventcv._rust"
 # Compile HDF5 reading into every wheel.
-features = ["hdf5"]
+# features = ["hdf5"]
 # Keep the docs source, fixtures, and dev-only files out of the sdist (the wheel already
 # only contains `python/eventcv/` + the compiled extension). Docs are hosted on Read the
 # Docs, so shipping them to PyPI would only bloat the download.
