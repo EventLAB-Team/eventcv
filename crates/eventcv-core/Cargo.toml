@@ -11,6 +11,9 @@ categories = ["computer-vision"]
 [dependencies]
 ndarray = "0.17"
 npyz = { version = "0.9", features = ["derive", "npz"] }
+# Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
+rand = "0.8"
+rand_distr = "0.4"
 rayon = "1.10"
 rosbag = "0.6.3"
 # Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.

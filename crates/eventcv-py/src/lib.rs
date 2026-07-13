@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use eventcv_core::{
     camera::Camera,
     cluster::ClusterError,
+    feast::{Feast, FeastConfig, FeastError},
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
@@ -19,12 +20,15 @@ use eventcv_core::{
     EventStream, EventStreamBuilder,
 };
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
+};
 use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyTuple};
 
 #[pyclass(name = "EventStream", frozen)]
 struct PyEventStream {
@@ -1705,6 +1709,140 @@ fn map_resize_error(error: ResizeError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
+fn map_feast_error(error: FeastError) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+/// FEAST feature extractor (Afshar et al., 2020) — an unsupervised, online, sklearn-style model.
+/// `fit` adapts feature weights and selection thresholds event-by-event (repeatable across
+/// recordings/epochs); `transform` then maps each event to its nearest feature id.
+#[pyclass(name = "FEAST")]
+struct PyFeast {
+    inner: Feast,
+}
+
+#[pymethods]
+impl PyFeast {
+    #[new]
+    #[pyo3(signature = (n_features=100, patch=11, tau_ms=30.0, eta=0.001, delta_i=0.001,
+        delta_e=0.003, per_polarity=true, seed=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        n_features: usize,
+        patch: usize,
+        tau_ms: f64,
+        eta: f32,
+        delta_i: f32,
+        delta_e: f32,
+        per_polarity: bool,
+        seed: u64,
+    ) -> PyResult<Self> {
+        let config = FeastConfig {
+            n_features,
+            patch,
+            tau_ms,
+            eta,
+            delta_i,
+            delta_e,
+            per_polarity,
+            seed,
+        };
+        Feast::new(config)
+            .map(|inner| Self { inner })
+            .map_err(map_feast_error)
+    }
+
+    /// Trains on `stream` for `epochs` online passes; returns the final-epoch **miss rate** (the
+    /// fraction of in-bounds events matching no feature), which settles low as the network
+    /// converges. Call repeatedly to train across multiple recordings.
+    #[pyo3(signature = (stream, epochs=1))]
+    fn fit(&mut self, py: Python<'_>, stream: PyRef<'_, PyEventStream>, epochs: usize) -> f64 {
+        let events = &stream.inner;
+        py.detach(|| self.inner.fit(events, epochs))
+    }
+
+    /// Feature id for every event (nearest feature by cosine distance; `-1` for border events).
+    /// Shape `(len(stream),)`, dtype int32; ids are `population * n_features + feature`.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        stream: PyRef<'_, PyEventStream>,
+    ) -> Bound<'py, PyArray1<i32>> {
+        let events = &stream.inner;
+        py.detach(|| self.inner.transform(events)).into_pyarray(py)
+    }
+
+    /// Pooled feature-event counts over `stream` (the paper's classifier input). Shape
+    /// `(n_features_total,)`, dtype uint32.
+    fn histogram<'py>(
+        &self,
+        py: Python<'py>,
+        stream: PyRef<'_, PyEventStream>,
+    ) -> Bound<'py, PyArray1<u32>> {
+        let events = &stream.inner;
+        py.detach(|| self.inner.histogram(events)).into_pyarray(py)
+    }
+
+    /// The learned features as an `(n_features_total, patch, patch)` float32 array — reproduces
+    /// the paper's feature grids for visualisation.
+    fn feature_images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let patch = self.inner.config().patch;
+        let shape = (self.inner.n_features_total(), patch, patch);
+        numpy::ndarray::Array3::from_shape_vec(shape, self.inner.weights().to_vec())
+            .map_err(|_| PyRuntimeError::new_err("feature weights shape mismatch"))
+            .map(|array| array.into_pyarray(py))
+    }
+
+    /// The current selection thresholds, shape `(n_features_total,)`, dtype float32.
+    #[getter]
+    fn thresholds<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        self.inner.thresholds().to_vec().into_pyarray(py)
+    }
+
+    /// Miss rate recorded by the most recent `fit` (0.0 before any training).
+    #[getter]
+    fn missed_rate(&self) -> f64 {
+        self.inner.missed_rate()
+    }
+
+    /// The constructor parameters as a dict (sklearn-style); consumed by `eventcv.save`.
+    fn get_params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let config = self.inner.config();
+        let params = PyDict::new(py);
+        params.set_item("n_features", config.n_features)?;
+        params.set_item("patch", config.patch)?;
+        params.set_item("tau_ms", config.tau_ms)?;
+        params.set_item("eta", config.eta)?;
+        params.set_item("delta_i", config.delta_i)?;
+        params.set_item("delta_e", config.delta_e)?;
+        params.set_item("per_polarity", config.per_polarity)?;
+        params.set_item("seed", config.seed)?;
+        Ok(params)
+    }
+
+    /// Replaces the weights/thresholds from saved arrays — the `eventcv.load_feast` rehydration
+    /// path. Both arrays must match the model's configured sizes.
+    fn _load_state(
+        &mut self,
+        features: PyReadonlyArray3<f32>,
+        thresholds: PyReadonlyArray1<f32>,
+    ) -> PyResult<()> {
+        let weights = features.as_array().iter().copied().collect();
+        let thresholds = thresholds.as_array().iter().copied().collect();
+        self.inner = Feast::from_state(*self.inner.config(), weights, thresholds)
+            .map_err(map_feast_error)?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        let config = self.inner.config();
+        format!(
+            "FEAST(n_features={}, patch={}, tau_ms={}, per_polarity={})",
+            config.n_features, config.patch, config.tau_ms, config.per_polarity
+        )
+    }
+}
+
 #[pymodule]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEventStream>()?;
@@ -1714,6 +1852,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWindowIterator>()?;
     m.add_class::<PyPolarity>()?;
     m.add_class::<PyCamera>()?;
+    m.add_class::<PyFeast>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;

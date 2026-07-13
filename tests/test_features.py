@@ -187,5 +187,88 @@ class ReaderPipelineTests(unittest.TestCase):
         self.assertEqual(len(flow_paths), reader.n_slices)
 
 
+def _sweep_stream(size=16, sweeps=10) -> "eventcv.EventStream":
+    """A vertical bar sweeping left→right across a ``size×size`` sensor, repeated ``sweeps`` times
+    — a dense, learnable moving-edge recording for the FEAST model."""
+    rows = []
+    t = 0
+    for _ in range(sweeps):
+        for x in range(size):
+            for y in range(size):
+                rows.append((x, y, t, 1))
+            t += 1000
+    events = np.array(rows, dtype=np.int64)  # x y t p
+    return eventcv.from_numpy(events, sensor_size=(size, size), time_unit="us")
+
+
+class FeastTests(unittest.TestCase):
+    """FEAST unsupervised feature learning (Afshar et al., 2020): a stateful sklearn-style model
+    whose ``fit`` adapts features online and ``transform`` maps events to nearest-feature ids."""
+
+    def _model(self, **kw):
+        params = dict(n_features=8, patch=5, per_polarity=False, seed=0)
+        params.update(kw)
+        return eventcv.FEAST(**params)
+
+    def test_fit_returns_miss_rate_and_transform_labels_events(self):
+        stream = _sweep_stream()
+        feast = self._model()
+        rate = feast.fit(stream, epochs=4)
+        self.assertIsInstance(rate, float)
+        self.assertTrue(0.0 <= rate <= 1.0)
+
+        ids = feast.transform(stream)
+        self.assertEqual(ids.shape, (len(stream),))
+        self.assertEqual(ids.dtype, np.int32)
+        self.assertTrue(ids.max() < 8)  # ids in [-1, n_features)
+        self.assertGreaterEqual(ids.min(), -1)
+        # Interior events (most of the sensor) are all assigned a feature.
+        self.assertGreater(int((ids >= 0).sum()), len(stream) * 0.4)
+
+    def test_histogram_matches_transform_tally(self):
+        stream = _sweep_stream()
+        feast = self._model()
+        feast.fit(stream, epochs=2)
+        hist = feast.histogram(stream)
+        self.assertEqual(hist.shape, (8,))
+        self.assertEqual(hist.dtype, np.uint32)
+        self.assertEqual(int(hist.sum()), int((feast.transform(stream) >= 0).sum()))
+
+    def test_feature_images_shape_and_per_polarity_doubles_bank(self):
+        feast = self._model()
+        feast.fit(_sweep_stream(), epochs=1)
+        images = feast.feature_images()
+        self.assertEqual(images.shape, (8, 5, 5))
+        self.assertEqual(images.dtype, np.float32)
+        # Each feature stays on the unit hypersphere.
+        norms = np.linalg.norm(images.reshape(8, -1), axis=1)
+        np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+        # A per-polarity model learns an independent ON and OFF bank.
+        self.assertEqual(self._model(per_polarity=True).feature_images().shape, (16, 5, 5))
+
+    def test_save_load_roundtrips_transform_exactly(self):
+        stream = _sweep_stream()
+        feast = self._model()
+        feast.fit(stream, epochs=3)
+        expected = feast.transform(stream)
+        with tempfile.TemporaryDirectory() as out:
+            path = str(Path(out) / "model.npz")
+            eventcv.save(feast, path)
+            reloaded = eventcv.load_feast(path)
+        np.testing.assert_array_equal(reloaded.transform(stream), expected)
+        np.testing.assert_array_equal(reloaded.thresholds, feast.thresholds)
+
+    def test_missed_rate_and_repr_are_exposed(self):
+        feast = self._model()
+        self.assertEqual(feast.missed_rate, 0.0)  # untrained
+        feast.fit(_sweep_stream(), epochs=2)
+        self.assertTrue(0.0 <= feast.missed_rate <= 1.0)
+        self.assertIn("FEAST", repr(feast))
+
+    def test_rejects_even_patch_size(self):
+        with self.assertRaises(ValueError):
+            eventcv.FEAST(patch=4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

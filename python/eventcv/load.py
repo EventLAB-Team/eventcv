@@ -8,6 +8,7 @@ EventPointSet = _rust.EventPointSet
 EventReader = _rust.EventReader
 Polarity = _rust.Polarity
 Camera = _rust.Camera
+FEAST = _rust.FEAST
 
 
 def load(
@@ -200,15 +201,51 @@ FrameSink = getattr(_rust, "FrameSink", None)
 
 
 def save(obj, path: str, *, topic: str | None = None) -> None:
-    """Save an :class:`EventStream` or :class:`EventFrame` to ``path``.
+    """Save an :class:`EventStream`, :class:`EventFrame`, or :class:`FEAST` model to ``path``.
 
     The mirror of :func:`load`: the format is chosen by the file extension. Streams go to
     ``.npz``/``.txt``/``.h5``/``.bag`` (npz, HDF5, and rosbag round-trip exactly; txt stores
     ``t x y p`` and recovers the sensor size/unit on load via inference or options). Frames
     (computed representations) go to ``.npz`` or ``.h5``, preserving shape, dtype, ``kind``,
-    and ``channel_names``. ``topic`` names the rosbag connection. Equivalent to ``obj.save(path)``.
+    and ``channel_names``. A trained :class:`FEAST` model is written to ``.npz`` (its learned
+    features, thresholds, and parameters) and reloaded with :func:`load_feast`. ``topic`` names
+    the rosbag connection. Equivalent to ``obj.save(path)`` for streams/frames.
     """
+    if isinstance(obj, FEAST):
+        import numpy as np
+
+        np.savez(
+            path,
+            features=obj.feature_images(),
+            thresholds=obj.thresholds,
+            **obj.get_params(),
+        )
+        return
     return _rust.save(obj, path, topic=topic)
+
+
+def load_feast(path: str) -> FEAST:
+    """Load a :class:`FEAST` model written by :func:`save` (``.npz``).
+
+    Restores the learned features, selection thresholds, and every constructor parameter, so the
+    reloaded model reproduces :meth:`FEAST.transform` exactly and can resume training with
+    :meth:`FEAST.fit`.
+    """
+    import numpy as np
+
+    state = np.load(path)
+    model = FEAST(
+        n_features=int(state["n_features"]),
+        patch=int(state["patch"]),
+        tau_ms=float(state["tau_ms"]),
+        eta=float(state["eta"]),
+        delta_i=float(state["delta_i"]),
+        delta_e=float(state["delta_e"]),
+        per_polarity=bool(state["per_polarity"]),
+        seed=int(state["seed"]),
+    )
+    model._load_state(state["features"], state["thresholds"])
+    return model
 
 
 def load_frame(path: str) -> EventFrame:
@@ -286,12 +323,14 @@ __all__ = [
     "EventPointSet",
     "EventReader",
     "EventStream",
+    "FEAST",
     "FrameSink",
     "Polarity",
     "collate",
     "export_png",
     "from_numpy",
     "load",
+    "load_feast",
     "load_frame",
     "open",
     "save",

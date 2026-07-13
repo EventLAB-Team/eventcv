@@ -10,6 +10,8 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
 - **Transform** streams with chainable, functional geometry / temporal / polarity ops.
 - **Represent** events as dense tensors (voxel grids, time surfaces, count images, …)
   ready for NumPy and PyTorch.
+- **Detect features** — corner detectors and the unsupervised, trainable
+  {class}`~eventcv.FEAST` feature extractor (the event analogue of `features2d`).
 - **Call it your way** — every operation is available both as a method
   (`stream.voxel()`) and as an OpenCV-style free function (`eventcv.voxel(stream)`).
 
@@ -19,6 +21,7 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
 
 quickstart
 representations
+feature-detection
 tutorials/index
 api
 ```
