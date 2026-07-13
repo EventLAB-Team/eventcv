@@ -2058,6 +2058,15 @@ impl PyFeast {
 #[cfg(feature = "camera")]
 const LIVE_REPR_WINDOW_MS: u64 = 33;
 
+/// Wall-clock budget the live viewer spends **decoding** events per display frame. At very high
+/// event rates (a 1280×720 Prophesee sensor can emit hundreds of millions of events per second)
+/// decoding a whole frame's worth of events takes far longer than a display frame, so the viewer
+/// decodes only this much of the freshest data each frame and drops the surplus — keeping the
+/// display at ~60 FPS instead of stalling to a couple of frames per second. The dropped events are
+/// invisible at that rate anyway. Iteration/`record` are unaffected (they process every event).
+#[cfg(feature = "camera")]
+const LIVE_DRAIN_BUDGET_MS: u64 = 10;
+
 /// How the live event stream is turned into frames for the interactive viewer.
 #[cfg(feature = "camera")]
 enum LiveRenderer {
@@ -2090,7 +2099,8 @@ impl LiveRenderer {
         match self {
             LiveRenderer::Raw(surface) => {
                 let mut lit = false;
-                let overflow = capture.drain_events(|x, y, t_us, positive| {
+                let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
+                let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
                     lit = true;
                     surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
                 })?;
@@ -2109,7 +2119,8 @@ impl LiveRenderer {
                 builder,
                 last_render,
             } => {
-                let overflow = capture.drain_events(|x, y, t_us, positive| {
+                let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
+                let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
                     builder.push(x, y, t_us, positive);
                 })?;
                 if overflow {
@@ -2314,13 +2325,19 @@ impl PyEventCamera {
 
     /// Headless diagnostic: runs the live drain/render loop for `seconds` at ~60 FPS **without**
     /// opening a window, returning `{frames, events, events_per_s, max_backlog, seconds}`. A
-    /// healthy viewer keeps `max_backlog` near zero. With `drain=False` it uses the old
-    /// one-poll-per-frame path for comparison (which lets the ring back up).
-    #[pyo3(signature = (seconds=3.0, *, drain=true))]
+    /// healthy viewer keeps `max_backlog` near zero and renders ~60 frames/second.
+    ///
+    /// By default it mirrors the live viewer: a `budget_ms` wall-clock decode budget per frame
+    /// (the freshest events are decoded, the surplus dropped) — this is what keeps the display at
+    /// ~60 FPS on high-rate sensors. Pass `budget_ms=None` to decode every queued event per frame
+    /// (`drain`-based); on a fast camera that collapses to a couple of frames/second. `drain=False`
+    /// uses the old one-poll-per-frame path for comparison (which lets the ring back up).
+    #[pyo3(signature = (seconds=3.0, *, budget_ms=Some(LIVE_DRAIN_BUDGET_MS as f64), drain=true))]
     fn _render_benchmark(
         &mut self,
         py: Python<'_>,
         seconds: f64,
+        budget_ms: Option<f64>,
         drain: bool,
     ) -> PyResult<Py<PyDict>> {
         let decay = self.decay_ms;
@@ -2338,7 +2355,13 @@ impl PyEventCamera {
             let start = std::time::Instant::now();
             while start.elapsed().as_secs_f64() < seconds {
                 let frame_start = std::time::Instant::now();
-                if drain {
+                if let Some(budget_ms) = budget_ms {
+                    let budget = std::time::Duration::from_secs_f64(budget_ms / 1000.0);
+                    capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
+                        events += 1;
+                        surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
+                    })?;
+                } else if drain {
                     capture.drain_events(|x, y, t_us, positive| {
                         events += 1;
                         surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);

@@ -453,17 +453,29 @@ impl RawSurface {
     /// `exp(-age / decay_ms)`, where `age` is the time since its last event. Never-lit pixels are
     /// black.
     pub fn render(&self) -> Rgb8Image {
-        let mut pixels = Vec::with_capacity(self.width * self.height * 3);
-        for index in 0..self.width * self.height {
+        let count = self.width * self.height;
+        let mut pixels = vec![0u8; count * 3]; // default black; only lit pixels are written.
+        // Past this age the brightest channel (255) scales below 0.5 and rounds to 0, so the pixel
+        // is black anyway. Skipping the `exp()` for those — and for never-lit pixels (age = +inf) —
+        // makes a typical sparse scene render in a fraction of the time (most pixels are black),
+        // while producing byte-for-byte the same image. `6.5 · τ` clears the round-to-zero
+        // threshold (`ln(255/0.5) ≈ 6.24 · τ`) with margin.
+        let cutoff = self.decay_ms * 6.5;
+        for index in 0..count {
             let age = self.latest_ms - self.last_t_ms[index];
-            let intensity = (-age / self.decay_ms).exp(); // age = +inf (never lit) -> 0
+            // `!(age < cutoff)` also rejects the `+inf` age of never-lit pixels and any NaN.
+            if !(age < cutoff) {
+                continue;
+            }
+            let intensity = (-age / self.decay_ms).exp();
             let color = if self.last_positive[index] {
                 RAW_POSITIVE
             } else {
                 RAW_NEGATIVE
             };
-            for channel in color {
-                pixels.push((f64::from(channel) * intensity).round() as u8);
+            let base = index * 3;
+            for channel in 0..3 {
+                pixels[base + channel] = (f64::from(color[channel]) * intensity).round() as u8;
             }
         }
         Rgb8Image {

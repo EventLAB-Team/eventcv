@@ -68,6 +68,31 @@ pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
         .collect())
 }
 
+/// Turns a raw `nd::open` failure into an actionable message. The driver reports a device that is
+/// present but can't be claimed (already open elsewhere, or missing USB permissions) the same way as
+/// a truly absent one — "no device found". So when enumeration *can* still see a supported camera,
+/// we say the device is present-but-unavailable rather than repeat the misleading "not found".
+fn open_error(serial: Option<&str>, error: impl std::fmt::Display) -> String {
+    let visible = list_cameras().unwrap_or_default();
+    let matched = match serial {
+        Some(serial) => visible.iter().find(|camera| camera.serial.as_deref() == Some(serial)),
+        None => visible.first(),
+    };
+    match matched {
+        Some(camera) => format!(
+            "found {} but couldn't open it ({error}). It may already be open in this or another \
+             process — an earlier eventcv.stream()/EventCamera that is still alive holds the device \
+             until it is closed (use `with eventcv.stream() as cam:` or call `cam.close()`); or, on \
+             Linux, the USB udev rules may be missing. Only one handle can open a camera at a time.",
+            camera.name,
+        ),
+        None => match serial {
+            Some(serial) => format!("no camera with serial {serial} found ({error})"),
+            None => format!("no event camera found ({error})"),
+        },
+    }
+}
+
 fn speed_name(speed: nd::usb::Speed) -> &'static str {
     match speed {
         nd::usb::Speed::Unknown => "unknown",
@@ -233,7 +258,7 @@ impl Capture {
             None => nd::SerialOrBusNumberAndAddress::None,
         };
         let device = nd::open(selector, None, None, event_loop.clone(), flag.clone())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| open_error(serial, error))?;
         let (width, height) = device_dimensions(&device);
         let name = device.name().to_owned();
         let serial = device.serial();
@@ -364,6 +389,60 @@ impl Capture {
                 Adapter::Davis346(adapter) => {
                     adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
                 }
+            }
+        }
+        Ok(overflow)
+    }
+
+    /// Like [`drain_events`](Self::drain_events), but caps how long is spent **decoding** per call.
+    ///
+    /// Every queued buffer is still read from the ring (so the driver never backs up), but once
+    /// `budget` of wall-clock time has been spent decoding, any remaining buffers are dropped
+    /// without being decoded. This bounds per-call latency for a display-paced consumer at very high
+    /// event rates — e.g. a 1280×720 Prophesee sensor emitting hundreds of millions of events per
+    /// second, where decoding a whole frame's worth of events takes far longer than a display frame.
+    /// The viewer visualises the freshest `budget` of decode work each frame and skips the surplus
+    /// (which is invisible at that rate anyway), keeping the display at ~60 FPS. `t` is in
+    /// microseconds. Returns whether the ring overflowed.
+    pub fn drain_events_budgeted<F>(
+        &mut self,
+        budget: Duration,
+        mut on_event: F,
+    ) -> Result<bool, String>
+    where
+        F: FnMut(u16, u16, i64, bool),
+    {
+        self.flag.load_error().map_err(|error| error.to_string())?;
+        let start = std::time::Instant::now();
+        let mut overflow = false;
+        let mut decoding = true;
+        while let Some(view) = self.device.next_with_timeout(&Duration::ZERO) {
+            if view.first_after_overflow {
+                overflow = true;
+            }
+            if !decoding {
+                continue; // over budget: drop the buffer, freeing its ring slot without decoding.
+            }
+            let slice = view.slice;
+            let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
+                on_event(
+                    event.x,
+                    event.y,
+                    event.t as i64,
+                    matches!(event.polarity, Polarity::On),
+                );
+            };
+            match &mut self.adapter {
+                Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
+                Adapter::Dvxplorer(adapter) => {
+                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {})
+                }
+                Adapter::Davis346(adapter) => {
+                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
+                }
+            }
+            if start.elapsed() >= budget {
+                decoding = false;
             }
         }
         Ok(overflow)
