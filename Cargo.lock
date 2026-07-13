@@ -585,9 +585,10 @@ dependencies = [
 
 [[package]]
 name = "eventcv-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hdf5-metno",
+ "hdf5-metno-sys",
  "ndarray",
  "npyz",
  "png",
@@ -600,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-py"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytemuck",
  "eventcv-core",

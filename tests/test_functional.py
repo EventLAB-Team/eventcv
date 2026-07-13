@@ -51,6 +51,53 @@ class TestFunctionalApi(unittest.TestCase):
         frame = self.stream.count()
         np.testing.assert_array_equal(eventcv.numpy(frame), frame.numpy())
 
+    def test_reader_native_free_function_matches_method(self):
+        reader = eventcv.open(str(EXAMPLE_NPZ), dt_ms=20)
+        np.testing.assert_array_equal(
+            eventcv.slice(reader, 0).numpy(), reader.slice(0).numpy()
+        )
+
+    def test_camera_free_function_matches_method(self):
+        cam = eventcv.Camera(200.0, 200.0, 160.0, 120.0, k1=0.1)
+        self.assertEqual(eventcv.undistort_point(cam, 1.0, 2.0), cam.undistort_point(1.0, 2.0))
+
+    def test_stream_op_on_reader_defers_lazily(self):
+        # A stream op applied to a reader returns a lazy reader that runs it per slice —
+        # identical to materialising the slice first and calling the method.
+        reader = eventcv.open(str(EXAMPLE_NPZ), dt_ms=20)
+        deferred = eventcv.hot_pixel_filter(reader)
+        self.assertIsInstance(deferred, eventcv.EventReader)
+        np.testing.assert_array_equal(
+            deferred.slice(0).numpy(), reader.slice(0).hot_pixel_filter().numpy()
+        )
+
+    def test_deferred_reader_ops_chain_in_order(self):
+        reader = eventcv.open(str(EXAMPLE_NPZ), dt_ms=20)
+        np.testing.assert_array_equal(
+            eventcv.flip_x(reader).hot_pixel_filter().slice(0).numpy(),
+            reader.slice(0).flip_x().hot_pixel_filter().numpy(),
+        )
+
+    def test_every_method_has_a_free_function(self):
+        # Completeness guard: every public method of every core type must have a matching
+        # free function, so the functional API can never silently fall behind the methods.
+        classes = (
+            eventcv.EventStream,
+            eventcv.EventFrame,
+            eventcv.EventReader,
+            eventcv.EventPointSet,
+            eventcv.Camera,
+        )
+        for cls in classes:
+            for name in dir(cls):
+                if name.startswith("_") or not callable(getattr(cls, name)):
+                    continue
+                with self.subTest(cls=cls.__name__, method=name):
+                    self.assertTrue(
+                        callable(getattr(eventcv, name, None)),
+                        f"{cls.__name__}.{name} has no eventcv.{name} free function",
+                    )
+
     def test_ops_are_listed_and_documented(self):
         for name in ("flip_x", "hot_pixel_filter", "voxel", "connected_components"):
             self.assertIn(name, eventcv.__all__)

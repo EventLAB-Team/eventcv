@@ -64,6 +64,15 @@ print(reader.n_slices)
 frame = reader.slice(50).voxel()           # the 50th 30 ms frame → voxel grid
 ```
 
+Stream ops apply to a reader too: `ecv.hot_pixel_filter(reader)` (or `reader.hot_pixel_filter()`)
+returns a new lazy reader that runs the op on every slice, so filtering/geometry compose with
+slicing without loading the file.
+
+```python
+clean = ecv.hot_pixel_filter(reader).flip_x()   # still lazy — nothing read yet
+frame = clean.slice(50).voxel()                 # 50th frame, hot pixels dropped + flipped
+```
+
 Slice by a fixed **event count** instead of a fixed duration with `max_events` — each
 slice holds exactly that many consecutive events (the last may be shorter), which keeps
 the number of events per frame constant rather than the time span. It is mutually
@@ -97,16 +106,21 @@ For a recording whose timestamps are epoch-based, `offset` is just that epoch ti
 (e.g. `offset=1_587_540_271_650`). Values before the recording clamp to the start; values
 past the end give zero frames.
 
-Pass `repr=` to give the reader a **default representation**. It is remembered by every
-slice, so `slice(n).view()` renders it (no need to name it again), and it makes the reader
-a PyTorch map-style dataset where `reader[i]` is the dense `[C, H, W]` array:
+Pass `repr=` to make the reader a **representation source**. Every slice-yielding call —
+`slice`, `slice_count`, and each item from `windows()` — applies it, returning the rendered
+{class}`~eventcv.EventFrame` directly, so `open(path, repr="mcts").slice(0)` is exactly
+`open(path).slice(0).mcts()`. It also makes the reader a PyTorch map-style dataset where
+`reader[i]` is the dense `[C, H, W]` array:
 
 ```python
 import torch
 
 reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")
-reader.slice(500).view()               # shows MCTS — the stored repr (not raw polarity)
-reader.slice(500).view("count")        # an explicit name still overrides it
+frame = reader.slice(500)              # an EventFrame — MCTS already applied
+frame.view()                           # render it (no need to name the repr again)
+frame.numpy()                          # the dense [C, H, W] array
+for frame in reader.windows():         # windows() yields rendered frames too
+    ...
 
 # as a PyTorch map-style dataset (dense arrays collate straight into a tensor)
 ds = ecv.open("huge.hdf5", dt_ms=30, repr="count")
@@ -114,9 +128,10 @@ ds = ecv.open("huge.hdf5", dt_ms=30, repr="count")
 loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=True)
 ```
 
-Without `repr`, `reader[i]` stays a raw {class}`~eventcv.EventStream`. Those are sparse and
-variable-length, so a `DataLoader` can't stack them — pass {func}`eventcv.collate` to batch
-them as a `list` instead:
+Without `repr`, `slice(n)` and `reader[i]` return raw {class}`~eventcv.EventStream`s, so name
+the representation on the slice yourself: `reader.slice(500).mcts()` (or `.view("count")`).
+Those streams are sparse and variable-length, so a `DataLoader` can't stack them — pass
+{func}`eventcv.collate` to batch them as a `list` instead:
 
 ```python
 import torch

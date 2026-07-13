@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "eventcv"
-version = "1.0.1"
+version = "1.0.2"
 description = "Open source event-based computer vision library."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,7 +20,7 @@ classifiers = [
 
         # Intended audience
         'Intended Audience :: Developers',
-        'Intended Audience :: Science/Researcher',
+        'Intended Audience :: Science/Research',
 
         # Languages
         'Programming Language :: Rust',
@@ -64,3 +64,6 @@ exclude = [
     "data/**",
     "assets/**"
 ]
+
+[tool.uv.extra-build-dependencies]
+eventcv = ["maturin"]

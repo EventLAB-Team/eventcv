@@ -1,5 +1,6 @@
 mod viewer;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use eventcv_core::{
@@ -9,8 +10,8 @@ use eventcv_core::{
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
-        load_rows, open as open_reader, ColumnOrder, IoError, LoadOptions, RawRow, Reader,
-        SaveOptions, TimeUnit,
+        load_rows, open as open_reader, ColumnOrder, EventKeys, IoError, LoadOptions, RawRow,
+        Reader, SaveOptions, TimeUnit,
     },
     representation::{
         AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, EventPointSet, Mcts,
@@ -639,6 +640,31 @@ fn parse_order(order: &str) -> PyResult<ColumnOrder> {
     })
 }
 
+/// Turns a `keys={"x": …, "y": …, "t": …, "p": …}` mapping into [`EventKeys`], requiring all
+/// four fields. Values are format-specific column names (HDF5 dataset paths / `dataset/field`;
+/// text header names or indices) — see `eventcv.load`.
+fn parse_keys(keys: Option<HashMap<String, String>>) -> PyResult<Option<EventKeys>> {
+    let Some(mut keys) = keys else {
+        return Ok(None);
+    };
+    let mut take = |field: &str| -> PyResult<String> {
+        keys.remove(field)
+            .ok_or_else(|| PyValueError::new_err(format!("keys is missing '{field}'")))
+    };
+    let parsed = EventKeys {
+        x: take("x")?,
+        y: take("y")?,
+        t: take("t")?,
+        p: take("p")?,
+    };
+    if let Some(extra) = keys.keys().next() {
+        return Err(PyValueError::new_err(format!(
+            "keys has an unexpected entry '{extra}' (only x/y/t/p are used)"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
 fn ms_to_us(ms: f64) -> i64 {
     (ms * 1000.0).round() as i64
 }
@@ -659,7 +685,7 @@ fn parse_offset(offset_ms: Option<f64>) -> PyResult<Option<i64>> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None))]
+#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None, keys=None))]
 #[allow(clippy::too_many_arguments)]
 fn load(
     py: Python<'_>,
@@ -670,6 +696,7 @@ fn load(
     topic: Option<String>,
     max_events: Option<i64>,
     offset: Option<f64>,
+    keys: Option<HashMap<String, String>>,
 ) -> PyResult<PyEventStream> {
     let max_events = max_events
         .map(|count| {
@@ -684,6 +711,7 @@ fn load(
         topic,
         max_events,
         offset: parse_offset(offset)?,
+        keys: parse_keys(keys)?,
     };
     py.detach(|| eventcv_core::io::load(path, options))
         .map(|inner| PyEventStream { inner, repr: None })
@@ -710,6 +738,7 @@ fn from_numpy(
         topic: None,
         max_events: None,
         offset: None,
+        keys: None,
     };
     let rows = numpy_rows(events, options.order)?;
     py.detach(|| load_rows(&rows, &options))
@@ -776,7 +805,7 @@ fn parse_dt_ms(dt_ms: Option<f64>) -> PyResult<Option<i64>> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0))]
+#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -791,6 +820,7 @@ fn open(
     topic: Option<String>,
     hot_pixel_filter: bool,
     hot_pixel_std: f64,
+    keys: Option<HashMap<String, String>>,
 ) -> PyResult<PyEventReader> {
     let mode = match (parse_dt_ms(dt_ms)?, max_events) {
         (Some(_), Some(_)) => {
@@ -818,6 +848,7 @@ fn open(
         topic,
         max_events: None,
         offset: None,
+        keys: parse_keys(keys)?,
     };
     let reader = py
         .detach(|| open_reader(path, options))
@@ -854,7 +885,7 @@ fn open(
         inner: Arc::new(Mutex::new(reader)),
         mode,
         repr,
-        slice_op: None,
+        slice_ops: no_slice_ops(),
         offset_us,
         base_index,
         hot_pixel_mask,
@@ -874,9 +905,10 @@ struct PyEventReader {
     /// Per-slice dense rendering set by `open(repr=…)` / `with_repr` — makes the reader a
     /// map-style dataset (`reader[i]` → `[C, H, W]`, `batch` → `[B, C, H, W]`).
     repr: Option<ReprSpec>,
-    /// Per-slice stream op set by `efast`/`harris_corners` — applied to every slice before any
-    /// `repr`, so corner detection composes with `slice`/`windows`/`with_repr`.
-    slice_op: Option<SliceOp>,
+    /// Deferred per-slice stream ops set by applying a stream op to the reader
+    /// (`reader.hot_pixel_filter()`, `efast`, …) — applied in order to every slice before any
+    /// `repr`, so they compose with `slice`/`windows`/`with_repr`.
+    slice_ops: SliceOps,
     /// `open(offset=…)`: the absolute framing origin (µs, the file's own time base). `slice(0)` /
     /// `windows()` / `n_slices` all start here (clamped up to `t_min`); events before it are
     /// outside every indexed frame. `None` frames the whole recording from `t_min`.
@@ -891,29 +923,22 @@ struct PyEventReader {
     hot_pixel_mask: Option<Arc<[bool]>>,
 }
 
-/// A per-slice `EventStream` → `EventStream` operation a reader carries (Phase 5 corner
-/// detectors). Applied off-GIL to each fetched slice.
-#[derive(Clone, Copy)]
-enum SliceOp {
-    Efast,
-    Harris { threshold: f64 },
+/// A per-slice `EventStream` → `EventStream` transform a reader defers onto every fetched
+/// slice — the machinery behind `reader.hot_pixel_filter()`, `reader.flip_x()`, `efast`, … .
+/// Boxed so any stream op composes, and `Send + Sync` so it runs off-GIL in `py.detach`.
+type SliceOp = Arc<dyn Fn(EventStream) -> EventStream + Send + Sync>;
+
+/// A reader's chain of deferred per-slice ops (empty = none), applied in push order.
+type SliceOps = Arc<[SliceOp]>;
+
+/// The empty op chain (a reader with no deferred per-slice transforms).
+fn no_slice_ops() -> SliceOps {
+    Arc::from(Vec::new())
 }
 
-impl SliceOp {
-    fn apply(self, stream: &EventStream) -> EventStream {
-        match self {
-            Self::Efast => stream.efast(),
-            Self::Harris { threshold } => stream.harris_corners(threshold),
-        }
-    }
-}
-
-/// Applies a reader's per-slice op (if any) to a freshly fetched slice.
-fn apply_slice_op(op: Option<SliceOp>, stream: EventStream) -> EventStream {
-    match op {
-        Some(op) => op.apply(&stream),
-        None => stream,
-    }
+/// Applies a reader's deferred per-slice ops (in order) to a freshly fetched slice.
+fn apply_slice_ops(ops: &[SliceOp], stream: EventStream) -> EventStream {
+    ops.iter().fold(stream, |stream, op| op(stream))
 }
 
 /// How `slice(n)` / `reader[n]` / `windows()` partition the recording: fixed-duration
@@ -932,12 +957,12 @@ enum SliceWindow {
 }
 
 /// Reads `window` from the shared reader off-GIL, dropping the whole-recording hot pixels (if
-/// any) before the per-slice op, so corner detectors never fire on stuck pixels.
+/// any) before the deferred per-slice ops, so corner detectors never fire on stuck pixels.
 fn fetch_window(
     py: Python<'_>,
     reader: &Arc<Mutex<Reader>>,
     window: SliceWindow,
-    op: Option<SliceOp>,
+    ops: SliceOps,
     hot_pixel_mask: Option<Arc<[bool]>>,
 ) -> PyResult<EventStream> {
     let reader = Arc::clone(reader);
@@ -952,10 +977,40 @@ fn fetch_window(
                 Some(mask) => stream.drop_masked_pixels(mask),
                 None => stream,
             };
-            apply_slice_op(op, stream)
+            apply_slice_ops(&ops, stream)
         })
     })
     .map_err(map_io_error)
+}
+
+/// Wraps a freshly fetched slice for a public slice API. When the reader carries a
+/// representation (`open(repr=…)` / `with_repr`) the slice is rendered eagerly and returned as
+/// an `EventFrame` (so `open(repr="mcts").slice(0)` == the frame `open().slice(0).mcts()`
+/// yields); otherwise the raw `EventStream` is returned.
+fn render_slice(
+    py: Python<'_>,
+    repr: Option<ReprSpec>,
+    stream: EventStream,
+) -> PyResult<Py<PyAny>> {
+    match repr {
+        Some(spec) => {
+            let frame = py
+                .detach(|| spec.generate(&stream))
+                .map_err(map_representation_error)?;
+            Ok(Bound::new(py, PyEventFrame { inner: frame })?
+                .into_any()
+                .unbind())
+        }
+        None => Ok(Bound::new(
+            py,
+            PyEventStream {
+                inner: stream,
+                repr: None,
+            },
+        )?
+        .into_any()
+        .unbind()),
+    }
 }
 
 #[pymethods]
@@ -1030,12 +1085,13 @@ impl PyEventReader {
         self.offset_us.map(us_to_ms)
     }
 
-    /// One slice as an `EventStream`. With a positional index `n` (requires
-    /// `open(dt_ms=…)` or `open(max_events=…)`), returns the `n`-th fixed frame — the
-    /// `dt_ms`-long window `[t_min + n·dt, t_min + (n+1)·dt)`, or the `max_events`-sized
-    /// event chunk `[n·N, (n+1)·N)`; negative `n` counts from the end. Otherwise returns
-    /// the half-open time window `[t0_ms, t1_ms)`, with omitted bounds extending to the
-    /// recording's start / end.
+    /// One slice. With a positional index `n` (requires `open(dt_ms=…)` or
+    /// `open(max_events=…)`), returns the `n`-th fixed frame — the `dt_ms`-long window
+    /// `[t_min + n·dt, t_min + (n+1)·dt)`, or the `max_events`-sized event chunk
+    /// `[n·N, (n+1)·N)`; negative `n` counts from the end. Otherwise returns the half-open
+    /// time window `[t0_ms, t1_ms)`, with omitted bounds extending to the recording's start /
+    /// end. When the reader carries a representation (`open(repr=…)` / `with_repr`) the slice
+    /// is rendered to that `EventFrame`; otherwise it is a raw `EventStream`.
     #[pyo3(signature = (index=None, *, t0_ms=None, t1_ms=None))]
     fn slice(
         &self,
@@ -1043,7 +1099,7 @@ impl PyEventReader {
         index: Option<i64>,
         t0_ms: Option<f64>,
         t1_ms: Option<f64>,
-    ) -> PyResult<PyEventStream> {
+    ) -> PyResult<Py<PyAny>> {
         let window = if let Some(index) = index {
             if t0_ms.is_some() || t1_ms.is_some() {
                 return Err(PyValueError::new_err(
@@ -1058,7 +1114,7 @@ impl PyEventReader {
                 t1_ms.map_or(hi.saturating_add(1), ms_to_us), // +1 keeps the last event
             )
         };
-        self.fetch(py, window)
+        self.fetch_slice(py, window)
     }
 
     /// `reader[n]` — the `n`-th fixed frame (requires `open(dt_ms=…)` or
@@ -1107,29 +1163,155 @@ impl PyEventReader {
             inner: Arc::clone(&self.inner),
             mode: self.mode,
             repr: Some(spec),
-            slice_op: self.slice_op,
+            slice_ops: self.slice_ops.clone(),
             offset_us: self.offset_us,
             base_index: self.base_index,
             hot_pixel_mask: self.hot_pixel_mask.clone(),
         })
     }
 
-    // ---- Per-slice feature detection (Phase 5). Each returns a new reader that applies the
-    // corner detector to every slice, so it composes with slice/windows/with_repr/batch:
-    //   corners = reader.efast()          # reader whose slices are corner sub-streams
-    //   corners.slice(500).count()        # corner count image for frame 500
-    //   corners.with_repr("count")[500]   # same, as a dense [C, H, W] array
+    // ---- Deferred per-slice stream ops. Each returns a new reader that applies the matching
+    // `EventStream` op to every slice (in chain order, before any `repr`), so a stream op used
+    // on a reader stays lazy and composes with slice/windows/with_repr/batch:
+    //   filtered = reader.hot_pixel_filter()   # reader whose slices drop hot pixels
+    //   filtered.slice(500).count()            # count image for frame 500, hot pixels removed
+    //   reader.flip_x().efast().with_repr("count")[500]   # chained, as a dense [C, H, W] array
+    // These mirror the identically named `EventStream` methods 1:1 (see that block for details).
+
+    /// Crops each slice to the `w`×`h` window at `(x0, y0)` (see [`EventStream::crop`]).
+    fn crop(&self, x0: i64, y0: i64, w: usize, h: usize) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.crop(x0, y0, w, h)))
+    }
+
+    /// Mirrors each slice horizontally.
+    fn flip_x(&self) -> PyEventReader {
+        self.with_slice_op(Arc::new(|s: EventStream| s.flip_x()))
+    }
+
+    /// Mirrors each slice vertically.
+    fn flip_y(&self) -> PyEventReader {
+        self.with_slice_op(Arc::new(|s: EventStream| s.flip_y()))
+    }
+
+    /// Rotates each slice by `k * 90°` clockwise.
+    fn rotate90(&self, k: i32) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.rotate90(k)))
+    }
+
+    /// Reflects each slice across the main diagonal.
+    fn transpose(&self) -> PyEventReader {
+        self.with_slice_op(Arc::new(|s: EventStream| s.transpose()))
+    }
+
+    /// Translates each slice by `(dx, dy)`.
+    fn translate(&self, dx: i64, dy: i64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.translate(dx, dy)))
+    }
+
+    /// Event-domain resize of each slice to a `width`×`height` grid.
+    fn resize(&self, width: usize, height: usize) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.resize(width, height)))
+    }
+
+    /// Scales each slice's sensor by `(sx, sy)`.
+    fn scale(&self, sx: f64, sy: f64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.scale(sx, sy)))
+    }
+
+    /// Applies a 2×3 affine matrix to each slice.
+    fn warp_affine(&self, matrix: [[f64; 3]; 2]) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.warp_affine(matrix)))
+    }
+
+    /// Applies a 3×3 perspective matrix to each slice.
+    fn warp_perspective(&self, matrix: [[f64; 3]; 3]) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.warp_perspective(matrix)))
+    }
+
+    /// Undistorts each slice with a `Camera`'s intrinsics + distortion.
+    fn undistort(&self, camera: PyRef<'_, PyCamera>) -> PyEventReader {
+        let camera = camera.inner;
+        self.with_slice_op(Arc::new(move |s: EventStream| s.undistort(&camera)))
+    }
+
+    /// Keeps events where the `(H, W)` boolean mask is `True`, per slice.
+    fn mask(&self, mask: PyReadonlyArray2<bool>) -> PyEventReader {
+        let view = mask.as_array();
+        let (h, w) = (view.shape()[0], view.shape()[1]);
+        let flat: Vec<bool> = view.iter().copied().collect();
+        self.with_slice_op(Arc::new(move |s: EventStream| s.mask(&flat, w, h)))
+    }
+
+    /// Keeps each slice's events whose timestamp lies in `[t0, t1)` (microseconds).
+    fn time_window(&self, t0: i64, t1: i64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.time_window(t0, t1)))
+    }
+
+    /// Shifts each slice's timestamps by `dt` microseconds.
+    fn time_shift(&self, dt: i64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.time_shift(dt)))
+    }
+
+    /// Scales each slice's timestamps by `factor`.
+    fn time_scale(&self, factor: f64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.time_scale(factor)))
+    }
+
+    /// Shifts each slice's timestamps so its earliest event starts at zero.
+    fn normalize_time(&self) -> PyEventReader {
+        self.with_slice_op(Arc::new(|s: EventStream| s.normalize_time()))
+    }
+
+    /// Keeps every `k`-th event of each slice.
+    fn decimate(&self, k: usize) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.decimate(k)))
+    }
+
+    /// Keeps only events of the given polarity per slice (nonzero / `True` = ON).
+    fn filter_polarity(&self, polarity: i64) -> PyEventReader {
+        let polarity = polarity != 0;
+        self.with_slice_op(Arc::new(move |s: EventStream| s.filter_polarity(polarity)))
+    }
+
+    /// Flips every event's polarity, per slice.
+    fn invert_polarity(&self) -> PyEventReader {
+        self.with_slice_op(Arc::new(|s: EventStream| s.invert_polarity()))
+    }
+
+    /// Reorders each slice by ascending timestamp (stable).
+    fn sort_by_time(&self) -> PyEventReader {
+        self.with_slice_op(Arc::new(|s: EventStream| s.sort_by_time()))
+    }
+
+    /// Background-activity (nearest-neighbour) noise filter, per slice.
+    fn background_activity_filter(&self, dt: i64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| {
+            s.background_activity_filter(dt)
+        }))
+    }
+
+    /// Refractory-period filter, per slice.
+    fn refractory_filter(&self, dt: i64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.refractory_filter(dt)))
+    }
+
+    /// Hot-pixel removal applied to each slice (per-slice statistics; distinct from
+    /// `open(hot_pixel_filter=True)`, which computes one mask over the whole recording).
+    #[pyo3(signature = (n_std=3.0))]
+    fn hot_pixel_filter(&self, n_std: f64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |s: EventStream| s.hot_pixel_filter(n_std)))
+    }
 
     /// Returns a new reader whose every slice is passed through [`EventStream::efast`], so the
     /// reader yields corner sub-streams (chain `.count()` / `with_repr` to visualise them).
     fn efast(&self) -> PyEventReader {
-        self.with_slice_op(SliceOp::Efast)
+        self.with_slice_op(Arc::new(|s: EventStream| s.efast()))
     }
 
     /// Returns a new reader whose every slice is passed through [`EventStream::harris_corners`].
     #[pyo3(signature = (threshold=0.0))]
     fn harris_corners(&self, threshold: f64) -> PyEventReader {
-        self.with_slice_op(SliceOp::Harris { threshold })
+        self.with_slice_op(Arc::new(move |s: EventStream| s.harris_corners(threshold)))
     }
 
     /// Renders slice `indices` into one dense `[B, C, H, W]` array — the explicit-batch path
@@ -1148,7 +1330,7 @@ impl PyEventReader {
                 py,
                 &self.inner,
                 window,
-                self.slice_op,
+                self.slice_ops.clone(),
                 self.hot_pixel_mask.clone(),
             )?;
             let frame = py
@@ -1171,14 +1353,16 @@ impl PyEventReader {
         stack_frames(py, &frames, template)
     }
 
-    /// Events whose index lies in `[i0, i1)` (clamped to the file).
+    /// Events whose index lies in `[i0, i1)` (clamped to the file). Rendered to the reader's
+    /// `EventFrame` when a representation is set (`open(repr=…)` / `with_repr`), else a raw
+    /// `EventStream`.
     #[pyo3(signature = (i0, i1))]
-    fn slice_count(&self, py: Python<'_>, i0: i64, i1: i64) -> PyResult<PyEventStream> {
+    fn slice_count(&self, py: Python<'_>, i0: i64, i1: i64) -> PyResult<Py<PyAny>> {
         let i0 =
             usize::try_from(i0).map_err(|_| PyValueError::new_err("i0 must be non-negative"))?;
         let i1 =
             usize::try_from(i1).map_err(|_| PyValueError::new_err("i1 must be non-negative"))?;
-        self.fetch(py, SliceWindow::Index(i0, i1))
+        self.fetch_slice(py, SliceWindow::Index(i0, i1))
     }
 
     /// Lazy iterator of consecutive windows: each is `[start, start + span_ms)` and
@@ -1186,7 +1370,8 @@ impl PyEventReader {
     /// (so `windows()` walks every `slice(n)`), and `span_ms` defaults to `step_ms`
     /// (non-overlapping). For a `max_events` reader, `windows()` without arguments walks
     /// the fixed-count slices instead. Streams a multi-GB file window-by-window without
-    /// loading it.
+    /// loading it. Each item is a rendered `EventFrame` when the reader carries a
+    /// representation (`open(repr=…)` / `with_repr`), else a raw `EventStream`.
     #[pyo3(signature = (*, step_ms=None, span_ms=None))]
     fn windows(&self, step_ms: Option<f64>, span_ms: Option<f64>) -> PyResult<PyWindowIterator> {
         let guard = self.inner.lock().unwrap();
@@ -1234,33 +1419,54 @@ impl PyEventReader {
     /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
     /// applying the per-slice op (e.g. `efast`) if one is set.
     fn fetch(&self, py: Python<'_>, window: SliceWindow) -> PyResult<PyEventStream> {
-        fetch_window(py, &self.inner, window, self.slice_op, self.hot_pixel_mask.clone()).map(
-            |inner| PyEventStream {
-                inner,
-                repr: self.repr,
-            },
+        fetch_window(
+            py,
+            &self.inner,
+            window,
+            self.slice_ops.clone(),
+            self.hot_pixel_mask.clone(),
         )
+        .map(|inner| PyEventStream {
+            inner,
+            repr: self.repr,
+        })
     }
 
-    /// A new reader over the same file (and mode/`repr`) that applies `op` to every slice.
+    /// Reads `window` and wraps it for a public slice API: rendered to the reader's
+    /// `EventFrame` when a representation is set, else the raw `EventStream`.
+    fn fetch_slice(&self, py: Python<'_>, window: SliceWindow) -> PyResult<Py<PyAny>> {
+        let stream = fetch_window(
+            py,
+            &self.inner,
+            window,
+            self.slice_ops.clone(),
+            self.hot_pixel_mask.clone(),
+        )?;
+        render_slice(py, self.repr, stream)
+    }
+
+    /// A new reader over the same file (and mode/`repr`) that applies `op` to every slice after
+    /// this reader's existing deferred ops (so stream ops chain, e.g. `flip_x().hot_pixel_filter()`).
     fn with_slice_op(&self, op: SliceOp) -> PyEventReader {
+        let mut ops = self.slice_ops.to_vec();
+        ops.push(op);
         PyEventReader {
             inner: Arc::clone(&self.inner),
             mode: self.mode,
             repr: self.repr,
-            slice_op: Some(op),
+            slice_ops: Arc::from(ops),
             offset_us: self.offset_us,
             base_index: self.base_index,
             hot_pixel_mask: self.hot_pixel_mask.clone(),
         }
     }
 
-    /// An iterator over this reader's file starting at `cursor` (shares op/repr).
+    /// An iterator over this reader's file starting at `cursor` (shares ops/repr).
     fn window_iterator(&self, cursor: WindowCursor) -> PyWindowIterator {
         PyWindowIterator {
             reader: Arc::clone(&self.inner),
             cursor,
-            slice_op: self.slice_op,
+            slice_ops: self.slice_ops.clone(),
             repr: self.repr,
             hot_pixel_mask: self.hot_pixel_mask.clone(),
         }
@@ -1333,9 +1539,9 @@ impl PyEventReader {
 struct PyWindowIterator {
     reader: Arc<Mutex<Reader>>,
     cursor: WindowCursor,
-    slice_op: Option<SliceOp>,
-    /// The reader's stored representation, carried onto each yielded window (so `open(repr=…)`
-    /// survives `for w in reader.windows(): w.view()`).
+    slice_ops: SliceOps,
+    /// The reader's stored representation. When set (`open(repr=…)` / `with_repr`) each yielded
+    /// window is rendered to that `EventFrame`; otherwise a raw `EventStream` is yielded.
     repr: Option<ReprSpec>,
     /// The reader's whole-recording hot-pixel mask, applied to each yielded window.
     hot_pixel_mask: Option<Arc<[bool]>>,
@@ -1392,7 +1598,7 @@ impl PyWindowIterator {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyEventStream>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let Some(window) = self.cursor.advance() else {
             return Ok(None);
         };
@@ -1400,13 +1606,10 @@ impl PyWindowIterator {
             py,
             &self.reader,
             window,
-            self.slice_op,
+            self.slice_ops.clone(),
             self.hot_pixel_mask.clone(),
         )?;
-        Ok(Some(PyEventStream {
-            inner: stream,
-            repr: self.repr,
-        }))
+        render_slice(py, self.repr, stream).map(Some)
     }
 }
 

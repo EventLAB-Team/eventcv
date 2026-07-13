@@ -20,6 +20,7 @@ def load(
     topic: str | None = None,
     max_events: int | None = None,
     offset: float | None = None,
+    keys: dict[str, str] | None = None,
 ) -> EventStream:
     """Load events from any supported file, detected by its extension.
 
@@ -32,13 +33,25 @@ def load(
     from the timestamps (a fractional text value means seconds) and the resolution
     from the coordinate range. Passing ``sensor_size`` for HDF5 also skips that scan.
     ``time_unit`` is ``seconds``/``milliseconds``/``microseconds``/``nanoseconds`` (or
-    ``auto``); ``order`` (``txyp``/``xytp``) applies to text. ``topic`` selects the
+    ``auto``); ``order`` (``txyp``/``xytp``) applies to headerless text. ``topic`` selects the
     rosbag topic (default ``/davis/left/events``). ``offset`` is an **absolute timestamp
     in milliseconds** (the file's own time base — the same base as ``stream.numpy()[:, 2]``
     scaled to ms): events before it are skipped, and ``max_events`` then caps how many are
     kept *after* it — together they read a window, handy for previewing a slice of a very
     large file. For a recording whose timestamps are epoch-based, pass the epoch time in ms
     (e.g. ``offset=1_587_540_271_650``); ``<= 0`` reads from the start.
+
+    **The x/y/t/p columns are found automatically**, whatever they're named or nested:
+    an HDF5 file's datasets are searched recursively and matched by synonym (``x``,
+    ``x_coordinates``, ``u``, …; ``t``/``timestamp``/``timestamps``; ``polarity``/``pol``;
+    etc.), and a single compound/structured dataset with those fields is read too — so the
+    common ROS ``dvs_msgs`` layout (``events/{x_coordinates, y_coordinates, timestamps,
+    polarities}``) just works. A ``.csv``/``.txt`` file with a header row is mapped by its
+    column names (comma **or** whitespace separated). When detection can't identify the
+    columns it raises, listing what the file contains. Pass ``keys`` to name them explicitly:
+    ``keys={"x": …, "y": …, "t": …, "p": …}`` — for HDF5 each value is a dataset path (or
+    ``dataset/field`` to pick a compound field); for text a header name or 0-based column
+    index. ``keys`` overrides auto-detection (and ``order``).
     """
     return _rust.load(
         path,
@@ -48,6 +61,7 @@ def load(
         topic=topic,
         max_events=max_events,
         offset=offset,
+        keys=keys,
     )
 
 
@@ -100,6 +114,7 @@ def open(
     topic: str | None = None,
     hot_pixel_filter: bool = False,
     hot_pixel_std: float = 3.0,
+    keys: dict[str, str] | None = None,
 ) -> EventReader:
     """Open a file for lazy slicing without loading it whole.
 
@@ -132,6 +147,12 @@ def open(
     :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
     ``sensor_size`` to skip the one-time coordinate scan resolution inference needs.
 
+    The x/y/t/p columns are **found automatically** whatever their names or nesting (HDF5
+    synonym/recursive/compound detection; text header rows), exactly as in :func:`load`.
+    Pass ``keys={"x": …, "y": …, "t": …, "p": …}`` to name them explicitly when a file's
+    layout can't be guessed (HDF5 dataset paths or ``dataset/field``; text header names or
+    0-based indices).
+
     Pass ``hot_pixel_filter=True`` to strip *stuck* pixels consistently across the whole
     recording. ``open`` scans the file once up front, flags every pixel whose event count exceeds
     ``mean + hot_pixel_std·std`` (over the active pixels), and drops those pixels from every slice
@@ -158,9 +179,12 @@ def open(
     ``slice``/``windows``/``with_repr``. To render an algorithm as a video, map it over
     ``windows()`` and hand the frames to :func:`export_png` (then assemble with ffmpeg).
 
-    Note ``repr`` governs the **array/dataset** path (``reader[i]`` → NumPy). To *view* a slice
-    interactively, ``slice(i)`` returns the raw :class:`EventStream`, so name the representation
-    on the stream: ``data.slice(1000).view("flow")`` (or ``.slice(1000).optical_flow().view()``).
+    When ``repr`` is set, ``slice``/``slice_count``/``windows`` also apply it: each returns the
+    rendered :class:`EventFrame` (the rich object — ``.numpy()``, ``.view()``, ``.save()``),
+    while ``reader[i]``/``batch`` stay dense NumPy arrays for the ``DataLoader`` path. So
+    ``open(path, repr="mcts").slice(0)`` equals ``open(path).slice(0).mcts()``. Without ``repr``,
+    ``slice(i)`` returns the raw :class:`EventStream`, so name the representation on the stream:
+    ``data.slice(1000).view("flow")`` (or ``.slice(1000).optical_flow().view()``).
 
     Example::
 
@@ -192,6 +216,7 @@ def open(
         topic=topic,
         hot_pixel_filter=hot_pixel_filter,
         hot_pixel_std=hot_pixel_std,
+        keys=keys,
     )
 
 
@@ -340,21 +365,31 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Functional (OpenCV-style) call API — §D1.
 #
-# Every op that exists as a *method* on a stream or frame is also exposed here as a
-# free function taking the object as its first argument, so ``ecv.flip_x(stream)`` reads
-# like ``cv2.resize(img, …)`` and mirrors ``stream.flip_x()`` exactly. The methods stay
-# the single source of truth; these forwarders are generated by introspection so they can
-# never drift from the Rust definitions. Names already curated above (``save``, ``load``,
-# the classes, …) and read-only properties (``sensor_size``, ``shape``, …) are skipped.
+# Every op that exists as a *method* on a stream, frame, reader, point set, or camera is also
+# exposed here as a free function taking the object as its first argument, so ``ecv.flip_x(x)``
+# reads like ``cv2.resize(img, …)`` and mirrors ``x.flip_x()`` exactly. A stream op applied to an
+# ``EventReader`` (e.g. ``ecv.hot_pixel_filter(reader)``) forwards to the reader's own method,
+# which defers it lazily onto every slice. The methods stay the single source of truth; these
+# forwarders are generated by introspection so they can never drift from the Rust definitions.
+# Names already curated above (``save``, ``load``, the classes, …) and read-only properties
+# (``sensor_size``, ``shape``, …) are skipped.
 # ---------------------------------------------------------------------------
+
+# Every compiled type whose public methods get a free-function form.
+_OP_CLASSES = (EventStream, EventFrame, EventReader, EventPointSet, Camera)
 
 
 def _make_op(name: str):
     def _op(obj, *args, **kwargs):
         return getattr(obj, name)(*args, **kwargs)
 
-    doc = getattr(getattr(EventStream, name, None), "__doc__", None) or getattr(
-        getattr(EventFrame, name, None), "__doc__", None
+    doc = next(
+        (
+            getattr(getattr(cls, name, None), "__doc__", None)
+            for cls in _OP_CLASSES
+            if getattr(getattr(cls, name, None), "__doc__", None)
+        ),
+        None,
     )
     summary = doc.strip().splitlines()[0] if doc else f"Calls ``obj.{name}(...)``."
     _op.__name__ = name
@@ -366,7 +401,7 @@ def _make_op(name: str):
 _op_names = sorted(
     {
         name
-        for cls in (EventStream, EventFrame)
+        for cls in _OP_CLASSES
         for name in dir(cls)
         if not name.startswith("_")
         and callable(getattr(cls, name))

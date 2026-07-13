@@ -379,18 +379,26 @@ class DatasetReaderTests(unittest.TestCase):
         self.assertEqual(reader[0].shape, (5, 8, 8))
         self.assertEqual(reader[0].dtype, np.float32)
 
-    def test_slice_carries_open_repr(self):
-        # A slice from a reader opened with a representation remembers it, so `view()`/
-        # `flatten()` render that repr instead of the default polarity image.
+    def test_slice_renders_open_repr(self):
+        # A reader opened with a representation is a frame source: slice()/slice_count()/
+        # windows() render each slice to that EventFrame instead of returning a raw stream.
         reader = self._dataset(repr="voxel")
-        stream = reader.slice(0)
-        self.assertIsInstance(stream, eventcv.EventStream)
-        self.assertEqual(stream.repr, "voxel")
-        self.assertEqual(stream.flatten().kind, "voxel")  # no explicit repr -> the stored one
-        # Transforms and windows keep it; an explicit argument still overrides it.
-        self.assertEqual(stream.flip_x().repr, "voxel")
-        self.assertEqual(next(reader.windows()).repr, "voxel")
-        self.assertEqual(stream.flatten("count").kind, "count")
+        frame = reader.slice(0)
+        self.assertIsInstance(frame, eventcv.EventFrame)
+        self.assertEqual(frame.kind, "voxel")
+        self.assertEqual(reader.slice_count(0, 4).kind, "voxel")
+        self.assertEqual(next(reader.windows()).kind, "voxel")
+
+    def test_slice_render_matches_manual_repr(self):
+        # open(repr=…).slice(n) == open().slice(n).<repr>()  (the reported bug): opening
+        # with a representation auto-applies it to each slice.
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n20 2 2 1\n30 3 3 0\n")
+        kwargs = dict(dt_ms=0.01, sensor_size=(8, 8), time_unit="us")
+        auto = eventcv.open(str(path), repr="count", **kwargs).slice(0)
+        manual = eventcv.open(str(path), **kwargs).slice(0).count()
+        self.assertEqual(auto.kind, manual.kind)
+        np.testing.assert_array_equal(auto.numpy(), manual.numpy())
 
     def test_slice_has_no_repr_without_open_repr(self):
         path = Path(tempfile.mkdtemp()) / "events.txt"
@@ -458,8 +466,8 @@ class DatasetReaderTests(unittest.TestCase):
         self.assertEqual(reader[0].shape, (1, 8, 8))
         self.assertEqual(int(reader[0].sum()), 2)  # raw counts: 2 events per slice
         self.assertEqual(reader.batch([0, 1]).shape, (2, 1, 8, 8))
-        stream = reader.slice(1)
-        self.assertEqual(stream.repr, "count")  # open(repr=…) survives count slicing
+        frame = reader.slice(1)
+        self.assertEqual(frame.kind, "count")  # open(repr=…) renders count slices
 
     def test_open_rejects_dt_ms_with_max_events(self):
         path = Path(tempfile.mkdtemp()) / "events.txt"

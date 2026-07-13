@@ -86,6 +86,92 @@ pub struct LoadOptions {
     /// Absolute timestamp (µs, the file's own time base): events before it are skipped.
     /// `max_events` then caps the events *after* the offset. `None`/`<= 0` reads from the start.
     pub offset: Option<i64>,
+    /// Explicit x/y/t/p column names, overriding auto-detection when a file's layout can't
+    /// be guessed. For HDF5 each value is a dataset path (a compound field is `dataset/field`);
+    /// for text/CSV a header column name or 0-based index. `None` auto-detects. Readers that
+    /// don't need it (rosbag, aedat, dat) ignore it.
+    pub keys: Option<EventKeys>,
+}
+
+/// User-supplied names for the four event columns, the escape hatch when auto-detection
+/// can't identify them. Interpreted per format (HDF5 dataset paths, text header
+/// names/indices); see [`LoadOptions::keys`].
+#[derive(Clone, Debug)]
+pub struct EventKeys {
+    pub x: String,
+    pub y: String,
+    pub t: String,
+    pub p: String,
+}
+
+/// Column index of each event field in the `[x, y, t, p]` ordering the readers share.
+pub(crate) const X: usize = 0;
+pub(crate) const Y: usize = 1;
+pub(crate) const T: usize = 2;
+pub(crate) const P: usize = 3;
+
+/// Case-insensitive name synonyms for each event field, used by the HDF5 and text readers
+/// to identify x/y/t/p under varied headings (dataset names, CSV headers). Order within a
+/// list is the tie-break preference — earlier is more canonical.
+pub(crate) const ROLE_KEYS: [&[&str]; 4] = [
+    &[
+        "x",
+        "xs",
+        "x_coordinate",
+        "x_coordinates",
+        "u",
+        "col",
+        "cols",
+        "column",
+        "columns",
+    ],
+    &[
+        "y",
+        "ys",
+        "y_coordinate",
+        "y_coordinates",
+        "v",
+        "row",
+        "rows",
+    ],
+    &[
+        "t",
+        "ts",
+        "time",
+        "times",
+        "timestamp",
+        "timestamps",
+        "time_stamp",
+    ],
+    &[
+        "p",
+        "ps",
+        "pol",
+        "pols",
+        "polarity",
+        "polarities",
+        "polarity_bit",
+        "polarity_bits",
+        "sign",
+    ],
+];
+
+/// The event field (`X`/`Y`/`T`/`P`) a column or dataset base name denotes, matched
+/// case-insensitively against [`ROLE_KEYS`]; `None` if it matches none. The synonym lists
+/// are disjoint, so at most one role matches.
+pub(crate) fn role_of(name: &str) -> Option<usize> {
+    let lower = name.to_ascii_lowercase();
+    ROLE_KEYS
+        .iter()
+        .position(|keys| keys.contains(&lower.as_str()))
+}
+
+/// Rank of `name` within `role`'s synonym list (lower = more canonical), used to choose
+/// between several names in one group that map to the same role; `None` if it isn't one.
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+pub(crate) fn role_rank(role: usize, name: &str) -> Option<usize> {
+    let lower = name.to_ascii_lowercase();
+    ROLE_KEYS[role].iter().position(|key| *key == lower)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
