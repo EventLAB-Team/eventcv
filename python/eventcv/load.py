@@ -224,6 +224,87 @@ def open(
 # includes HDF5 support; published wheels do, but keep the import resilient otherwise.
 FrameSink = getattr(_rust, "FrameSink", None)
 
+# `EventCamera` and the live-streaming functions are only built when the extension includes
+# USB camera support (the published wheels do); keep imports resilient otherwise.
+EventCamera = getattr(_rust, "EventCamera", None)
+
+_NO_CAMERA = (
+    "eventcv was built without USB camera support. Install a build with the `camera` feature "
+    "(the published wheels include it)."
+)
+
+
+def list_cameras() -> list[dict]:
+    """List every connected, supported USB event camera.
+
+    Returns one dict per device with keys ``kind`` (machine name, e.g. ``"prophesee_evk4"``),
+    ``name`` (model), ``serial``, ``bus``, ``address``, and ``speed``. A device's ``serial`` can
+    be passed to :func:`stream` to select it when several are attached; an empty list means no
+    supported camera was found.
+
+    On Linux, accessing the device needs udev rules — if a camera is plugged in but not listed,
+    install them (see the neuromorphic-drivers README) and re-plug.
+    """
+    if not hasattr(_rust, "list_cameras"):
+        raise RuntimeError(_NO_CAMERA)
+    return _rust.list_cameras()
+
+
+def stream(
+    serial: str | None = None,
+    *,
+    dt_ms: float | None = None,
+    max_events: int | None = None,
+    repr: str | None = None,
+    decay_ms: float = 30.0,
+) -> EventCamera:
+    """Open a live USB event camera — the streaming twin of :func:`open`.
+
+    Where :func:`open` turns a *file* into sliceable :class:`EventReader` windows, ``stream`` turns
+    a *camera* into a live :class:`EventCamera` that yields the very same :class:`EventStream`
+    windows — so every representation, transform, feature detector, and viewer in eventcv composes
+    on a live feed exactly as it does on a recording.
+
+    ``serial`` selects a specific device (from :func:`list_cameras`); ``None`` opens the first found.
+    Windowing mirrors :func:`open`: pass ``dt_ms`` for fixed-duration windows **or** ``max_events``
+    for a fixed event count (mutually exclusive; default ``dt_ms=30``). Only non-empty windows are
+    yielded, so a loop never spins on idle time.
+
+    Pass ``repr`` (a representation name — ``"count"``, ``"voxel"``, ``"tencode"``, …) to make
+    iteration yield rendered :class:`EventFrame` s instead of raw streams, mirroring
+    ``open(repr=…)``. ``decay_ms`` sets the fade time constant of the raw :meth:`EventCamera.show`
+    view.
+
+    The returned camera is a context manager and an iterator::
+
+        # Live raw event view (the default) — polarity dots with exponential decay:
+        eventcv.stream().show()
+
+        # Live representation view:
+        eventcv.stream(dt_ms=30).show("count")
+
+        # Iterate windows and run any eventcv op on the live feed:
+        with eventcv.stream(dt_ms=30) as cam:
+            for events in cam:              # each `events` is a 30 ms EventStream
+                corners = events.efast()
+                if done:
+                    break
+
+        # Record to a file (format by extension), stopping after 10 s or on Ctrl+C:
+        eventcv.stream().record("session.h5", seconds=10)
+
+    Requires a build with camera support and, on Linux, udev rules for USB access.
+    """
+    if not hasattr(_rust, "stream"):
+        raise RuntimeError(_NO_CAMERA)
+    return _rust.stream(
+        serial,
+        dt_ms=dt_ms,
+        max_events=max_events,
+        repr=repr,
+        decay_ms=decay_ms,
+    )
+
 
 def save(obj, path: str, *, topic: str | None = None) -> None:
     """Save an :class:`EventStream`, :class:`EventFrame`, or :class:`FEAST` model to ``path``.
@@ -344,6 +425,7 @@ def collate(batch):
 
 __all__ = [
     "Camera",
+    "EventCamera",
     "EventFrame",
     "EventPointSet",
     "EventReader",
@@ -354,11 +436,13 @@ __all__ = [
     "collate",
     "export_png",
     "from_numpy",
+    "list_cameras",
     "load",
     "load_feast",
     "load_frame",
     "open",
     "save",
+    "stream",
 ]
 
 

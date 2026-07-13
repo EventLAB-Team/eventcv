@@ -53,8 +53,9 @@ bindings = "pyo3"
 manifest-path = "crates/eventcv-py/Cargo.toml"
 python-source = "python"
 module-name = "eventcv._rust"
-# Compile HDF5 reading into every wheel.
-features = ["hdf5"]
+# Compile HDF5 reading and USB event-camera streaming into every wheel. `camera` pulls in the
+# neuromorphic-drivers crate + a vendored libusb (built from source, no system libusb at runtime).
+features = ["hdf5", "camera"]
 # Keep the docs source, fixtures, and dev-only files out of the sdist (the wheel already
 # only contains `python/eventcv/` + the compiled extension). Docs are hosted on Read the
 # Docs, so shipping them to PyPI would only bloat the download.

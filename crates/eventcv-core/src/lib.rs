@@ -17,14 +17,18 @@
 //! - [`features`], [`flow`], [`cluster`] — corner detection, optical flow, connected components.
 //! - [`feast`] — unsupervised online feature learning (FEAST adaptive-threshold clustering).
 //! - [`filter`], [`image`], [`viz`] — hot-pixel filtering, frame-domain resize, colormapped export.
+//! - `device` — live USB event-camera capture into [`EventStream`] windows (`camera` feature).
 //!
 //! The `hdf5` feature (off by default to keep `cargo test` fast) enables the `.h5`/`.hdf5`
-//! reader by building libhdf5 from source.
+//! reader by building libhdf5 from source. The `camera` feature (also off by default) enables the
+//! `device` module, pulling in the `neuromorphic-drivers` crate and a vendored libusb.
 
 use ndarray::Array2;
 
 pub mod camera;
 pub mod cluster;
+#[cfg(feature = "camera")]
+pub mod device;
 pub mod feast;
 pub mod features;
 pub mod filter;

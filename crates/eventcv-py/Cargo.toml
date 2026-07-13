@@ -22,3 +22,6 @@ bytemuck = { version = "1", features = ["derive"] }
 # Build `.h5`/`.hdf5` support into the extension (forwards to eventcv-core, which
 # builds libhdf5 from source — needs cmake). Enable with `maturin develop --features hdf5`.
 hdf5 = ["eventcv-core/hdf5"]
+# Build USB event-camera streaming into the extension (forwards to eventcv-core, which pulls in
+# the neuromorphic-drivers crate + a vendored libusb). Enable with `maturin develop --features camera`.
+camera = ["eventcv-core/camera"]

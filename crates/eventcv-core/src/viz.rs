@@ -5,6 +5,7 @@
 //! encoding) and Flow (Middlebury colour coding — direction → hue, speed → saturation).
 
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
+use crate::EventStream;
 
 /// A packed 8-bit RGB image (`pixels.len() == width * height * 3`, row-major).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,9 +366,127 @@ const TURBO: [[u8; 3]; 11] = [
     [122, 4, 3],
 ];
 
+// Polarity colours for the raw event view — the warm/cool pair the interactive viewer uses
+// (positive → warm red, negative → cool blue). Kept in sync with the viewer's cloud colours.
+const RAW_POSITIVE: [u8; 3] = [0xff, 0x49, 0x6c];
+const RAW_NEGATIVE: [u8; 3] = [0x27, 0xc2, 0xff];
+
+/// A persistent polarity "event image" with exponential time decay — the canonical live event-
+/// camera view. Each event lights its pixel to full intensity in its polarity colour; the intensity
+/// then fades with a time constant so moving edges leave glowing trails rather than a hard frame.
+///
+/// Feed it successive [`EventStream`] windows with [`update`](Self::update) — live from a camera or
+/// sliced from a file — and read back an [`Rgb8Image`] each display frame with
+/// [`render`](Self::render). State persists across `update`s, so decay carries over window
+/// boundaries. Ages are measured in milliseconds via each stream's own timestamp scale, so the same
+/// `decay_ms` behaves identically whatever the source's time unit.
+#[derive(Clone, Debug)]
+pub struct RawSurface {
+    width: usize,
+    height: usize,
+    decay_ms: f64,
+    // Per-pixel time (ms) and polarity of the most recent event; `NEG_INFINITY` = never lit.
+    last_t_ms: Vec<f64>,
+    last_positive: Vec<bool>,
+    // Timestamp (ms) of the most recent event across the whole surface — the "now" decay measures
+    // ages from.
+    latest_ms: f64,
+}
+
+impl RawSurface {
+    /// Creates a black surface for a `width` × `height` sensor. `decay_ms` is the fade time
+    /// constant: a pixel dims to `1/e` of full brightness `decay_ms` after its last event.
+    pub fn new(width: usize, height: usize, decay_ms: f64) -> Self {
+        let pixels = width * height;
+        Self {
+            width,
+            height,
+            decay_ms: decay_ms.max(1e-6),
+            last_t_ms: vec![f64::NEG_INFINITY; pixels],
+            last_positive: vec![false; pixels],
+            latest_ms: 0.0,
+        }
+    }
+
+    /// Sensor dimensions `(width, height)`.
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// Stamps every event in `stream` onto the surface, keeping the most recent event per pixel.
+    /// Events outside the surface are ignored. Call repeatedly to build up a live view.
+    pub fn update(&mut self, stream: &EventStream) {
+        let scale = stream.timestamp_scale_ms();
+        let xs = stream.xs();
+        let ys = stream.ys();
+        let ts = stream.ts();
+        let ps = stream.ps();
+        for index in 0..xs.len() {
+            self.stamp(
+                xs[index] as usize,
+                ys[index] as usize,
+                ts[index] as f64 * scale,
+                ps[index],
+            );
+        }
+    }
+
+    /// Stamps a single event (time in **milliseconds**) onto the surface, keeping the most recent
+    /// event per pixel; out-of-bounds events are ignored. The per-event entry point for the live
+    /// viewer, which decodes straight from the camera; [`update`](Self::update) is the batch form.
+    pub fn stamp(&mut self, x: usize, y: usize, t_ms: f64, positive: bool) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let pixel = y * self.width + x;
+        // Keep the temporally-latest event per pixel even if events aren't perfectly ordered.
+        if t_ms >= self.last_t_ms[pixel] {
+            self.last_t_ms[pixel] = t_ms;
+            self.last_positive[pixel] = positive;
+        }
+        if t_ms > self.latest_ms {
+            self.latest_ms = t_ms;
+        }
+    }
+
+    /// Renders the current surface to an RGB image: each pixel is its polarity colour scaled by
+    /// `exp(-age / decay_ms)`, where `age` is the time since its last event. Never-lit pixels are
+    /// black.
+    pub fn render(&self) -> Rgb8Image {
+        let mut pixels = Vec::with_capacity(self.width * self.height * 3);
+        for index in 0..self.width * self.height {
+            let age = self.latest_ms - self.last_t_ms[index];
+            let intensity = (-age / self.decay_ms).exp(); // age = +inf (never lit) -> 0
+            let color = if self.last_positive[index] {
+                RAW_POSITIVE
+            } else {
+                RAW_NEGATIVE
+            };
+            for channel in color {
+                pixels.push((f64::from(channel) * intensity).round() as u8);
+            }
+        }
+        Rgb8Image {
+            width: self.width,
+            height: self.height,
+            pixels,
+        }
+    }
+}
+
+/// Renders a single [`EventStream`] to a raw polarity "event image" in one call — the offline twin
+/// of a live [`RawSurface`]. Decay is measured from the stream's latest event, so the newest events
+/// are brightest.
+pub fn render_raw(stream: &EventStream, decay_ms: f64) -> Rgb8Image {
+    let (width, height) = stream.sensor_size();
+    let mut surface = RawSurface::new(width, height, decay_ms);
+    surface.update(stream);
+    surface.render()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render_frame, Colormap, Rgb8Image};
+    use super::{render_frame, render_raw, Colormap, RawSurface, Rgb8Image};
     use crate::representation::{
         AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, Representation,
         RepresentationKind, Tencode,
@@ -378,6 +497,58 @@ mod tests {
     fn pixel(image: &Rgb8Image, x: usize, y: usize) -> [u8; 3] {
         let i = (y * image.width + x) * 3;
         [image.pixels[i], image.pixels[i + 1], image.pixels[i + 2]]
+    }
+
+    #[test]
+    fn raw_surface_colors_pixels_by_polarity() {
+        // A positive event at (0,0) and a negative at (1,0), same instant.
+        let stream = EventStream::from_array2(array![[0, 0, 10, 1], [1, 0, 10, 0]], 2, 1, 0.001);
+        let image = render_raw(&stream, 1000.0);
+
+        let [r0, _, b0] = pixel(&image, 0, 0);
+        let [r1, _, b1] = pixel(&image, 1, 0);
+        assert!(r0 > b0, "positive pixel is warm/red-dominant");
+        assert!(b1 > r1, "negative pixel is cool/blue-dominant");
+    }
+
+    #[test]
+    fn raw_surface_fades_older_events() {
+        // Two positive events 100 ms apart; the older (t=0) renders dimmer than the newest.
+        let stream =
+            EventStream::from_array2(array![[0, 0, 0, 1], [1, 0, 100_000, 1]], 2, 1, 0.001);
+        let image = render_raw(&stream, 50.0); // τ = 50 ms → older pixel is ~e^-2 of full
+
+        let old = pixel(&image, 0, 0)[0];
+        let new = pixel(&image, 1, 0)[0];
+        assert!(new > old, "newer event brighter than older");
+        assert!(old > 0, "older event still faintly visible");
+    }
+
+    #[test]
+    fn raw_surface_untouched_pixels_are_black() {
+        let stream = EventStream::from_array2(array![[0, 0, 10, 1]], 2, 1, 0.001);
+        let image = render_raw(&stream, 1000.0);
+
+        assert_eq!(pixel(&image, 1, 0), [0, 0, 0]);
+        assert_eq!((image.width, image.height), (2, 1));
+    }
+
+    #[test]
+    fn raw_surface_persists_across_updates() {
+        let (width, height) = (2, 1);
+        let mut surface = RawSurface::new(width, height, 50.0);
+        surface.update(&EventStream::from_array2(array![[0, 0, 0, 1]], width, height, 0.001));
+        surface.update(&EventStream::from_array2(
+            array![[1, 0, 100_000, 1]],
+            width,
+            height,
+            0.001,
+        ));
+        let image = surface.render();
+
+        // The first pixel survives the second update (state persists), still lit but dimmer.
+        assert!(pixel(&image, 0, 0)[0] > 0, "earlier event persists across updates");
+        assert!(pixel(&image, 1, 0)[0] > pixel(&image, 0, 0)[0], "newest event is brightest");
     }
 
     #[test]
