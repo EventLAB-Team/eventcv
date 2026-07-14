@@ -17,6 +17,7 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: open
 .. autofunction:: save
 .. autofunction:: load_frame
+.. autofunction:: load_feast
 .. autofunction:: export_png
 .. autofunction:: collate
 ```
@@ -40,6 +41,36 @@ from the methods, so the two forms stay in sync.
    :members:
 ```
 
+## FEAST feature learning
+
+{class}`~eventcv.FEAST` is an unsupervised, online event-feature extractor (Afshar et al.,
+*Event-based Feature Extraction Using Adaptive Selection Thresholds*,
+[Sensors 2020](https://www.mdpi.com/1424-8220/20/6/1600) /
+[arXiv:1907.07853](https://arxiv.org/abs/1907.07853)). Unlike the stateless stream/frame ops,
+it is a **stateful, trainable model** (scikit-learn-style `fit`/`transform`): `fit` adapts a set
+of feature prototypes and their selection thresholds event-by-event, and `transform` then maps
+each event to its nearest learned feature.
+
+```python
+import eventcv as ecv
+
+stream = ecv.load("recording.npz")
+feast = ecv.FEAST(n_features=100, patch=11, tau_ms=30.0, per_polarity=True, seed=0)
+feast.fit(stream, epochs=2)             # online, unsupervised; returns the miss rate
+
+ids  = feast.transform(stream)          # (N,) nearest-feature id per event (-1 at borders)
+hist = feast.histogram(stream)          # pooled feature-event counts (classifier input)
+imgs = feast.feature_images()           # (n_features_total, patch, patch) learned patches
+
+ecv.save(feast, "model.npz")            # persist the trained model
+feast = ecv.load_feast("model.npz")     # ...and reload it
+```
+
+```{eval-rst}
+.. autoclass:: eventcv.FEAST
+   :members:
+```
+
 (functional-opencv-style-api)=
 ## Functional (OpenCV-style) API
 
@@ -55,5 +86,6 @@ with `slice`/`windows`/`with_repr` without loading the file.
 .. automodule:: eventcv
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
-      Polarity, FrameSink, load, from_numpy, open, save, load_frame, export_png, collate
+      Polarity, FrameSink, FEAST, load, from_numpy, open, save, load_frame, load_feast,
+      export_png, collate
 ```

@@ -32,6 +32,24 @@ pub(crate) enum Scene {
     },
 }
 
+/// Runs the interactive viewer against a live stream, sizing the window for a `width` × `height`
+/// sensor and pulling each frame from `producer` on the calling (main) thread. Blocks until the
+/// window is closed or `producer` returns an error. Frames are RGB images the producer renders
+/// upstream (e.g. a [`RawSurface`](eventcv_core::viz::RawSurface) for the raw view, or a
+/// colour-mapped representation), so the viewer just uploads and displays the latest.
+#[cfg(feature = "camera")]
+pub(crate) fn run_live<P>(
+    producer: P,
+    width: u32,
+    height: u32,
+    title: String,
+) -> Result<(), String>
+where
+    P: FnMut() -> Result<Option<Rgb8Image>, String>,
+{
+    gpu::run_live(producer, width, height, title)
+}
+
 /// Renders `frame`: image kinds are colour-mapped (`colormap`, auto-contrast via `normalize`),
 /// volumetric kinds become an orbitable point cloud.
 pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> Result<(), String> {

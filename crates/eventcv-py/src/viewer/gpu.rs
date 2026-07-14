@@ -8,6 +8,8 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
+#[cfg(feature = "camera")]
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -37,6 +39,9 @@ const CAMERA_DISTANCE: f32 = 3.4;
 const MIN_DISTANCE: f32 = 1.3;
 const MAX_DISTANCE: f32 = 12.0;
 const DEFAULT_PITCH: f32 = -0.55;
+/// Live viewer refresh cadence (~60 FPS).
+#[cfg(feature = "camera")]
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 thread_local! {
     static EVENT_LOOP: RefCell<Option<EventLoop<()>>> = const { RefCell::new(None) };
@@ -59,6 +64,163 @@ pub(crate) fn run(scene: Scene) -> Result<(), String> {
             None => Ok(()),
         }
     })
+}
+
+/// Opens a window and displays a live stream, pulling a fresh frame from `producer` every
+/// ~[`FRAME_INTERVAL`] until the user closes the window or `producer` returns an error. The producer
+/// polls the camera and renders on this (main) thread — `producer` returns `Ok(Some(image))` for a
+/// new frame, `Ok(None)` when nothing changed since the last call, or `Err` to abort. Reuses the
+/// same process-global event loop as [`run`], so a session mixes `.view()` and live streaming freely
+/// (one window at a time).
+#[cfg(feature = "camera")]
+pub(crate) fn run_live<P>(
+    producer: P,
+    width: u32,
+    height: u32,
+    title: String,
+) -> Result<(), String>
+where
+    P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
+{
+    EVENT_LOOP.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(EventLoop::new().map_err(|error| error.to_string())?);
+        }
+        let event_loop = slot.as_mut().expect("event loop just initialised");
+        let mut app = LiveApp::new(producer, width, height, title);
+        event_loop
+            .run_app_on_demand(&mut app)
+            .map_err(|error| error.to_string())?;
+        match app.error.take() {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
+    })
+}
+
+/// The live counterpart to [`App`]: instead of one static [`Scene`] it pulls a frame from `producer`
+/// each ~[`FRAME_INTERVAL`] and re-uploads the image texture in place.
+#[cfg(feature = "camera")]
+struct LiveApp<P> {
+    producer: P,
+    width: u32,
+    height: u32,
+    title: String,
+    window: Option<Arc<Window>>,
+    render: Option<Render>,
+    error: Option<String>,
+}
+
+#[cfg(feature = "camera")]
+impl<P> LiveApp<P>
+where
+    P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
+{
+    fn new(producer: P, width: u32, height: u32, title: String) -> Self {
+        Self {
+            producer,
+            width,
+            height,
+            title,
+            window: None,
+            render: None,
+            error: None,
+        }
+    }
+
+    fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        self.render = None;
+        self.window = None;
+        event_loop.set_control_flow(ControlFlow::Poll);
+        event_loop.exit();
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, message: String) {
+        self.error = Some(message);
+        self.shutdown(event_loop);
+    }
+}
+
+#[cfg(feature = "camera")]
+impl<P> ApplicationHandler for LiveApp<P>
+where
+    P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
+{
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return; // resumed can fire more than once
+        }
+        // Upscale small sensors so the window is comfortably visible; the texture stays at sensor
+        // resolution (nearest sampling) so the events aren't blurred.
+        let factor = ((480 + self.height - 1) / self.height.max(1)).clamp(1, 4);
+        let attributes = Window::default_attributes()
+            .with_title(format!("eventcv - {}", self.title))
+            .with_inner_size(LogicalSize::new(self.width * factor, self.height * factor));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => return self.fail(event_loop, error.to_string()),
+        };
+        // Start from a black frame at sensor resolution; live frames re-upload it in place.
+        let black = super::Rgb8Image {
+            width: self.width as usize,
+            height: self.height as usize,
+            pixels: vec![0; (self.width * self.height * 3) as usize],
+        };
+        match Render::new(window.clone(), Scene::Image(black)) {
+            Ok(render) => {
+                self.render = Some(render);
+                self.window = Some(window);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+            }
+            Err(error) => self.fail(event_loop, error),
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.shutdown(event_loop),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.logical_key == Key::Named(NamedKey::Escape) =>
+            {
+                self.shutdown(event_loop)
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(render) = &mut self.render {
+                    render.resize(size);
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(render) = &mut self.render {
+                    // Image content ignores the camera args.
+                    if let Err(error) = render.draw(0.0, 0.0, CAMERA_DISTANCE) {
+                        self.fail(event_loop, error);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match (self.producer)() {
+            Ok(Some(image)) => {
+                if let Some(render) = &mut self.render {
+                    render.update_image(&image);
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            Ok(None) => {}
+            Err(message) => return self.fail(event_loop, message),
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+    }
 }
 
 struct App {
@@ -241,24 +403,59 @@ enum Content {
     Image {
         pipeline: wgpu::RenderPipeline,
         bind_group: wgpu::BindGroup,
+        // Kept so the live viewer can re-upload frames in place (the sensor size is fixed).
+        #[cfg(feature = "camera")]
+        texture: wgpu::Texture,
+        #[cfg(feature = "camera")]
+        width: u32,
+        #[cfg(feature = "camera")]
+        height: u32,
     },
+}
+
+/// Pick the best available adapter, degrading gracefully rather than failing on GPU-less machines:
+/// a real high-performance GPU first, then any low-power/integrated (or OpenGL) adapter, then
+/// wgpu's software fallback (WARP on Windows, llvmpipe/lavapipe on Linux via Mesa). `None` only
+/// when the machine has no renderable adapter at all — e.g. a headless box with no Mesa installed.
+fn request_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Option<wgpu::Adapter> {
+    // (power preference, force software fallback). Ordered best → worst.
+    let attempts = [
+        (wgpu::PowerPreference::HighPerformance, false),
+        (wgpu::PowerPreference::LowPower, false),
+        (wgpu::PowerPreference::None, true),
+    ];
+    attempts.into_iter().find_map(|(power_preference, force_fallback_adapter)| {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
+            compatible_surface: Some(surface),
+            force_fallback_adapter,
+        }))
+    })
 }
 
 impl Render {
     fn new(window: Arc<Window>, scene: Scene) -> Result<Self, String> {
+        // `all()` (not just `PRIMARY`) so machines with no native Vulkan/Metal/DX12 GPU — headless
+        // boxes, VMs, remote desktops — can still reach an OpenGL or software adapter and render,
+        // slowly, instead of failing outright. A real GPU is still preferred (see `request_adapter`).
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .ok_or_else(|| "no compatible GPU adapter found".to_owned())?;
+        let adapter = request_adapter(&instance, &surface)
+            .ok_or_else(|| "no compatible GPU or software adapter found".to_owned())?;
+        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+            eprintln!(
+                "eventcv: no GPU found — falling back to software rendering ({}); the viewer will be slow.",
+                adapter.get_info().name
+            );
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("eventcv-device"),
@@ -314,6 +511,43 @@ impl Render {
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth = depth_view(&self.device, size.width, size.height);
+    }
+
+    /// Re-uploads a live frame into the image texture in place. Frames whose size differs from the
+    /// texture (fixed at the sensor resolution) are ignored, as is a non-image content.
+    #[cfg(feature = "camera")]
+    fn update_image(&mut self, image: &super::Rgb8Image) {
+        let Content::Image {
+            texture,
+            width,
+            height,
+            ..
+        } = &self.content
+        else {
+            return;
+        };
+        if image.width as u32 != *width || image.height as u32 != *height {
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgb_to_rgba(&image.pixels),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(*width * 4),
+                rows_per_image: Some(*height),
+            },
+            wgpu::Extent3d {
+                width: *width,
+                height: *height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     fn draw(&mut self, pitch: f32, yaw: f32, distance: f32) -> Result<(), String> {
@@ -394,6 +628,7 @@ impl Render {
             Content::Image {
                 pipeline,
                 bind_group,
+                ..
             } => {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("image"),
@@ -693,6 +928,12 @@ fn build_image(
     Content::Image {
         pipeline,
         bind_group,
+        #[cfg(feature = "camera")]
+        texture,
+        #[cfg(feature = "camera")]
+        width: image.width as u32,
+        #[cfg(feature = "camera")]
+        height: image.height as u32,
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "eventcv-core"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Rust core of EventCV — OpenCV for event-based vision."
 license = "Apache-2.0"
@@ -11,6 +11,9 @@ categories = ["computer-vision"]
 [dependencies]
 ndarray = "0.17"
 npyz = { version = "0.9", features = ["derive", "npz"] }
+# Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
+rand = "0.8"
+rand_distr = "0.4"
 rayon = "1.10"
 rosbag = "0.6.3"
 # Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.
@@ -26,9 +29,18 @@ hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-feat
 # hyperslab — hdf5-metno's safe API can't decode an arbitrary compound generically.
 hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true, default-features = false, features = ["static"] }
 
+# USB event-camera streaming via the `neuromorphic-drivers` crate (Prophesee EVK4/EVK3 HD,
+# iniVation DVXplorer/DAVIS346, CenturyArks, ...). `rusb` is pulled in with its `vendored`
+# feature, so libusb is compiled from bundled C source and statically linked — no system libusb
+# at runtime, keeping the pure-Rust wheel story intact (a C compiler is already required for the
+# libhdf5 build). MIT-licensed. Needs udev rules on Linux for non-root USB access. `--features camera`.
+neuromorphic-drivers = { version = "0.17", optional = true }
+
 # The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
+# The `camera` feature turns on USB streaming (compiles the driver crate + a vendored libusb).
 [features]
 hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
+camera = ["dep:neuromorphic-drivers"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.

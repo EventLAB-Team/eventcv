@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use eventcv_core::{
     camera::Camera,
     cluster::ClusterError,
+    feast::{Feast, FeastConfig, FeastError},
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
@@ -20,12 +21,15 @@ use eventcv_core::{
     EventStream, EventStreamBuilder,
 };
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
+};
 use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyTuple};
 
 #[pyclass(name = "EventStream", frozen)]
 struct PyEventStream {
@@ -1908,6 +1912,585 @@ fn map_resize_error(error: ResizeError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
+fn map_feast_error(error: FeastError) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+/// FEAST feature extractor (Afshar et al., 2020) — an unsupervised, online, sklearn-style model.
+/// `fit` adapts feature weights and selection thresholds event-by-event (repeatable across
+/// recordings/epochs); `transform` then maps each event to its nearest feature id.
+#[pyclass(name = "FEAST")]
+struct PyFeast {
+    inner: Feast,
+}
+
+#[pymethods]
+impl PyFeast {
+    #[new]
+    #[pyo3(signature = (n_features=100, patch=11, tau_ms=30.0, eta=0.001, delta_i=0.001,
+        delta_e=0.003, per_polarity=true, seed=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        n_features: usize,
+        patch: usize,
+        tau_ms: f64,
+        eta: f32,
+        delta_i: f32,
+        delta_e: f32,
+        per_polarity: bool,
+        seed: u64,
+    ) -> PyResult<Self> {
+        let config = FeastConfig {
+            n_features,
+            patch,
+            tau_ms,
+            eta,
+            delta_i,
+            delta_e,
+            per_polarity,
+            seed,
+        };
+        Feast::new(config)
+            .map(|inner| Self { inner })
+            .map_err(map_feast_error)
+    }
+
+    /// Trains on `stream` for `epochs` online passes; returns the final-epoch **miss rate** (the
+    /// fraction of in-bounds events matching no feature), which settles low as the network
+    /// converges. Call repeatedly to train across multiple recordings.
+    #[pyo3(signature = (stream, epochs=1))]
+    fn fit(&mut self, py: Python<'_>, stream: PyRef<'_, PyEventStream>, epochs: usize) -> f64 {
+        let events = &stream.inner;
+        py.detach(|| self.inner.fit(events, epochs))
+    }
+
+    /// Feature id for every event (nearest feature by cosine distance; `-1` for border events).
+    /// Shape `(len(stream),)`, dtype int32; ids are `population * n_features + feature`.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        stream: PyRef<'_, PyEventStream>,
+    ) -> Bound<'py, PyArray1<i32>> {
+        let events = &stream.inner;
+        py.detach(|| self.inner.transform(events)).into_pyarray(py)
+    }
+
+    /// Pooled feature-event counts over `stream` (the paper's classifier input). Shape
+    /// `(n_features_total,)`, dtype uint32.
+    fn histogram<'py>(
+        &self,
+        py: Python<'py>,
+        stream: PyRef<'_, PyEventStream>,
+    ) -> Bound<'py, PyArray1<u32>> {
+        let events = &stream.inner;
+        py.detach(|| self.inner.histogram(events)).into_pyarray(py)
+    }
+
+    /// The learned features as an `(n_features_total, patch, patch)` float32 array — reproduces
+    /// the paper's feature grids for visualisation.
+    fn feature_images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let patch = self.inner.config().patch;
+        let shape = (self.inner.n_features_total(), patch, patch);
+        numpy::ndarray::Array3::from_shape_vec(shape, self.inner.weights().to_vec())
+            .map_err(|_| PyRuntimeError::new_err("feature weights shape mismatch"))
+            .map(|array| array.into_pyarray(py))
+    }
+
+    /// The current selection thresholds, shape `(n_features_total,)`, dtype float32.
+    #[getter]
+    fn thresholds<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        self.inner.thresholds().to_vec().into_pyarray(py)
+    }
+
+    /// Miss rate recorded by the most recent `fit` (0.0 before any training).
+    #[getter]
+    fn missed_rate(&self) -> f64 {
+        self.inner.missed_rate()
+    }
+
+    /// The constructor parameters as a dict (sklearn-style); consumed by `eventcv.save`.
+    fn get_params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let config = self.inner.config();
+        let params = PyDict::new(py);
+        params.set_item("n_features", config.n_features)?;
+        params.set_item("patch", config.patch)?;
+        params.set_item("tau_ms", config.tau_ms)?;
+        params.set_item("eta", config.eta)?;
+        params.set_item("delta_i", config.delta_i)?;
+        params.set_item("delta_e", config.delta_e)?;
+        params.set_item("per_polarity", config.per_polarity)?;
+        params.set_item("seed", config.seed)?;
+        Ok(params)
+    }
+
+    /// Replaces the weights/thresholds from saved arrays — the `eventcv.load_feast` rehydration
+    /// path. Both arrays must match the model's configured sizes.
+    fn _load_state(
+        &mut self,
+        features: PyReadonlyArray3<f32>,
+        thresholds: PyReadonlyArray1<f32>,
+    ) -> PyResult<()> {
+        let weights = features.as_array().iter().copied().collect();
+        let thresholds = thresholds.as_array().iter().copied().collect();
+        self.inner = Feast::from_state(*self.inner.config(), weights, thresholds)
+            .map_err(map_feast_error)?;
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        let config = self.inner.config();
+        format!(
+            "FEAST(n_features={}, patch={}, tau_ms={}, per_polarity={})",
+            config.n_features, config.patch, config.tau_ms, config.per_polarity
+        )
+    }
+}
+
+// ---- Live USB event-camera streaming (`camera` feature) --------------------------------
+//
+// `list_cameras()` enumerates connected devices; `stream(...)` opens one as an `EventCamera`.
+// An `EventCamera` is the live twin of `EventReader`: iterate it for fixed windows of events (or
+// representations), `show()` a live view, or `record()` to a file. The heavy lifting lives in
+// `eventcv_core::device` (capture) and `eventcv_core::viz` (raw rendering); this is the PyO3 glue.
+
+/// How long the live representation view accumulates events between rendered frames (~30 FPS).
+/// Decoupled from `stream(dt_ms=…)` (that windows the *data* API); this paces the *display*.
+#[cfg(feature = "camera")]
+const LIVE_REPR_WINDOW_MS: u64 = 33;
+
+/// Wall-clock budget the live viewer spends **decoding** events per display frame. At very high
+/// event rates (a 1280×720 Prophesee sensor can emit hundreds of millions of events per second)
+/// decoding a whole frame's worth of events takes far longer than a display frame, so the viewer
+/// decodes only this much of the freshest data each frame and drops the surplus — keeping the
+/// display at ~60 FPS instead of stalling to a couple of frames per second. The dropped events are
+/// invisible at that rate anyway. Iteration/`record` are unaffected (they process every event).
+#[cfg(feature = "camera")]
+const LIVE_DRAIN_BUDGET_MS: u64 = 10;
+
+/// How the live event stream is turned into frames for the interactive viewer.
+#[cfg(feature = "camera")]
+enum LiveRenderer {
+    /// Raw polarity view with exponential decay — the default. Events are stamped straight onto a
+    /// persistent surface, which is re-rendered each display frame.
+    Raw(eventcv_core::viz::RawSurface),
+    /// A representation, colour-mapped to a 2-D image (voxel/tsurf collapse to 2-D). Events
+    /// accumulate into `builder`, rendered every `window` of wall-clock time.
+    Repr {
+        spec: ReprSpec,
+        colormap: Colormap,
+        normalize: bool,
+        width: usize,
+        height: usize,
+        window: std::time::Duration,
+        builder: EventStreamBuilder,
+        last_render: std::time::Instant,
+    },
+}
+
+#[cfg(feature = "camera")]
+impl LiveRenderer {
+    /// Drains the driver ring **in full** and returns the next frame to display (or `None` when
+    /// nothing new this cycle). Draining every call — rather than stopping at the first window
+    /// boundary — is what keeps the driver ring from backing up and the view from lagging.
+    fn drain(
+        &mut self,
+        capture: &mut eventcv_core::device::Capture,
+    ) -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
+        match self {
+            LiveRenderer::Raw(surface) => {
+                let mut lit = false;
+                let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
+                let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
+                    lit = true;
+                    surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
+                })?;
+                if overflow {
+                    note_overflow();
+                }
+                Ok(lit.then(|| surface.render()))
+            }
+            LiveRenderer::Repr {
+                spec,
+                colormap,
+                normalize,
+                width,
+                height,
+                window,
+                builder,
+                last_render,
+            } => {
+                let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
+                let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
+                    builder.push(x, y, t_us, positive);
+                })?;
+                if overflow {
+                    note_overflow();
+                }
+                if last_render.elapsed() < *window || builder.is_empty() {
+                    return Ok(None);
+                }
+                let fresh = EventStreamBuilder::new(*width, *height, 0.001);
+                let stream = std::mem::replace(builder, fresh).build();
+                *last_render = std::time::Instant::now();
+                let frame = spec.generate(&stream).map_err(|error| error.to_string())?;
+                Ok(Some(eventcv_core::viz::render_frame(
+                    &frame, *colormap, *normalize,
+                )))
+            }
+        }
+    }
+}
+
+/// Warns (once per overflow edge) that the driver's ring buffer overflowed and dropped events.
+#[cfg(feature = "camera")]
+fn note_overflow() {
+    eprintln!(
+        "eventcv: camera ring buffer overflowed — some events were dropped \
+         (lower the event rate, increase dt_ms, or process each window faster)"
+    );
+}
+
+/// A live USB event camera — the streaming twin of [`PyEventReader`]. Open one with
+/// `eventcv.stream(...)`.
+#[cfg(feature = "camera")]
+#[pyclass(name = "EventCamera", unsendable)]
+struct PyEventCamera {
+    // `None` once closed (via `close()` / `__exit__`).
+    capture: Option<eventcv_core::device::Capture>,
+    // Representation iterated windows render to (`open(repr=…)` twin); `None` yields raw streams.
+    repr: Option<ReprSpec>,
+    // Default decay time constant (ms) for the raw `show()` view.
+    decay_ms: f64,
+}
+
+#[cfg(feature = "camera")]
+#[pymethods]
+impl PyEventCamera {
+    #[getter]
+    fn sensor_size(&self) -> PyResult<(usize, usize)> {
+        let capture = self.capture()?;
+        Ok((capture.width(), capture.height()))
+    }
+
+    #[getter]
+    fn name(&self) -> PyResult<String> {
+        Ok(self.capture()?.name().to_owned())
+    }
+
+    #[getter]
+    fn serial(&self) -> PyResult<String> {
+        Ok(self.capture()?.serial().to_owned())
+    }
+
+    /// Buffers waiting in the driver's ring — a rising value means the consumer is falling behind.
+    #[getter]
+    fn backlog(&self) -> PyResult<usize> {
+        Ok(self.capture()?.backlog())
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Blocks until the next window is ready and returns it — an `EventFrame` when the camera was
+    /// opened with a representation (`stream(repr=…)`), else a raw `EventStream`. Ends iteration
+    /// (raises `StopIteration`) only once the camera is closed. `Ctrl+C` breaks the loop.
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let repr = self.repr;
+        let Some(capture) = self.capture.as_mut() else {
+            return Ok(None); // closed -> StopIteration
+        };
+        loop {
+            match py.detach(|| capture.poll()) {
+                Ok(Some(window)) => {
+                    if window.first_after_overflow {
+                        note_overflow();
+                    }
+                    return render_slice(py, repr, window.stream).map(Some);
+                }
+                Ok(None) => {} // no window yet — keep polling
+                Err(message) => return Err(PyRuntimeError::new_err(message)),
+            }
+            py.check_signals()?; // let Ctrl+C break out of the live loop
+        }
+    }
+
+    /// Opens the interactive live viewer. With no `representation`, shows the **raw** event stream
+    /// (polarity dots with exponential decay — the default view). Pass a representation name
+    /// (`"count"`, `"tencode"`, `"voxel"`, …) to render that live instead, or `"raw"` to force the
+    /// raw view. Blocks on the main thread until the window is closed. `decay_ms` tunes the raw
+    /// fade; `colormap` / `normalize` apply to representations.
+    #[pyo3(signature = (representation=None, *, decay_ms=None, colormap="viridis", normalize=true))]
+    fn show(
+        &mut self,
+        py: Python<'_>,
+        representation: Option<String>,
+        decay_ms: Option<f64>,
+        colormap: &str,
+        normalize: bool,
+    ) -> PyResult<()> {
+        let default_decay = self.decay_ms;
+        let stored_repr = self.repr;
+        let colormap_value = parse_colormap(colormap)?;
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        let (width, height) = (capture.width() as u32, capture.height() as u32);
+        let title = capture.name().to_owned();
+
+        let raw = |decay: Option<f64>| {
+            LiveRenderer::Raw(eventcv_core::viz::RawSurface::new(
+                width as usize,
+                height as usize,
+                decay.unwrap_or(default_decay),
+            ))
+        };
+        let repr = |spec: ReprSpec| LiveRenderer::Repr {
+            spec,
+            colormap: colormap_value,
+            normalize,
+            width: width as usize,
+            height: height as usize,
+            window: std::time::Duration::from_millis(LIVE_REPR_WINDOW_MS),
+            builder: EventStreamBuilder::new(width as usize, height as usize, 0.001),
+            last_render: std::time::Instant::now(),
+        };
+        let mut renderer = match representation.as_deref() {
+            Some("raw") => raw(decay_ms),
+            Some(name) => repr(ReprSpec::new(name, None, None, None, None, None, Some(normalize))?),
+            None => match stored_repr {
+                Some(spec) => repr(spec),
+                None => raw(decay_ms),
+            },
+        };
+
+        // The producer runs on the viewer (main) thread with the GIL released: each display frame
+        // it fully drains the driver ring into the renderer and returns the latest frame, so the
+        // camera never backs up behind the ~60 FPS render loop.
+        let producer = move || renderer.drain(capture);
+
+        py.detach(move || viewer::run_live(producer, width, height, title))
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Records the live stream to `path` (format by extension, like `eventcv.save`). Blocks,
+    /// accumulating events, until `seconds` elapses (if given) or `Ctrl+C` — then writes the file
+    /// and returns the number of events saved. (Long recordings are held in memory; a streaming
+    /// writer is planned.)
+    #[pyo3(signature = (path, *, seconds=None))]
+    fn record(&mut self, py: Python<'_>, path: &str, seconds: Option<f64>) -> PyResult<usize> {
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        let mut builder = EventStreamBuilder::new(capture.width(), capture.height(), 0.001);
+        let deadline =
+            seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
+        loop {
+            match py.detach(|| capture.poll()) {
+                Ok(Some(window)) => {
+                    if window.first_after_overflow {
+                        note_overflow();
+                    }
+                    for event in window.stream.iter() {
+                        builder.push(
+                            event.x as u16,
+                            event.y as u16,
+                            event.timestamp as i64,
+                            event.polarity,
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(message) => return Err(PyRuntimeError::new_err(message)),
+            }
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            // Ctrl+C stops the recording and saves what was captured, rather than discarding it.
+            if py.check_signals().is_err() {
+                break;
+            }
+        }
+        let count = builder.len();
+        let stream = builder.build();
+        let options = SaveOptions::default();
+        py.detach(|| eventcv_core::io::save_stream(path, &stream, &options))
+            .map_err(map_io_error)?;
+        Ok(count)
+    }
+
+    /// Headless diagnostic: runs the live drain/render loop for `seconds` at ~60 FPS **without**
+    /// opening a window, returning `{frames, events, events_per_s, max_backlog, seconds}`. A
+    /// healthy viewer keeps `max_backlog` near zero and renders ~60 frames/second.
+    ///
+    /// By default it mirrors the live viewer: a `budget_ms` wall-clock decode budget per frame
+    /// (the freshest events are decoded, the surplus dropped) — this is what keeps the display at
+    /// ~60 FPS on high-rate sensors. Pass `budget_ms=None` to decode every queued event per frame
+    /// (`drain`-based); on a fast camera that collapses to a couple of frames/second. `drain=False`
+    /// uses the old one-poll-per-frame path for comparison (which lets the ring back up).
+    #[pyo3(signature = (seconds=3.0, *, budget_ms=Some(LIVE_DRAIN_BUDGET_MS as f64), drain=true))]
+    fn _render_benchmark(
+        &mut self,
+        py: Python<'_>,
+        seconds: f64,
+        budget_ms: Option<f64>,
+        drain: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let decay = self.decay_ms;
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        let (width, height) = (capture.width(), capture.height());
+        let mut frames = 0u64;
+        let mut events = 0u64;
+        let mut max_backlog = 0usize;
+        let result: Result<(), String> = py.detach(|| {
+            let mut surface = eventcv_core::viz::RawSurface::new(width, height, decay);
+            let frame_interval = std::time::Duration::from_millis(16);
+            let start = std::time::Instant::now();
+            while start.elapsed().as_secs_f64() < seconds {
+                let frame_start = std::time::Instant::now();
+                if let Some(budget_ms) = budget_ms {
+                    let budget = std::time::Duration::from_secs_f64(budget_ms / 1000.0);
+                    capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
+                        events += 1;
+                        surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
+                    })?;
+                } else if drain {
+                    capture.drain_events(|x, y, t_us, positive| {
+                        events += 1;
+                        surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
+                    })?;
+                } else {
+                    // Old behaviour: one poll per frame stops at the first unsealed window.
+                    while let Some(window) = capture.poll()? {
+                        for event in window.stream.iter() {
+                            events += 1;
+                            surface.stamp(
+                                event.x,
+                                event.y,
+                                event.timestamp as f64 * 0.001,
+                                event.polarity,
+                            );
+                        }
+                    }
+                }
+                let _image = surface.render();
+                frames += 1;
+                max_backlog = max_backlog.max(capture.backlog());
+                let elapsed = frame_start.elapsed();
+                if elapsed < frame_interval {
+                    std::thread::sleep(frame_interval - elapsed);
+                }
+            }
+            Ok(())
+        });
+        result.map_err(PyRuntimeError::new_err)?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("frames", frames)?;
+        dict.set_item("events", events)?;
+        dict.set_item("events_per_s", (events as f64 / seconds).round() as u64)?;
+        dict.set_item("max_backlog", max_backlog)?;
+        dict.set_item("seconds", seconds)?;
+        Ok(dict.unbind())
+    }
+
+    /// Closes the device and releases it. Idempotent; further use raises.
+    fn close(&mut self) {
+        self.capture = None;
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false // never suppress an exception raised in the `with` body
+    }
+}
+
+#[cfg(feature = "camera")]
+impl PyEventCamera {
+    fn capture(&self) -> PyResult<&eventcv_core::device::Capture> {
+        self.capture
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))
+    }
+}
+
+/// Lists every connected, supported event camera as a list of dicts (`kind`, `name`, `serial`,
+/// `bus`, `address`, `speed`). A `serial` can be passed to `eventcv.stream(serial=…)`.
+#[cfg(feature = "camera")]
+#[pyfunction]
+fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+    let cameras =
+        py.detach(eventcv_core::device::list_cameras).map_err(PyRuntimeError::new_err)?;
+    cameras
+        .into_iter()
+        .map(|info| {
+            let dict = PyDict::new(py);
+            dict.set_item("kind", info.kind)?;
+            dict.set_item("name", info.name)?;
+            dict.set_item("serial", info.serial)?;
+            dict.set_item("bus", info.bus_number)?;
+            dict.set_item("address", info.address)?;
+            dict.set_item("speed", info.speed)?;
+            Ok(dict.unbind())
+        })
+        .collect()
+}
+
+/// Opens a live event camera. `serial` selects a specific device (from `list_cameras`); `None`
+/// opens the first found. Windowing mirrors `eventcv.open`: `dt_ms` for fixed-duration windows or
+/// `max_events` for fixed-count (mutually exclusive; default `dt_ms=30`). `repr` sets what iterating
+/// the camera yields (a representation name → `EventFrame`s; omit for raw `EventStream`s). `decay_ms`
+/// is the default fade for the raw `show()` view.
+#[cfg(feature = "camera")]
+#[pyfunction]
+#[pyo3(signature = (serial=None, *, dt_ms=None, max_events=None, repr=None, decay_ms=30.0))]
+fn stream(
+    py: Python<'_>,
+    serial: Option<String>,
+    dt_ms: Option<f64>,
+    max_events: Option<usize>,
+    repr: Option<String>,
+    decay_ms: f64,
+) -> PyResult<PyEventCamera> {
+    let window = match (dt_ms, max_events) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err("pass dt_ms or max_events, not both"))
+        }
+        (Some(dt), None) => eventcv_core::device::Window::Duration(dt),
+        (None, Some(count)) => eventcv_core::device::Window::Count(count),
+        (None, None) => eventcv_core::device::Window::Duration(30.0),
+    };
+    let repr = match repr.as_deref() {
+        None | Some("raw") => None,
+        Some(name) => Some(ReprSpec::new(name, None, None, None, None, None, None)?),
+    };
+    let capture = py
+        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), window))
+        .map_err(PyRuntimeError::new_err)?;
+    Ok(PyEventCamera {
+        capture: Some(capture),
+        repr,
+        decay_ms,
+    })
+}
+
 #[pymodule]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEventStream>()?;
@@ -1917,6 +2500,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWindowIterator>()?;
     m.add_class::<PyPolarity>()?;
     m.add_class::<PyCamera>()?;
+    m.add_class::<PyFeast>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
@@ -1924,5 +2508,11 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_frame, m)?)?;
     #[cfg(feature = "hdf5")]
     m.add_class::<PyFrameSink>()?;
+    #[cfg(feature = "camera")]
+    {
+        m.add_class::<PyEventCamera>()?;
+        m.add_function(wrap_pyfunction!(list_cameras, m)?)?;
+        m.add_function(wrap_pyfunction!(stream, m)?)?;
+    }
     Ok(())
 }
