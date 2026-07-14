@@ -463,8 +463,9 @@ impl RawSurface {
         let cutoff = self.decay_ms * 6.5;
         for index in 0..count {
             let age = self.latest_ms - self.last_t_ms[index];
-            // `!(age < cutoff)` also rejects the `+inf` age of never-lit pixels and any NaN.
-            if !(age < cutoff) {
+            // Keep only `age < cutoff`; the `partial_cmp` form also rejects the `+inf` age of
+            // never-lit pixels and any NaN (both compare as `None`/not-`Less`).
+            if !matches!(age.partial_cmp(&cutoff), Some(std::cmp::Ordering::Less)) {
                 continue;
             }
             let intensity = (-age / self.decay_ms).exp();

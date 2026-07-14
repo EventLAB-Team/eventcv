@@ -413,21 +413,49 @@ enum Content {
     },
 }
 
+/// Pick the best available adapter, degrading gracefully rather than failing on GPU-less machines:
+/// a real high-performance GPU first, then any low-power/integrated (or OpenGL) adapter, then
+/// wgpu's software fallback (WARP on Windows, llvmpipe/lavapipe on Linux via Mesa). `None` only
+/// when the machine has no renderable adapter at all — e.g. a headless box with no Mesa installed.
+fn request_adapter(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'_>,
+) -> Option<wgpu::Adapter> {
+    // (power preference, force software fallback). Ordered best → worst.
+    let attempts = [
+        (wgpu::PowerPreference::HighPerformance, false),
+        (wgpu::PowerPreference::LowPower, false),
+        (wgpu::PowerPreference::None, true),
+    ];
+    attempts.into_iter().find_map(|(power_preference, force_fallback_adapter)| {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference,
+            compatible_surface: Some(surface),
+            force_fallback_adapter,
+        }))
+    })
+}
+
 impl Render {
     fn new(window: Arc<Window>, scene: Scene) -> Result<Self, String> {
+        // `all()` (not just `PRIMARY`) so machines with no native Vulkan/Metal/DX12 GPU — headless
+        // boxes, VMs, remote desktops — can still reach an OpenGL or software adapter and render,
+        // slowly, instead of failing outright. A real GPU is still preferred (see `request_adapter`).
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .ok_or_else(|| "no compatible GPU adapter found".to_owned())?;
+        let adapter = request_adapter(&instance, &surface)
+            .ok_or_else(|| "no compatible GPU or software adapter found".to_owned())?;
+        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+            eprintln!(
+                "eventcv: no GPU found — falling back to software rendering ({}); the viewer will be slow.",
+                adapter.get_info().name
+            );
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("eventcv-device"),

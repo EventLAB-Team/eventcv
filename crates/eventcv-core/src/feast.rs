@@ -364,7 +364,7 @@ fn validate(config: &FeastConfig) -> Result<(), FeastError> {
     if config.n_features == 0 {
         return Err(FeastError::InvalidParameter("n_features must be at least 1"));
     }
-    if config.patch == 0 || config.patch % 2 == 0 {
+    if config.patch == 0 || config.patch.is_multiple_of(2) {
         return Err(FeastError::InvalidParameter("patch must be odd and at least 1"));
     }
     if !config.tau_ms.is_finite() || config.tau_ms <= 0.0 {
