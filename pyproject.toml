@@ -48,6 +48,11 @@ classifiers = [
 [project.optional-dependencies]
 test = ["h5py>=3", "hdf5plugin"]
 
+[project.urls]
+homepage = "https://eventcv.net"
+documentation = "https://eventcv.readthedocs.io"
+source = "https://github.com/EventLAB-Team/eventcv"
+
 [tool.maturin]
 bindings = "pyo3"
 manifest-path = "crates/eventcv-py/Cargo.toml"
