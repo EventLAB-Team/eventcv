@@ -165,5 +165,75 @@ class FrameSinkTests(unittest.TestCase):
             eventcv.save([1, 2, 3], _tmp("bad.npz"))
 
 
+class EventSinkTests(unittest.TestCase):
+    """`EventSink` streams event windows to HDF5 window-by-window; the file round-trips exactly."""
+
+    def setUp(self):
+        if eventcv.EventSink is None:
+            self.skipTest("extension built without HDF5 support")
+        self.stream = _make_stream()
+
+    def _windows(self, n_windows):
+        """Split the recording into `n_windows` contiguous windows as separate EventStreams."""
+        chunks = np.array_split(self.stream.numpy(), n_windows)
+        return [eventcv.from_numpy(chunk, time_unit="us", sensor_size=SENSOR) for chunk in chunks]
+
+    def _empty(self):
+        return eventcv.from_numpy(np.zeros((0, 4)), time_unit="us", sensor_size=SENSOR)
+
+    def test_sink_streams_windows_and_round_trips(self):
+        path = _tmp("live.h5")
+        sink = eventcv.EventSink(path)
+        for window in self._windows(5):
+            sink.append(window)
+        self.assertEqual(sink.n_events, len(self.stream))
+        sink.finish()
+        loaded = eventcv.load(path)  # metadata stored: no options needed
+        np.testing.assert_array_equal(loaded.numpy(), self.stream.numpy())
+        self.assertEqual(loaded.sensor_size, self.stream.sensor_size)
+
+    def test_empty_window_is_a_no_op(self):
+        path = _tmp("empty.h5")
+        sink = eventcv.EventSink(path)
+        sink.append(self._empty())  # before any real data
+        self.assertEqual(sink.n_events, 0)
+        windows = self._windows(2)
+        sink.append(windows[0])
+        sink.append(self._empty())  # between windows
+        sink.append(windows[1])
+        sink.finish()
+        self.assertEqual(len(eventcv.load(path)), len(self.stream))
+
+    def test_context_manager_finishes(self):
+        path = _tmp("cm.h5")
+        with eventcv.EventSink(path) as sink:
+            for window in self._windows(3):
+                sink.append(window)
+        # exiting the `with` finished the sink; the file reads straight back.
+        self.assertEqual(len(eventcv.load(path)), len(self.stream))
+
+    def test_compression_round_trips(self):
+        path = _tmp("gz.h5")
+        with eventcv.EventSink(path, compression=4) as sink:
+            for window in self._windows(4):
+                sink.append(window)
+        np.testing.assert_array_equal(eventcv.load(path).numpy(), self.stream.numpy())
+
+    def test_closed_sink_rejects_append(self):
+        path = _tmp("closed.h5")
+        sink = eventcv.EventSink(path)
+        sink.append(self._windows(1)[0])
+        sink.finish()
+        with self.assertRaises(RuntimeError):
+            sink.append(self._windows(1)[0])
+
+    def test_invalid_compression_rejected(self):
+        with self.assertRaises(ValueError):
+            eventcv.EventSink(_tmp("bad.h5"), compression=99)
+
+    def test_exported_in_all(self):
+        self.assertIn("EventSink", eventcv.__all__)
+
+
 if __name__ == "__main__":
     unittest.main()

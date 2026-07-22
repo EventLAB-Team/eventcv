@@ -71,6 +71,64 @@ feast = ecv.load_feast("model.npz")     # ...and reload it
    :members:
 ```
 
+## Live camera streaming
+
+`eventcv.stream(...)` opens a USB event camera (Prophesee EVK3-HD/EVK4, iniVation
+DVXplorer/DAVIS346, CenturyArks) as a live {class}`~eventcv.EventCamera` — the streaming twin of
+{func}`~eventcv.open`. It yields the same {class}`~eventcv.EventStream` windows the file readers do,
+so every representation, transform, feature detector, and viewer composes on a live feed. Windowing
+mirrors `open`: `dt_ms` for fixed-duration windows or `max_events` for a fixed event count. These
+functions are built into wheels that include camera support; on Linux the camera needs udev rules
+for non-root USB access.
+
+**A `while` loop that returns a representation per window.** `read()` blocks until the next window
+(spanning exactly the `dt_ms` / `max_events` set at `stream(...)`) completes, then returns it —
+an {class}`~eventcv.EventFrame` when opened with `repr=`, else a raw {class}`~eventcv.EventStream`:
+
+```python
+import eventcv as ecv
+
+cam = ecv.stream(dt_ms=50, repr="mcts")     # one MCTS frame per ~50 ms of events
+while running:
+    frame = cam.read()                      # blocks for the next window
+    infer(frame.numpy())
+
+# Pass a wait cap so an idle scene doesn't block the loop (the cap is *not* the window length):
+frame = cam.read(timeout_ms=100)            # None if no window completed within 100 ms
+```
+
+Iterating the camera (`for frame in cam:`) is the same thing in `for` form; `Ctrl+C` breaks either.
+
+**Recording from camera to file, continuously.** `record()` writes straight to disk. For HDF5
+targets each window is appended as it arrives and flushed about once a second, so a long or busy
+session never accumulates in memory and a crash keeps everything captured so far (npz/txt/bag can't
+be appended incrementally, so they buffer and write once at the end). Only events are saved — a
+DAVIS346's APS frames and IMU samples are dropped.
+
+```python
+ecv.stream().record("session.h5", seconds=10)       # 10 s, or Ctrl+C; returns the event count
+ecv.stream().record("session.h5", compression=4)    # gzip the columns (HDF5 only)
+```
+
+For full control, drive the continuous writer yourself with an {class}`~eventcv.EventSink` — the
+event-level twin of {class}`~eventcv.FrameSink` — which appends {class}`~eventcv.EventStream`
+windows to an extendable HDF5 file (sensor size and time base taken from the first window). The
+result reads straight back with {func}`~eventcv.load` / {func}`~eventcv.open`:
+
+```python
+with ecv.stream(dt_ms=50) as cam, ecv.EventSink("session.h5") as sink:
+    for events in cam:
+        sink.append(events)     # to disk, window-by-window
+        track(events)           # ...and process the same window live
+```
+
+```{eval-rst}
+.. currentmodule:: eventcv
+
+.. autofunction:: stream
+.. autofunction:: list_cameras
+```
+
 (functional-opencv-style-api)=
 ## Functional (OpenCV-style) API
 
@@ -86,6 +144,6 @@ with `slice`/`windows`/`with_repr` without loading the file.
 .. automodule:: eventcv
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
-      Polarity, FrameSink, FEAST, load, from_numpy, open, save, load_frame, load_feast,
-      export_png, collate
+      Polarity, FrameSink, EventSink, EventCamera, FEAST, load, from_numpy, open, save,
+      load_frame, load_feast, export_png, collate, stream, list_cameras
 ```

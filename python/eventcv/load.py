@@ -220,9 +220,11 @@ def open(
     )
 
 
-# `FrameSink` (streaming HDF5 representation writer) is only built when the extension
-# includes HDF5 support; published wheels do, but keep the import resilient otherwise.
+# `FrameSink` (streaming HDF5 representation writer) and `EventSink` (streaming HDF5 event
+# writer) are only built when the extension includes HDF5 support; published wheels do, but
+# keep the import resilient otherwise.
 FrameSink = getattr(_rust, "FrameSink", None)
+EventSink = getattr(_rust, "EventSink", None)
 
 # `EventCamera` and the live-streaming functions are only built when the extension includes
 # USB camera support (the published wheels do); keep imports resilient otherwise.
@@ -271,9 +273,9 @@ def stream(
     yielded, so a loop never spins on idle time.
 
     Pass ``repr`` (a representation name — ``"count"``, ``"voxel"``, ``"tencode"``, …) to make
-    iteration yield rendered :class:`EventFrame` s instead of raw streams, mirroring
-    ``open(repr=…)``. ``decay_ms`` sets the fade time constant of the raw :meth:`EventCamera.show`
-    view.
+    iteration (and :meth:`EventCamera.read`) yield rendered :class:`EventFrame` s instead of raw
+    streams, mirroring ``open(repr=…)``. ``decay_ms`` sets the fade time constant of the raw
+    :meth:`EventCamera.show` view.
 
     The returned camera is a context manager and an iterator::
 
@@ -290,8 +292,22 @@ def stream(
                 if done:
                     break
 
-        # Record to a file (format by extension), stopping after 10 s or on Ctrl+C:
+        # A `while` loop that returns one representation per time window — `read()` blocks for
+        # the next window (here one MCTS frame per ~50 ms of events):
+        cam = eventcv.stream(dt_ms=50, repr="mcts")
+        while running:
+            frame = cam.read()              # EventFrame (mcts); use max_events=N for count windows
+            infer(frame.numpy())
+
+        # Record continuously, straight to disk (HDF5 streams window-by-window, never buffering
+        # the whole session), stopping after 10 s or on Ctrl+C:
         eventcv.stream().record("session.h5", seconds=10)
+
+        # Or drive the recorder yourself with an EventSink, mixing capture and processing:
+        with eventcv.stream(dt_ms=50) as cam, eventcv.EventSink("session.h5") as sink:
+            for events in cam:
+                sink.append(events)         # to disk
+                track(events)               # ...and process the same window live
 
     Requires a build with camera support and, on Linux, udev rules for USB access.
     """
@@ -429,6 +445,7 @@ __all__ = [
     "EventFrame",
     "EventPointSet",
     "EventReader",
+    "EventSink",
     "EventStream",
     "FEAST",
     "FrameSink",

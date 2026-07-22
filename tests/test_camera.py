@@ -42,7 +42,16 @@ class CameraApiTests(unittest.TestCase):
             eventcv.stream(repr="not-a-representation")
 
     def test_event_camera_surface(self):
-        for method in ("show", "record", "close", "__enter__", "__exit__", "__iter__", "__next__"):
+        for method in (
+            "show",
+            "record",
+            "read",
+            "close",
+            "__enter__",
+            "__exit__",
+            "__iter__",
+            "__next__",
+        ):
             self.assertTrue(
                 hasattr(eventcv.EventCamera, method),
                 f"EventCamera is missing {method}",
