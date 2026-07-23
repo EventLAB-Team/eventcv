@@ -2173,16 +2173,32 @@ impl LiveRenderer {
     ) -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
         match self {
             LiveRenderer::Raw(surface) => {
+                let debug = std::env::var_os("EVENTCV_PERF_DEBUG").is_some();
                 let mut lit = false;
+                let mut n = 0u64;
+                let t_drain = std::time::Instant::now();
                 let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
                 let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
                     lit = true;
+                    n += 1;
                     surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
                 })?;
+                let drain_dt = t_drain.elapsed();
                 if overflow {
                     note_overflow();
                 }
-                Ok(lit.then(|| surface.render()))
+                let t_render = std::time::Instant::now();
+                let image = lit.then(|| surface.render());
+                if debug {
+                    eprintln!(
+                        "[perf]   drain={:?} (n={}) render={:?} backlog={}",
+                        drain_dt,
+                        n,
+                        t_render.elapsed(),
+                        capture.backlog()
+                    );
+                }
+                Ok(image)
             }
             LiveRenderer::Repr {
                 spec,
