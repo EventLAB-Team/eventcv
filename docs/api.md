@@ -99,6 +99,60 @@ frame = cam.read(timeout_ms=100)            # None if no window completed within
 
 Iterating the camera (`for frame in cam:`) is the same thing in `for` form; `Ctrl+C` breaks either.
 
+`stream` takes the same per-representation options as {meth}`~eventcv.EventReader.with_repr`
+(`bins`, `window_ms`, `tau_ms`, `max_window_ms`, `window`, `normalize`), and **unset time spans
+follow the capture window** so a live representation covers exactly the events it was handed:
+
+```python
+ecv.stream(dt_ms=50, repr="tencode")                  # window_ms = 50 (not the 30 ms default)
+ecv.stream(dt_ms=50, repr="tencode", window_ms=20)    # explicit: keep only the newest 20 ms
+ecv.stream(dt_ms=50, repr="voxel", bins=5)            # bins=5 over the 50 ms window
+ecv.stream(max_events=50_000, repr="tsurf")           # no fixed duration -> tau_ms stays 30 ms
+```
+
+Without this, `dt_ms=50` with tencode's 30 ms default silently discards the oldest 20 ms of every
+window — on a real 50 ms window that was 54% of the lit pixels.
+
+**Processing and archiving in one loop.** Pass `record=` an `.h5`/`.hdf5` path and every window the
+loop reads has its **raw** events appended to that file before it is rendered — so the loop works on
+representations while the file keeps the full-resolution recording for later. The append happens in
+Rust as each window is polled, so there is no per-window Python round trip, and the file is flushed
+about once a second:
+
+```python
+with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
+    while running:
+        infer(cam.read().numpy())       # this window's raw events are already on disk
+
+# `cam.n_recorded` counts events written; the `with` block (or `close()`) closes the file, and
+# `ecv.open("session.h5")` reads it back like any other recording.
+```
+
+**Capture runs on its own thread.** Decoding — and any `record=` writing — happens on a background
+thread that owns the camera, so the driver's ring drains continuously whatever your loop is doing;
+the loop only collects windows that are already decoded. This is what keeps the per-window budget
+yours: on an EVK4 at `dt_ms=50`, 40 ms of processing per frame still holds 19.9 of an ideal 20 fps
+with the ring empty. `show()`, `record()`, and `close()` pause the thread to take the camera back,
+and it restarts on the next read. `backlog` (ring buffers waiting) should sit near zero; `n_overflows`
+counts the times the driver dropped events anyway — the loss eventcv can't prevent, because it
+happens upstream.
+
+**Keeping a slow loop on live data.** Windows are handed back in order, so a loop whose per-window
+work is slower than the camera still falls behind: the thread buffers a few windows, then applies
+backpressure, and under sustained overload the ring is what finally overflows. `latest=True` trades
+completeness for freshness instead — each read returns the **newest** decoded window and drops what
+it overtook, holding latency at about one window however slow the loop is. On a Prophesee EVK4 with
+a 200 ms per-window workload, a 5 s session ends 4.3 s behind in order versus 0.2 s behind with
+`latest=True`. Skipped windows are counted in `n_skipped` — and are still written by `record=` from
+the capture thread, so the archive stays complete even though the loop never sees them:
+
+```python
+with ecv.stream(dt_ms=30, repr="count", record="session.h5", latest=True) as cam:
+    while running:
+        slow_inference(cam.read().numpy())
+print(cam.n_skipped, "windows skipped,", cam.n_recorded, "events recorded")
+```
+
 **Recording from camera to file, continuously.** `record()` writes straight to disk. For HDF5
 targets each window is appended as it arrives and flushed about once a second, so a long or busy
 session never accumulates in memory and a crash keeps everything captured so far (npz/txt/bag can't

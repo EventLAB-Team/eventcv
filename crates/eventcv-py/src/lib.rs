@@ -1,3 +1,5 @@
+#[cfg(feature = "camera")]
+mod capture;
 mod viewer;
 
 use std::collections::HashMap;
@@ -2148,6 +2150,11 @@ const LIVE_DRAIN_BUDGET_MS: u64 = 10;
 #[cfg(feature = "camera")]
 const LIVE_RENDER_INTERVAL_MS: u64 = 16;
 
+/// How often a continuous recording is forced out to disk, so a crash mid-session keeps everything
+/// captured up to about a second ago. Shared by `record()` and `stream(record=…)`.
+#[cfg(all(feature = "camera", feature = "hdf5"))]
+const RECORD_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How the live event stream is turned into frames for the interactive viewer.
 #[cfg(feature = "camera")]
 enum LiveRenderer {
@@ -2336,17 +2343,117 @@ fn note_overflow() {
     );
 }
 
+/// The open file behind `stream(record=…)` plus its flush clock: every window the camera hands out
+/// is appended here before it is rendered, so one loop both archives the raw events and processes
+/// representations.
+#[cfg(all(feature = "camera", feature = "hdf5"))]
+pub(crate) struct Recorder {
+    sink: eventcv_core::io::Hdf5EventSink,
+    last_flush: std::time::Instant,
+}
+
+/// Without HDF5 there is nothing to record into — `stream(record=…)` is rejected up front, so this
+/// placeholder only exists to keep the camera's plumbing free of feature gates.
+#[cfg(all(feature = "camera", not(feature = "hdf5")))]
+pub(crate) struct Recorder;
+
+#[cfg(all(feature = "camera", not(feature = "hdf5")))]
+impl Recorder {
+    pub(crate) fn append(&mut self, _stream: &EventStream) -> Result<(), IoError> {
+        Ok(())
+    }
+
+    pub(crate) fn n_events(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn finish(self) -> Result<(), IoError> {
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "camera", feature = "hdf5"))]
+impl Recorder {
+    /// Checks a `record=` request without touching the filesystem, so a typo is rejected before the
+    /// camera is opened — and with the same error whether or not a device is attached.
+    fn validate(path: &str, compression: Option<u8>) -> PyResult<()> {
+        if compression.is_some_and(|level| level > 9) {
+            return Err(PyValueError::new_err("compression must be a gzip level in 0..=9"));
+        }
+        if !eventcv_core::io::supports_event_append(path) {
+            return Err(PyValueError::new_err(format!(
+                "record={path} needs a format that can be appended window-by-window (.h5/.hdf5); \
+                 for npz/txt/bag record the whole session at once with camera.record({path:?})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn open(path: &str, compression: Option<u8>) -> PyResult<Self> {
+        Ok(Self {
+            sink: eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?,
+            last_flush: std::time::Instant::now(),
+        })
+    }
+
+    /// Appends one window, flushing about once a second.
+    pub(crate) fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        self.sink.append(stream)?;
+        if self.last_flush.elapsed() >= RECORD_FLUSH_INTERVAL {
+            self.sink.flush()?;
+            self.last_flush = std::time::Instant::now();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn n_events(&self) -> usize {
+        self.sink.n_events()
+    }
+
+    /// Flushes and closes the recording.
+    pub(crate) fn finish(self) -> Result<(), IoError> {
+        self.sink.finish()
+    }
+}
+
+/// How long a read waits on the pump before surfacing to Python to check its deadline and Ctrl+C.
+#[cfg(feature = "camera")]
+const READ_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Where the open camera currently lives. Reading runs it on the pump thread; `show`, `record`, and
+/// `close` need it back on this thread, so they park the pump first.
+#[cfg(feature = "camera")]
+enum CameraState {
+    /// Held here, decoding nothing until a window is read.
+    Idle {
+        capture: eventcv_core::device::Capture,
+        recorder: Option<Recorder>,
+    },
+    /// The pump thread owns the camera and decodes continuously.
+    Pumping(capture::Pump),
+    /// Closed via `close()` / `__exit__`.
+    Closed,
+}
+
 /// A live USB event camera — the streaming twin of [`PyEventReader`]. Open one with
 /// `eventcv.stream(...)`.
 #[cfg(feature = "camera")]
 #[pyclass(name = "EventCamera", unsendable)]
 struct PyEventCamera {
-    // `None` once closed (via `close()` / `__exit__`).
-    capture: Option<eventcv_core::device::Capture>,
+    state: CameraState,
     // Representation iterated windows render to (`open(repr=…)` twin); `None` yields raw streams.
     repr: Option<ReprSpec>,
     // Default decay time constant (ms) for the raw `show()` view.
     decay_ms: f64,
+    // What the pump does with windows the loop hasn't collected (`stream(latest=True)`).
+    mode: capture::Backpressure,
+    // Cached at open so the getters keep working while the pump thread owns the capture.
+    name: String,
+    serial: String,
+    sensor_size: (usize, usize),
+    // Skips and overflows from pumps already stopped, so the counters survive a `show()` round trip.
+    skipped: usize,
+    overflows: usize,
 }
 
 #[cfg(feature = "camera")]
@@ -2354,24 +2461,60 @@ struct PyEventCamera {
 impl PyEventCamera {
     #[getter]
     fn sensor_size(&self) -> PyResult<(usize, usize)> {
-        let capture = self.capture()?;
-        Ok((capture.width(), capture.height()))
+        self.open_check()?;
+        Ok(self.sensor_size)
     }
 
     #[getter]
     fn name(&self) -> PyResult<String> {
-        Ok(self.capture()?.name().to_owned())
+        self.open_check()?;
+        Ok(self.name.clone())
     }
 
     #[getter]
     fn serial(&self) -> PyResult<String> {
-        Ok(self.capture()?.serial().to_owned())
+        self.open_check()?;
+        Ok(self.serial.clone())
     }
 
-    /// Buffers waiting in the driver's ring — a rising value means the consumer is falling behind.
+    /// Buffers waiting in the driver's ring. The pump thread drains it continuously, so this stays
+    /// near zero unless the camera is producing faster than events can be decoded and written.
     #[getter]
     fn backlog(&self) -> PyResult<usize> {
-        Ok(self.capture()?.backlog())
+        match &self.state {
+            CameraState::Pumping(pump) => Ok(pump.backlog()),
+            CameraState::Idle { capture, .. } => Ok(capture.backlog()),
+            CameraState::Closed => Err(PyRuntimeError::new_err("camera is closed")),
+        }
+    }
+
+    /// Windows a `stream(latest=True)` loop skipped to stay live — the count of frames the loop was
+    /// too slow to process. Always `0` without `latest=True` (that mode never skips). A steadily
+    /// rising value means the per-window work is slower than the camera; recordings stay complete
+    /// either way.
+    #[getter]
+    fn n_skipped(&self) -> usize {
+        self.skipped + self.pump().map_or(0, capture::Pump::n_skipped)
+    }
+
+    /// Times the driver's ring overflowed and dropped events before a window — the loss `n_skipped`
+    /// can't prevent, because it happens upstream of eventcv. Non-zero means the camera outran the
+    /// decoder or the recording; lower the event rate, or record uncompressed.
+    #[getter]
+    fn n_overflows(&self) -> usize {
+        self.overflows + self.pump().map_or(0, capture::Pump::n_overflows)
+    }
+
+    /// Events written so far by `stream(record=…)` (`0` when the camera isn't recording).
+    #[getter]
+    fn n_recorded(&self) -> usize {
+        match &self.state {
+            CameraState::Pumping(pump) => pump.n_recorded(),
+            CameraState::Idle { recorder, .. } => {
+                recorder.as_ref().map_or(0, Recorder::n_events)
+            }
+            CameraState::Closed => 0,
+        }
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -2382,7 +2525,7 @@ impl PyEventCamera {
     /// opened with a representation (`stream(repr=…)`), else a raw `EventStream`. Ends iteration
     /// (raises `StopIteration`) only once the camera is closed. `Ctrl+C` breaks the loop.
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        if self.capture.is_none() {
+        if matches!(self.state, CameraState::Closed) {
             return Ok(None); // closed -> StopIteration
         }
         self.poll_next(py, None)
@@ -2397,11 +2540,13 @@ impl PyEventCamera {
     /// within that many milliseconds `read` returns `None`, so the loop can do other work or exit
     /// instead of blocking forever on an idle scene. (`timeout_ms` is a wait cap, *not* the window
     /// length.) `Ctrl+C` breaks out. Raises if the camera is closed.
+    ///
+    /// By default windows are returned in order, so a loop slower than the camera falls further and
+    /// further behind live. `stream(latest=True)` returns the newest completed window instead,
+    /// counting what it skipped in `n_skipped` — `record=` still archives every window either way.
     #[pyo3(signature = (*, timeout_ms=None))]
     fn read(&mut self, py: Python<'_>, timeout_ms: Option<f64>) -> PyResult<Option<Py<PyAny>>> {
-        if self.capture.is_none() {
-            return Err(PyRuntimeError::new_err("camera is closed"));
-        }
+        self.open_check()?;
         let timeout = timeout_ms.map(|ms| std::time::Duration::from_secs_f64(ms.max(0.0) / 1000.0));
         self.poll_next(py, timeout)
     }
@@ -2423,12 +2568,13 @@ impl PyEventCamera {
         let default_decay = self.decay_ms;
         let stored_repr = self.repr;
         let colormap_value = parse_colormap(colormap)?;
-        // Take ownership so the capture can move onto the dedicated drain thread; it is restored
+        // Take ownership so the capture can move onto the viewer's own drain thread; it is restored
         // into `self` when the viewer closes, so the camera stays usable afterwards.
-        let capture = self
-            .capture
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        self.park();
+        let (capture, recorder) = match std::mem::replace(&mut self.state, CameraState::Closed) {
+            CameraState::Idle { capture, recorder } => (capture, recorder),
+            _ => return Err(PyRuntimeError::new_err("camera is closed")),
+        };
         let (width, height) = (capture.width() as u32, capture.height() as u32);
         let title = capture.name().to_owned();
 
@@ -2463,7 +2609,10 @@ impl PyEventCamera {
         // into `self` on close so it stays usable.
         let (capture, result) =
             py.detach(move || run_live_threaded(capture, renderer, width, height, title));
-        self.capture = capture;
+        self.state = match capture {
+            Some(capture) => CameraState::Idle { capture, recorder },
+            None => CameraState::Closed,
+        };
         result.map_err(PyRuntimeError::new_err)
     }
 
@@ -2512,10 +2661,7 @@ impl PyEventCamera {
         drain: bool,
     ) -> PyResult<Py<PyDict>> {
         let decay = self.decay_ms;
-        let capture = self
-            .capture
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        let capture = self.parked_capture()?;
         let (width, height) = (capture.width(), capture.height());
         let mut frames = 0u64;
         let mut events = 0u64;
@@ -2572,9 +2718,18 @@ impl PyEventCamera {
         Ok(dict.unbind())
     }
 
-    /// Closes the device and releases it. Idempotent; further use raises.
-    fn close(&mut self) {
-        self.capture = None;
+    /// Stops the pump, closes the device, and finishes a `stream(record=…)` file if one is open.
+    /// Idempotent; further use raises.
+    fn close(&mut self) -> PyResult<()> {
+        self.park(); // joins the pump thread, handing the recording back
+        let recorder = match std::mem::replace(&mut self.state, CameraState::Closed) {
+            CameraState::Idle { recorder, .. } => recorder,
+            _ => None,
+        };
+        if let Some(recorder) = recorder {
+            recorder.finish().map_err(map_io_error)?;
+        }
+        Ok(())
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -2587,18 +2742,63 @@ impl PyEventCamera {
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_value: Option<&Bound<'_, PyAny>>,
         _traceback: Option<&Bound<'_, PyAny>>,
-    ) -> bool {
-        self.close();
-        false // never suppress an exception raised in the `with` body
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false) // never suppress an exception raised in the `with` body
     }
 }
 
 #[cfg(feature = "camera")]
 impl PyEventCamera {
-    fn capture(&self) -> PyResult<&eventcv_core::device::Capture> {
-        self.capture
-            .as_ref()
+    fn open_check(&self) -> PyResult<()> {
+        match self.state {
+            CameraState::Closed => Err(PyRuntimeError::new_err("camera is closed")),
+            _ => Ok(()),
+        }
+    }
+
+    fn pump(&self) -> Option<&capture::Pump> {
+        match &self.state {
+            CameraState::Pumping(pump) => Some(pump),
+            _ => None,
+        }
+    }
+
+    /// Starts the pump if it isn't already running, so reads come from the decode thread.
+    fn pumping(&mut self) -> PyResult<&capture::Pump> {
+        if matches!(self.state, CameraState::Idle { .. }) {
+            let CameraState::Idle { capture, recorder } =
+                std::mem::replace(&mut self.state, CameraState::Closed)
+            else {
+                unreachable!("checked immediately above")
+            };
+            self.state = CameraState::Pumping(capture::Pump::start(capture, recorder, self.mode));
+        }
+        self.pump()
             .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))
+    }
+
+    /// Stops the pump and takes the camera back onto this thread — `show`, `record`, and `close`
+    /// drive the capture directly. Counters are folded in so they survive the restart.
+    fn park(&mut self) {
+        if let CameraState::Pumping(pump) = &mut self.state {
+            self.skipped += pump.n_skipped();
+            self.overflows += pump.n_overflows();
+            let (capture, recorder) = pump.stop();
+            self.state = match capture {
+                Some(capture) => CameraState::Idle { capture, recorder },
+                None => CameraState::Closed,
+            };
+        }
+    }
+
+    /// Parks the pump and borrows the capture for the direct-drive paths.
+    fn parked_capture(&mut self) -> PyResult<&mut eventcv_core::device::Capture> {
+        self.park();
+        match &mut self.state {
+            CameraState::Idle { capture, .. } => Ok(capture),
+            _ => Err(PyRuntimeError::new_err("camera is closed")),
+        }
     }
 
     /// Shared poll loop behind `__next__` and `read`: waits for the next completed window and
@@ -2610,20 +2810,19 @@ impl PyEventCamera {
         timeout: Option<std::time::Duration>,
     ) -> PyResult<Option<Py<PyAny>>> {
         let repr = self.repr;
-        let capture = self
-            .capture
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        // Decoding, archiving, and the `latest=` skip policy all run on the pump thread; this loop
+        // only collects finished windows and renders them.
+        let pump = self.pumping()?;
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
         loop {
-            match py.detach(|| capture.poll()) {
+            match py.detach(|| pump.next_window(READ_SLICE)) {
                 Ok(Some(window)) => {
                     if window.first_after_overflow {
                         note_overflow();
                     }
                     return render_slice(py, repr, window.stream).map(Some);
                 }
-                Ok(None) => {} // no window yet — keep polling
+                Ok(None) => {} // nothing decoded yet — keep waiting
                 Err(message) => return Err(PyRuntimeError::new_err(message)),
             }
             if let Some(deadline) = deadline {
@@ -2646,15 +2845,11 @@ impl PyEventCamera {
         seconds: Option<f64>,
         compression: Option<u8>,
     ) -> PyResult<usize> {
-        let capture = self
-            .capture
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        let capture = self.parked_capture()?;
         let mut sink =
             eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
         let deadline =
             seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-        let flush_interval = std::time::Duration::from_secs(1);
         let mut last_flush = std::time::Instant::now();
         loop {
             match py.detach(|| capture.poll()) {
@@ -2667,7 +2862,7 @@ impl PyEventCamera {
                 Ok(None) => {}
                 Err(message) => return Err(PyRuntimeError::new_err(message)),
             }
-            if last_flush.elapsed() >= flush_interval {
+            if last_flush.elapsed() >= RECORD_FLUSH_INTERVAL {
                 py.detach(|| sink.flush()).map_err(map_io_error)?;
                 last_flush = std::time::Instant::now();
             }
@@ -2694,10 +2889,7 @@ impl PyEventCamera {
         path: &str,
         seconds: Option<f64>,
     ) -> PyResult<usize> {
-        let capture = self
-            .capture
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
+        let capture = self.parked_capture()?;
         let mut builder = EventStreamBuilder::new(capture.width(), capture.height(), 0.001);
         let deadline =
             seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
@@ -2763,20 +2955,38 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 /// Opens a live event camera. `serial` selects a specific device (from `list_cameras`); `None`
 /// opens the first found. Windowing mirrors `eventcv.open`: `dt_ms` for fixed-duration windows or
 /// `max_events` for fixed-count (mutually exclusive; default `dt_ms=30`). `repr` sets what iterating
-/// the camera yields (a representation name → `EventFrame`s; omit for raw `EventStream`s). `decay_ms`
-/// is the default fade for the raw `show()` view.
+/// the camera yields (a representation name → `EventFrame`s; omit for raw `EventStream`s), with the
+/// same per-representation options `EventReader.with_repr` takes (`bins`, `window_ms`, `tau_ms`,
+/// `max_window_ms`, `window`, `normalize`). `record` archives every window's raw events to an HDF5
+/// file as it is read (`compression` is its optional gzip level). `latest` keeps a slow loop on live
+/// data by handing back the newest window instead of the oldest. `decay_ms` is the default fade for
+/// the raw `show()` view.
 #[cfg(feature = "camera")]
 #[pyfunction]
-#[pyo3(signature = (serial=None, *, dt_ms=None, max_events=None, repr=None, decay_ms=30.0))]
+#[pyo3(signature = (
+    serial=None, *, dt_ms=None, max_events=None, repr=None, bins=None, window_ms=None, tau_ms=None,
+    max_window_ms=None, window=None, normalize=None, record=None, compression=None, latest=false,
+    decay_ms=30.0
+))]
+#[allow(clippy::too_many_arguments)]
 fn stream(
     py: Python<'_>,
     serial: Option<String>,
     dt_ms: Option<f64>,
     max_events: Option<usize>,
     repr: Option<String>,
+    bins: Option<i64>,
+    window_ms: Option<f64>,
+    tau_ms: Option<f64>,
+    max_window_ms: Option<f64>,
+    window: Option<i64>,
+    normalize: Option<bool>,
+    record: Option<String>,
+    compression: Option<u8>,
+    latest: bool,
     decay_ms: f64,
 ) -> PyResult<PyEventCamera> {
-    let window = match (dt_ms, max_events) {
+    let windowing = match (dt_ms, max_events) {
         (Some(_), Some(_)) => {
             return Err(PyValueError::new_err("pass dt_ms or max_events, not both"))
         }
@@ -2786,15 +2996,62 @@ fn stream(
     };
     let repr = match repr.as_deref() {
         None | Some("raw") => None,
-        Some(name) => Some(ReprSpec::new(name, None, None, None, None, None, None)?),
+        Some(name) => {
+            // Unset time spans follow the capture window, so a live representation covers exactly
+            // the events it is handed: `stream(dt_ms=50, repr="tencode")` encodes all 50 ms rather
+            // than the 30 ms default, which would silently drop the oldest 20 ms of every window.
+            // An explicit `window_ms=`/`tau_ms=`/`max_window_ms=` always wins.
+            let span = match windowing {
+                eventcv_core::device::Window::Duration(dt) => Some(dt),
+                eventcv_core::device::Window::Count(_) => None,
+            };
+            Some(ReprSpec::new(
+                name,
+                bins,
+                window_ms.or(span),
+                tau_ms.or(span),
+                max_window_ms.or(span),
+                window,
+                normalize,
+            )?)
+        }
     };
+    #[cfg(feature = "hdf5")]
+    if let Some(path) = record.as_deref() {
+        Recorder::validate(path, compression)?;
+    }
+    #[cfg(not(feature = "hdf5"))]
+    if record.is_some() {
+        let _ = compression;
+        return Err(PyRuntimeError::new_err(
+            "record= needs HDF5 support, which this build of eventcv was compiled without",
+        ));
+    }
     let capture = py
-        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), window))
+        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing))
         .map_err(PyRuntimeError::new_err)?;
+    // Created only now, so a failed camera open never leaves an empty recording behind.
+    #[cfg(feature = "hdf5")]
+    let recorder = record
+        .as_deref()
+        .map(|path| Recorder::open(path, compression))
+        .transpose()?;
+    #[cfg(not(feature = "hdf5"))]
+    let recorder = None;
     Ok(PyEventCamera {
-        capture: Some(capture),
+        name: capture.name().to_owned(),
+        serial: capture.serial().to_owned(),
+        sensor_size: (capture.width(), capture.height()),
+        state: CameraState::Idle { capture, recorder },
         repr,
         decay_ms,
+        mode: if latest {
+            capture::Backpressure::Latest
+        } else {
+            capture::Backpressure::Buffer
+        },
+        skipped: 0,
+        overflows: 0,
     })
 }
 

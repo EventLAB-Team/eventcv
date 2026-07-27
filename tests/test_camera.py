@@ -5,6 +5,7 @@ and the surface of the ``EventCamera`` class. The actual capture/viewer/record p
 and are exercised separately. Skips entirely when the extension was built without the ``camera``
 feature."""
 
+import os
 import unittest
 
 import eventcv
@@ -41,6 +42,20 @@ class CameraApiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eventcv.stream(repr="not-a-representation")
 
+    def test_record_rejects_formats_that_cannot_be_appended(self):
+        # `record=` archives window-by-window, so it needs HDF5; npz/txt/bag are pointed at
+        # `camera.record(...)` instead. Checked before the device is touched.
+        for path in ("session.npz", "session.txt", "session.bag"):
+            with self.assertRaises(ValueError) as caught:
+                eventcv.stream(record=path)
+            self.assertIn("record", str(caught.exception))
+        self.assertFalse(os.path.exists("session.npz"), "rejected path must not be created")
+
+    def test_record_rejects_a_bad_compression_level(self):
+        with self.assertRaises(ValueError):
+            eventcv.stream(record="session.h5", compression=42)
+        self.assertFalse(os.path.exists("session.h5"), "rejected path must not be created")
+
     def test_event_camera_surface(self):
         for method in (
             "show",
@@ -56,11 +71,46 @@ class CameraApiTests(unittest.TestCase):
                 hasattr(eventcv.EventCamera, method),
                 f"EventCamera is missing {method}",
             )
-        for prop in ("sensor_size", "name", "serial", "backlog"):
+        for prop in (
+            "sensor_size",
+            "name",
+            "serial",
+            "backlog",
+            "n_recorded",
+            "n_skipped",
+            "n_overflows",
+        ):
             self.assertTrue(
                 hasattr(eventcv.EventCamera, prop),
                 f"EventCamera is missing property {prop}",
             )
+
+    def test_stream_accepts_the_representation_options(self):
+        # The same per-representation options `EventReader.with_repr` takes, so a live tencode /
+        # voxel / tsurf can be tuned instead of being stuck on the 30 ms defaults.
+        import inspect
+
+        parameters = inspect.signature(eventcv.stream).parameters
+        for name in ("bins", "window_ms", "tau_ms", "max_window_ms", "window", "normalize"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIsNone(parameters[name].default, f"{name} must default to 'follow dt_ms'")
+        # Parsed before the device is touched, so a bad option raises regardless of hardware.
+        with self.assertRaises(ValueError):
+            eventcv.stream(repr="voxel", bins=-1)
+        with self.assertRaises(ValueError):
+            eventcv.stream(repr="flow", window=0)
+
+    def test_stream_accepts_the_sink_options(self):
+        # `record`/`compression`/`latest` are keyword-only and reach the Rust binding — a signature
+        # mismatch would raise TypeError here rather than at capture time.
+        import inspect
+
+        parameters = inspect.signature(eventcv.stream).parameters
+        for name in ("record", "compression", "latest"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(parameters["latest"].default, False)
 
     def test_public_api_is_exported(self):
         for name in ("stream", "list_cameras", "EventCamera"):

@@ -4,6 +4,12 @@ use super::{
 };
 use crate::EventStream;
 
+/// Per-pixel winner states for the scratch column: no event in the window, or the polarity of the
+/// latest one.
+const NOTHING: u8 = 0;
+const POSITIVE: u8 = 1;
+const NEGATIVE: u8 = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tencode {
     window_ms: f64,
@@ -28,35 +34,38 @@ impl Representation for Tencode {
         validate_positive(self.window_ms, "window_ms")?;
         let (width, height, length) = frame_len(stream, 3)?;
         let plane_len = width * height;
-        let mut latest = vec![None; plane_len];
+        // Per-pixel winner, split into two lean columns rather than one `Vec<Option<(u64, usize,
+        // bool)>>`: at 1280×720 that packing zeroed 22 MB of scratch per frame, which dominated the
+        // cost of a live window. `state` doubles as the "seen" flag the `Option` used to carry.
+        let mut latest_t = vec![0_u64; plane_len];
+        let mut latest_state = vec![NOTHING; plane_len];
         let mut values = vec![0_u8; length];
 
         if let Some(reference) = reference_time(stream) {
-            for (order, event) in stream.iter().enumerate() {
+            for event in stream.iter() {
                 if age_ms(stream, reference, event.timestamp) > self.window_ms {
                     continue;
                 }
                 let index = event_index(event, width, height)?;
-                if latest[index].is_none_or(|(timestamp, previous_order, _)| {
-                    event.timestamp > timestamp
-                        || (event.timestamp == timestamp && order > previous_order)
-                }) {
-                    latest[index] = Some((event.timestamp, order, event.polarity));
+                // Events are visited in stream order, so `>=` keeps the last event of a timestamp
+                // tie — the same winner an explicit order comparison picked.
+                if latest_state[index] == NOTHING || event.timestamp >= latest_t[index] {
+                    latest_t[index] = event.timestamp;
+                    latest_state[index] = if event.polarity { POSITIVE } else { NEGATIVE };
                 }
             }
 
-            for (index, event) in latest.into_iter().enumerate() {
-                if let Some((timestamp, _, polarity)) = event {
-                    if polarity {
-                        values[index] = u8::MAX;
-                    } else {
-                        values[2 * plane_len + index] = u8::MAX;
-                    }
-                    values[plane_len + index] = (255.0 * age_ms(stream, reference, timestamp)
-                        / self.window_ms)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
+            for index in 0..plane_len {
+                match latest_state[index] {
+                    POSITIVE => values[index] = u8::MAX,
+                    NEGATIVE => values[2 * plane_len + index] = u8::MAX,
+                    _ => continue,
                 }
+                values[plane_len + index] = (255.0
+                    * age_ms(stream, reference, latest_t[index])
+                    / self.window_ms)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
         }
 

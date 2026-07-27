@@ -210,8 +210,18 @@ impl Windower {
     }
 
     /// Seals the current window into `pending` and starts a fresh one.
+    ///
+    /// The replacement is sized from the window just sealed: consecutive windows hold similar event
+    /// counts, so the next one fills without reallocating. Starting from zero meant a busy window
+    /// (millions of events on a high-resolution sensor) grew its four column vectors through ~20
+    /// doublings, copying everything accumulated so far each time.
     fn seal(&mut self) {
-        let fresh = EventStreamBuilder::new(self.width, self.height, TIMESTAMP_SCALE_MS);
+        let fresh = EventStreamBuilder::with_capacity(
+            self.width,
+            self.height,
+            TIMESTAMP_SCALE_MS,
+            self.builder.len(),
+        );
         let builder = std::mem::replace(&mut self.builder, fresh);
         self.pending.push_back(CaptureWindow {
             stream: builder.build(),
@@ -320,32 +330,56 @@ impl Capture {
                 self.windower.mark_overflow();
             }
             let slice = view.slice;
-            // Disjoint field borrows: `slice` borrows `self.device`, the closures borrow
-            // `self.windower`, and the match borrows `self.adapter`.
+            // Disjoint field borrows: `slice` borrows `self.device`, the closure borrows
+            // `self.windower`, and `convert_buffer` borrows `self.adapter`.
             let windower = &mut self.windower;
-            let on_polarity = |event: nd::types::PolarityEvent<u64, u16, u16>| {
-                windower.push(
-                    event.x,
-                    event.y,
-                    event.t as i64,
-                    matches!(event.polarity, Polarity::On),
-                );
-            };
-            match &mut self.adapter {
-                Adapter::Evt3(adapter) => adapter.convert(slice, on_polarity, |_trigger| {}),
-                Adapter::Dvxplorer(adapter) => {
-                    adapter.convert(slice, on_polarity, |_imu| {}, |_trigger| {})
-                }
-                Adapter::Davis346(adapter) => {
-                    adapter.convert(slice, on_polarity, |_imu| {}, |_trigger| {}, |_frame| {})
-                }
-            }
+            convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
+                windower.push(x, y, t, polarity)
+            });
             // Flush the current window if its boundary has passed, so a mid-window pause doesn't
             // stall delivery. `current_t` advances with the device clock even during quiet periods.
             let current_t = self.adapter.current_t() as i64;
             self.windower.seal_until(current_t);
         }
         Ok(self.windower.pending.pop_front())
+    }
+
+    /// Decodes **at most one** queued buffer into the window grid, waiting up to `timeout` for one
+    /// to arrive. Returns whether a buffer was decoded; completed windows are collected with
+    /// [`take_pending`].
+    ///
+    /// This is the windowed twin of [`drain_events`](Self::drain_events), deliberately stopping
+    /// after a single buffer: a caller that decodes ahead of its consumer must be able to pause. A
+    /// full-ring drain would let the driver's ring — half a gigabyte of encoded events on a
+    /// Prophesee sensor — expand into many times that as decoded columns before the consumer got a
+    /// look in. Decoding one buffer at a time keeps that bounded: when the consumer stops taking
+    /// windows the caller simply stops calling this, and the ring (not memory) absorbs the excess.
+    pub fn decode_next(&mut self, timeout: Duration) -> Result<bool, String> {
+        self.flag.load_error().map_err(|error| error.to_string())?;
+        let Some(view) = self.device.next_with_timeout(&timeout) else {
+            // Nothing arrived, but the device clock still moved: flush a window whose boundary has
+            // passed so a mid-window pause doesn't stall delivery.
+            let current_t = self.adapter.current_t() as i64;
+            self.windower.seal_until(current_t);
+            return Ok(false);
+        };
+        if view.first_after_overflow {
+            self.windower.mark_overflow();
+        }
+        let slice = view.slice;
+        let windower = &mut self.windower;
+        convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
+            windower.push(x, y, t, polarity)
+        });
+        let current_t = self.adapter.current_t() as i64;
+        self.windower.seal_until(current_t);
+        Ok(true)
+    }
+
+    /// Takes the next window that has **already** completed, without touching the device. Returns
+    /// `None` once the queue sealed by [`poll`] / [`catch_up`] is empty.
+    pub fn take_pending(&mut self) -> Option<CaptureWindow> {
+        self.windower.pending.pop_front()
     }
 
     /// Seals and returns a final partial window after the stream is stopped, if any events remain.
@@ -372,24 +406,7 @@ impl Capture {
             if view.first_after_overflow {
                 overflow = true;
             }
-            let slice = view.slice;
-            let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
-                on_event(
-                    event.x,
-                    event.y,
-                    event.t as i64,
-                    matches!(event.polarity, Polarity::On),
-                );
-            };
-            match &mut self.adapter {
-                Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
-                Adapter::Dvxplorer(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {})
-                }
-                Adapter::Davis346(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
-                }
-            }
+            convert_buffer(&mut self.adapter, view.slice, &mut on_event);
         }
         Ok(overflow)
     }
@@ -423,29 +440,37 @@ impl Capture {
             if !decoding {
                 continue; // over budget: drop the buffer, freeing its ring slot without decoding.
             }
-            let slice = view.slice;
-            let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
-                on_event(
-                    event.x,
-                    event.y,
-                    event.t as i64,
-                    matches!(event.polarity, Polarity::On),
-                );
-            };
-            match &mut self.adapter {
-                Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
-                Adapter::Dvxplorer(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {})
-                }
-                Adapter::Davis346(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
-                }
-            }
+            convert_buffer(&mut self.adapter, view.slice, &mut on_event);
             if start.elapsed() >= budget {
                 decoding = false;
             }
         }
         Ok(overflow)
+    }
+}
+
+/// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity
+/// event as `(x, y, t_us, positive)` and discarding the IMU/trigger/APS streams. The single place
+/// the per-device adapter variants are matched, shared by every decode path above.
+fn convert_buffer(
+    adapter: &mut Adapter,
+    slice: &[u8],
+    mut on_event: impl FnMut(u16, u16, i64, bool),
+) {
+    let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
+        on_event(
+            event.x,
+            event.y,
+            event.t as i64,
+            matches!(event.polarity, Polarity::On),
+        );
+    };
+    match adapter {
+        Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
+        Adapter::Dvxplorer(adapter) => adapter.convert(slice, handle, |_imu| {}, |_trigger| {}),
+        Adapter::Davis346(adapter) => {
+            adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
+        }
     }
 }
 
