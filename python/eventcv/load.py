@@ -220,9 +220,11 @@ def open(
     )
 
 
-# `FrameSink` (streaming HDF5 representation writer) is only built when the extension
-# includes HDF5 support; published wheels do, but keep the import resilient otherwise.
+# `FrameSink` (streaming HDF5 representation writer) and `EventSink` (streaming HDF5 event
+# writer) are only built when the extension includes HDF5 support; published wheels do, but
+# keep the import resilient otherwise.
 FrameSink = getattr(_rust, "FrameSink", None)
+EventSink = getattr(_rust, "EventSink", None)
 
 # `EventCamera` and the live-streaming functions are only built when the extension includes
 # USB camera support (the published wheels do); keep imports resilient otherwise.
@@ -256,6 +258,17 @@ def stream(
     dt_ms: float | None = None,
     max_events: int | None = None,
     repr: str | None = None,
+    bins: int | None = None,
+    window_ms: float | None = None,
+    tau_ms: float | None = None,
+    max_window_ms: float | None = None,
+    window: int | None = None,
+    normalize: bool | None = None,
+    record: str | None = None,
+    compression: int | None = None,
+    latest: bool = False,
+    max_event_rate: float | None = None,
+    roi: tuple[int, int, int, int] | None = None,
     decay_ms: float = 30.0,
 ) -> EventCamera:
     """Open a live USB event camera — the streaming twin of :func:`open`.
@@ -271,9 +284,56 @@ def stream(
     yielded, so a loop never spins on idle time.
 
     Pass ``repr`` (a representation name — ``"count"``, ``"voxel"``, ``"tencode"``, …) to make
-    iteration yield rendered :class:`EventFrame` s instead of raw streams, mirroring
-    ``open(repr=…)``. ``decay_ms`` sets the fade time constant of the raw :meth:`EventCamera.show`
-    view.
+    iteration (and :meth:`EventCamera.read`) yield rendered :class:`EventFrame` s instead of raw
+    streams, mirroring ``open(repr=…)``. The per-representation options are the same ones
+    :meth:`EventReader.with_repr` takes — ``bins``, ``window_ms``, ``tau_ms``, ``max_window_ms``,
+    ``window`` (for ``"flow"``), and ``normalize``. ``decay_ms`` sets the fade time constant of the
+    raw :meth:`EventCamera.show` view.
+
+    **Time spans follow the capture window.** An unset ``window_ms`` / ``tau_ms`` /
+    ``max_window_ms`` defaults to ``dt_ms``, so a live representation covers exactly the events it
+    was handed: ``stream(dt_ms=50, repr="tencode")`` encodes the full 50 ms instead of the 30 ms
+    default (which would silently discard the oldest 20 ms of every window). Set one explicitly to
+    override — ``stream(dt_ms=50, repr="tencode", window_ms=20)`` keeps only the newest 20 ms. In
+    ``max_events`` mode there is no fixed duration, so the 30 ms defaults stand.
+
+    Pass ``record`` (an ``.h5``/``.hdf5`` path) to archive the session while you work: every window
+    the loop reads has its **raw** events appended to that file first, so a ``repr=`` loop processes
+    representations live and still keeps the full-resolution recording for later. Writing happens in
+    Rust as each window is polled — no per-window Python round trip — and is flushed about once a
+    second, so a crash keeps everything up to a second ago. ``compression`` is an optional gzip level
+    (``0..=9``); omit it for the fastest writes. The file is closed by :meth:`EventCamera.close` or
+    the ``with`` block, and :attr:`EventCamera.n_recorded` counts what has been written. Only windows
+    that are actually read are recorded (``show()`` doesn't poll them); to record without a loop, use
+    :meth:`EventCamera.record` instead.
+
+    **Capping the source.** Every event costs time to decode, window, and render, so the cheapest
+    event is one the camera never sends. ``max_event_rate`` (events per second) enables the sensor's
+    on-chip event-rate controller, and ``roi=(x0, y0, width, height)`` masks every pixel outside that
+    rectangle, so neither costs the host anything. Both are Prophesee features (EVK4, EVK3 HD); on
+    other cameras they raise rather than silently doing nothing. A saturating scene on a 1280×720
+    sensor can emit far more than one core can decode, and capping the source is the only fix that
+    keeps the events you *do* get contiguous rather than punched full of dropout holes::
+
+        ecv.stream(dt_ms=50, max_event_rate=40_000_000)     # 40 Mev/s ceiling, enforced on-chip
+        ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))      # centre quarter only
+
+    Decoding, and any ``record=`` writing, run on a **background thread** that owns the camera, so
+    the driver's ring is drained continuously no matter what your loop is doing — the loop only
+    collects windows that are already decoded. On a Prophesee EVK4 at ``dt_ms=50`` this leaves
+    ~80% of each window's wall-clock budget free for your own work: 40 ms of per-frame processing
+    still holds 19.9 of an ideal 20 fps with the ring empty. (:meth:`EventCamera.show`,
+    :meth:`EventCamera.record`, and :meth:`EventCamera.close` pause the thread and take the camera
+    back, then it restarts on the next read.)
+
+    Windows are delivered in order, so a loop whose per-window work is slower than the camera still
+    falls behind — the thread buffers a few windows, then applies backpressure, and under *sustained*
+    overload the driver's ring is what finally overflows (watch :attr:`EventCamera.n_overflows`).
+    Pass ``latest=True`` to trade completeness for freshness instead: reads hand back the **newest**
+    decoded window and drop what it overtook, keeping latency at about one window no matter how slow
+    the loop is. :attr:`EventCamera.n_skipped` counts the windows passed over, and ``record=`` still
+    archives every one of them from the capture thread — so the loop sees live data while the file
+    keeps the full recording.
 
     The returned camera is a context manager and an iterator::
 
@@ -290,8 +350,33 @@ def stream(
                 if done:
                     break
 
-        # Record to a file (format by extension), stopping after 10 s or on Ctrl+C:
+        # A `while` loop that returns one representation per time window — `read()` blocks for
+        # the next window (here one MCTS frame per ~50 ms of events):
+        cam = eventcv.stream(dt_ms=50, repr="mcts")
+        while running:
+            frame = cam.read()              # EventFrame (mcts); use max_events=N for count windows
+            infer(frame.numpy())
+
+        # Process representations live *and* archive the raw events in the same loop:
+        with eventcv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
+            while running:
+                infer(cam.read().numpy())   # raw events for this window are already on disk
+
+        # `latest=True` keeps slow work on live data — the file still gets every window:
+        with eventcv.stream(dt_ms=30, repr="count", record="session.h5", latest=True) as cam:
+            while running:
+                slow_inference(cam.read().numpy())
+            print(cam.n_skipped, "windows skipped,", cam.n_recorded, "events recorded")
+
+        # Record continuously, straight to disk (HDF5 streams window-by-window, never buffering
+        # the whole session), stopping after 10 s or on Ctrl+C:
         eventcv.stream().record("session.h5", seconds=10)
+
+        # Or drive the recorder yourself with an EventSink, mixing capture and processing:
+        with eventcv.stream(dt_ms=50) as cam, eventcv.EventSink("session.h5") as sink:
+            for events in cam:
+                sink.append(events)         # to disk
+                track(events)               # ...and process the same window live
 
     Requires a build with camera support and, on Linux, udev rules for USB access.
     """
@@ -302,6 +387,17 @@ def stream(
         dt_ms=dt_ms,
         max_events=max_events,
         repr=repr,
+        bins=bins,
+        window_ms=window_ms,
+        tau_ms=tau_ms,
+        max_window_ms=max_window_ms,
+        window=window,
+        normalize=normalize,
+        record=record,
+        compression=compression,
+        latest=latest,
+        max_event_rate=max_event_rate,
+        roi=roi,
         decay_ms=decay_ms,
     )
 
@@ -429,6 +525,7 @@ __all__ = [
     "EventFrame",
     "EventPointSet",
     "EventReader",
+    "EventSink",
     "EventStream",
     "FEAST",
     "FrameSink",

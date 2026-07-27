@@ -1037,9 +1037,16 @@ fn glyph_segments(glyph: char) -> &'static [[(f32, f32); 2]] {
 }
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for chunk in rgb.chunks_exact(3) {
-        rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+    // Indexed writes into a preallocated buffer, rather than `extend_from_slice` per pixel: this
+    // runs once per displayed live frame at full sensor resolution, and the per-call overhead of
+    // `extend_from_slice` (a length check plus a memcpy call for each 3-byte chunk) adds up at that
+    // rate on cores with less headroom to hide it.
+    let mut rgba = vec![0u8; rgb.len() / 3 * 4];
+    for (src, dst) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = 255;
     }
     rgba
 }

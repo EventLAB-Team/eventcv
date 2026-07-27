@@ -15,7 +15,7 @@ pub use bag::{open_bag_slice, read_bag, write_bag, BagSliceSource};
 #[cfg(feature = "hdf5")]
 pub use h5::{
     open_hdf5_slice, read_hdf5, read_hdf5_frame, write_hdf5_frame, write_hdf5_stream,
-    Hdf5FrameSink, Hdf5SliceSource,
+    Hdf5EventSink, Hdf5FrameSink, Hdf5SliceSource,
 };
 pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream};
 pub use prophesee::read_dat;
@@ -209,6 +209,13 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
             "file has no extension to detect its format".to_owned(),
         )),
     }
+}
+
+/// Whether `path`'s format can be written incrementally with [`Hdf5EventSink`] — currently only
+/// HDF5. The live recorder uses this to stream a camera to disk window-by-window when it can, and
+/// fall back to buffering the whole recording in memory (then [`save_stream`]) when it can't.
+pub fn supports_event_append(path: impl AsRef<Path>) -> bool {
+    matches!(detect_format(path.as_ref()), Ok(Format::Hdf5))
 }
 
 /// Loads events from any supported file, detected by extension — the OpenCV-style

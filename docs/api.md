@@ -39,6 +39,15 @@ from the methods, so the two forms stay in sync.
 
 .. autoclass:: eventcv.Camera
    :members:
+
+.. autoclass:: eventcv.EventCamera
+   :members:
+
+.. autoclass:: eventcv.EventSink
+   :members:
+
+.. autoclass:: eventcv.FrameSink
+   :members:
 ```
 
 ## FEAST feature learning
@@ -71,6 +80,36 @@ feast = ecv.load_feast("model.npz")     # ...and reload it
    :members:
 ```
 
+(live-camera-streaming)=
+## Live camera streaming
+
+`eventcv.stream(...)` opens a USB event camera (Prophesee EVK4/EVK3-HD, iniVation
+DVXplorer/DAVIS346, CenturyArks) as a live {class}`~eventcv.EventCamera` — the streaming twin of
+{func}`~eventcv.open`. It yields the same {class}`~eventcv.EventStream` windows the file readers do,
+so every representation, transform, feature detector, and viewer composes on a live feed:
+
+```python
+import eventcv as ecv
+
+with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
+    while running:
+        infer(cam.read().numpy())   # a representation per window; raw events archived as you go
+```
+
+Windowing mirrors `open` (`dt_ms` or `max_events`), `repr=` and its options render each window,
+`record=` archives the raw events, `latest=True` keeps a slow loop on live data, and
+`max_event_rate` / `roi` cap what the sensor emits in hardware. See the
+[streaming guide](streaming.md) for the full picture — recording, staying live under load, source
+caps, and troubleshooting. These functions are built into wheels that include camera support; on
+Linux the camera needs udev rules for non-root USB access.
+
+```{eval-rst}
+.. currentmodule:: eventcv
+
+.. autofunction:: stream
+.. autofunction:: list_cameras
+```
+
 (functional-opencv-style-api)=
 ## Functional (OpenCV-style) API
 
@@ -86,6 +125,6 @@ with `slice`/`windows`/`with_repr` without loading the file.
 .. automodule:: eventcv
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
-      Polarity, FrameSink, FEAST, load, from_numpy, open, save, load_frame, load_feast,
-      export_png, collate
+      Polarity, FrameSink, EventSink, EventCamera, FEAST, load, from_numpy, open, save,
+      load_frame, load_feast, export_png, collate, stream, list_cameras
 ```

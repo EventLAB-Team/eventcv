@@ -104,6 +104,35 @@ fn speed_name(speed: nd::usb::Speed) -> &'static str {
     }
 }
 
+/// The reference period the hardware event-rate controller averages over. The register field is 10
+/// bits, so this is the largest round period that fits — long enough to smooth bursts, short enough
+/// that the cap still tracks a changing scene.
+const RATE_LIMIT_PERIOD_US: u16 = 1000;
+
+/// Widest cap the rate controller's 22-bit budget register can express, per reference period.
+const RATE_LIMIT_MAX_PER_PERIOD: u64 = (1 << 22) - 1;
+
+/// Limits applied to the **sensor itself**, so it never emits more than the pipeline can consume.
+///
+/// Everything downstream of the USB cable — decoding, windowing, representations — costs time per
+/// event, so the cheapest event is one the camera never sends. These are hardware features: the
+/// Prophesee event-rate controller drops events on-chip, and the region masks stop pixels producing
+/// them at all, neither of which costs the host anything.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Ceiling on events per second, enforced on-chip. `None` leaves the sensor unlimited.
+    pub max_event_rate: Option<u64>,
+    /// Only pixels inside `(x0, y0, width, height)` produce events. `None` uses the whole sensor.
+    pub roi: Option<(usize, usize, usize, usize)>,
+}
+
+impl Limits {
+    /// Whether anything is actually limited (an all-`None` set is left unapplied).
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// How the incoming event stream is cut into [`EventStream`] windows — the live twin of
 /// [`io::open`](crate::io::open)'s `dt_ms` / `max_events`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -210,8 +239,18 @@ impl Windower {
     }
 
     /// Seals the current window into `pending` and starts a fresh one.
+    ///
+    /// The replacement is sized from the window just sealed: consecutive windows hold similar event
+    /// counts, so the next one fills without reallocating. Starting from zero meant a busy window
+    /// (millions of events on a high-resolution sensor) grew its four column vectors through ~20
+    /// doublings, copying everything accumulated so far each time.
     fn seal(&mut self) {
-        let fresh = EventStreamBuilder::new(self.width, self.height, TIMESTAMP_SCALE_MS);
+        let fresh = EventStreamBuilder::with_capacity(
+            self.width,
+            self.height,
+            TIMESTAMP_SCALE_MS,
+            self.builder.len(),
+        );
         let builder = std::mem::replace(&mut self.builder, fresh);
         self.pending.push_back(CaptureWindow {
             stream: builder.build(),
@@ -246,18 +285,22 @@ pub struct Capture {
 impl Capture {
     /// Opens a camera and begins streaming. `serial` selects a specific device (from
     /// [`CameraInfo::serial`]); `None` opens the first supported camera found. `window` sets how the
-    /// stream is cut into [`CaptureWindow`]s.
+    /// stream is cut into [`CaptureWindow`]s, and `limits` caps what the sensor emits.
     ///
-    /// The device is opened with its default configuration (biases, ROI, …). Errors — no camera
-    /// found, permission denied (missing udev rules on Linux), or an unreadable serial — are
-    /// returned as a human-readable string.
-    pub fn open(serial: Option<&str>, window: Window) -> Result<Self, String> {
+    /// Apart from `limits` the device is opened with its default configuration (biases, clock, …).
+    /// Errors — no camera found, permission denied (missing udev rules on Linux), an unreadable
+    /// serial, or limits the device can't honour — are returned as a human-readable string.
+    pub fn open(serial: Option<&str>, window: Window, limits: Limits) -> Result<Self, String> {
         let (flag, event_loop) = nd::flag_and_event_loop().map_err(|error| error.to_string())?;
         let selector = match serial {
             Some(serial) => nd::SerialOrBusNumberAndAddress::Serial(serial),
             None => nd::SerialOrBusNumberAndAddress::None,
         };
-        let device = nd::open(selector, None, None, event_loop.clone(), flag.clone())
+        // Applied as part of the opening handshake: the driver writes the rate controller and the
+        // region masks while configuring the sensor, and only re-writes the masks afterwards, so a
+        // rate cap set after open would be silently ignored.
+        let configuration = limits_configuration(serial, limits)?;
+        let device = nd::open(selector, configuration, None, event_loop.clone(), flag.clone())
             .map_err(|error| open_error(serial, error))?;
         let (width, height) = device_dimensions(&device);
         let name = device.name().to_owned();
@@ -320,32 +363,56 @@ impl Capture {
                 self.windower.mark_overflow();
             }
             let slice = view.slice;
-            // Disjoint field borrows: `slice` borrows `self.device`, the closures borrow
-            // `self.windower`, and the match borrows `self.adapter`.
+            // Disjoint field borrows: `slice` borrows `self.device`, the closure borrows
+            // `self.windower`, and `convert_buffer` borrows `self.adapter`.
             let windower = &mut self.windower;
-            let on_polarity = |event: nd::types::PolarityEvent<u64, u16, u16>| {
-                windower.push(
-                    event.x,
-                    event.y,
-                    event.t as i64,
-                    matches!(event.polarity, Polarity::On),
-                );
-            };
-            match &mut self.adapter {
-                Adapter::Evt3(adapter) => adapter.convert(slice, on_polarity, |_trigger| {}),
-                Adapter::Dvxplorer(adapter) => {
-                    adapter.convert(slice, on_polarity, |_imu| {}, |_trigger| {})
-                }
-                Adapter::Davis346(adapter) => {
-                    adapter.convert(slice, on_polarity, |_imu| {}, |_trigger| {}, |_frame| {})
-                }
-            }
+            convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
+                windower.push(x, y, t, polarity)
+            });
             // Flush the current window if its boundary has passed, so a mid-window pause doesn't
             // stall delivery. `current_t` advances with the device clock even during quiet periods.
             let current_t = self.adapter.current_t() as i64;
             self.windower.seal_until(current_t);
         }
         Ok(self.windower.pending.pop_front())
+    }
+
+    /// Decodes **at most one** queued buffer into the window grid, waiting up to `timeout` for one
+    /// to arrive. Returns whether a buffer was decoded; completed windows are collected with
+    /// [`take_pending`].
+    ///
+    /// This is the windowed twin of [`drain_events`](Self::drain_events), deliberately stopping
+    /// after a single buffer: a caller that decodes ahead of its consumer must be able to pause. A
+    /// full-ring drain would let the driver's ring — half a gigabyte of encoded events on a
+    /// Prophesee sensor — expand into many times that as decoded columns before the consumer got a
+    /// look in. Decoding one buffer at a time keeps that bounded: when the consumer stops taking
+    /// windows the caller simply stops calling this, and the ring (not memory) absorbs the excess.
+    pub fn decode_next(&mut self, timeout: Duration) -> Result<bool, String> {
+        self.flag.load_error().map_err(|error| error.to_string())?;
+        let Some(view) = self.device.next_with_timeout(&timeout) else {
+            // Nothing arrived, but the device clock still moved: flush a window whose boundary has
+            // passed so a mid-window pause doesn't stall delivery.
+            let current_t = self.adapter.current_t() as i64;
+            self.windower.seal_until(current_t);
+            return Ok(false);
+        };
+        if view.first_after_overflow {
+            self.windower.mark_overflow();
+        }
+        let slice = view.slice;
+        let windower = &mut self.windower;
+        convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
+            windower.push(x, y, t, polarity)
+        });
+        let current_t = self.adapter.current_t() as i64;
+        self.windower.seal_until(current_t);
+        Ok(true)
+    }
+
+    /// Takes the next window that has **already** completed, without touching the device. Returns
+    /// `None` once the queue sealed by [`poll`] / [`catch_up`] is empty.
+    pub fn take_pending(&mut self) -> Option<CaptureWindow> {
+        self.windower.pending.pop_front()
     }
 
     /// Seals and returns a final partial window after the stream is stopped, if any events remain.
@@ -372,24 +439,7 @@ impl Capture {
             if view.first_after_overflow {
                 overflow = true;
             }
-            let slice = view.slice;
-            let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
-                on_event(
-                    event.x,
-                    event.y,
-                    event.t as i64,
-                    matches!(event.polarity, Polarity::On),
-                );
-            };
-            match &mut self.adapter {
-                Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
-                Adapter::Dvxplorer(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {})
-                }
-                Adapter::Davis346(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
-                }
-            }
+            convert_buffer(&mut self.adapter, view.slice, &mut on_event);
         }
         Ok(overflow)
     }
@@ -423,29 +473,142 @@ impl Capture {
             if !decoding {
                 continue; // over budget: drop the buffer, freeing its ring slot without decoding.
             }
-            let slice = view.slice;
-            let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
-                on_event(
-                    event.x,
-                    event.y,
-                    event.t as i64,
-                    matches!(event.polarity, Polarity::On),
-                );
-            };
-            match &mut self.adapter {
-                Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
-                Adapter::Dvxplorer(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {})
-                }
-                Adapter::Davis346(adapter) => {
-                    adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
-                }
-            }
+            convert_buffer(&mut self.adapter, view.slice, &mut on_event);
             if start.elapsed() >= budget {
                 decoding = false;
             }
         }
         Ok(overflow)
+    }
+}
+
+/// Builds the device configuration that carries [`Limits`] into the opening handshake, or `None`
+/// when nothing is limited (the device then keeps its stock configuration).
+///
+/// The variant has to match the device being opened, so the camera is identified by enumeration
+/// first. Only the Prophesee sensors have an on-chip rate controller and region masks; asking for
+/// limits on another camera is an error rather than a silent no-op, since the caller would
+/// otherwise believe the source was capped when it isn't.
+fn limits_configuration(
+    serial: Option<&str>,
+    limits: Limits,
+) -> Result<Option<nd::Configuration>, String> {
+    if limits.is_empty() {
+        return Ok(None);
+    }
+    let listed = nd::list_devices().map_err(|error| error.to_string())?;
+    let device = match serial {
+        Some(serial) => listed
+            .iter()
+            .find(|device| device.serial.as_deref().ok() == Some(serial))
+            .ok_or_else(|| format!("no camera with serial {serial} found"))?,
+        None => listed
+            .first()
+            .ok_or_else(|| "no event camera found".to_owned())?,
+    };
+    macro_rules! prophesee {
+        ($module:ident, $variant:ident) => {{
+            use nd::devices::$module::{DEFAULT_CONFIGURATION, PROPERTIES, RateLimiter};
+            let mut configuration = DEFAULT_CONFIGURATION;
+            configuration.rate_limiter = rate_limiter(limits.max_event_rate).map(
+                |(reference_period_us, maximum_events_per_period)| RateLimiter {
+                    reference_period_us,
+                    maximum_events_per_period,
+                },
+            );
+            if let Some(roi) = limits.roi {
+                let (x_mask, y_mask) =
+                    region_masks(roi, PROPERTIES.width as usize, PROPERTIES.height as usize)?;
+                configuration.x_mask = x_mask;
+                configuration.y_mask = y_mask;
+                configuration.mask_intersection_only = false;
+            }
+            nd::Configuration::$variant(configuration)
+        }};
+    }
+    Ok(Some(match device.device_type {
+        nd::Type::PropheseeEvk4 => prophesee!(prophesee_evk4, PropheseeEvk4),
+        nd::Type::PropheseeEvk3Hd => prophesee!(prophesee_evk3_hd, PropheseeEvk3Hd),
+        other => {
+            return Err(format!(
+                "{} has no on-chip event-rate controller or region masks — max_event_rate and roi \
+                 are supported on Prophesee sensors (EVK4, EVK3 HD) only",
+                other.name(),
+            ))
+        }
+    }))
+}
+
+/// Converts an events-per-second ceiling into the rate controller's `(reference period, events
+/// allowed per period)` pair. `None` (no ceiling) turns the controller off. A cap below one event
+/// per period still admits one, since the register cannot express "none".
+fn rate_limiter(max_event_rate: Option<u64>) -> Option<(u16, u32)> {
+    let rate = max_event_rate?;
+    let per_period = (rate * RATE_LIMIT_PERIOD_US as u64 / 1_000_000)
+        .clamp(1, RATE_LIMIT_MAX_PER_PERIOD) as u32;
+    Some((RATE_LIMIT_PERIOD_US, per_period))
+}
+
+/// Builds the column and row masks that leave only `(x0, y0, width, height)` producing events.
+///
+/// The masks are bitmaps over sensor columns and rows, and are applied as regions of *non*-interest
+/// (the driver's `mask_intersection_only: false`), so a set bit blocks that column or row: we set
+/// every bit outside the rectangle.
+///
+/// Columns map straight across — bit `i` is column `i` — but **rows are stored bottom-up**: bit `i`
+/// is row `height - 1 - i`. Verified on an EVK4, where a top-left `(0, 0, 200, 200)` region built
+/// row-major came back as rows 520..719, the exact mirror. A vertically symmetric rectangle looks
+/// correct either way, so this is easy to miss.
+fn region_masks(
+    roi: (usize, usize, usize, usize),
+    sensor_width: usize,
+    sensor_height: usize,
+) -> Result<([u64; 20], [u64; 12]), String> {
+    let (x0, y0, width, height) = roi;
+    if width == 0 || height == 0 {
+        return Err("roi width and height must be at least 1".to_owned());
+    }
+    let (x1, y1) = (x0 + width, y0 + height);
+    if x1 > sensor_width || y1 > sensor_height {
+        return Err(format!(
+            "roi ({x0}, {y0}, {width}, {height}) reaches ({x1}, {y1}), outside the \
+             {sensor_width}x{sensor_height} sensor"
+        ));
+    }
+    let mut x_mask = [0_u64; 20];
+    let mut y_mask = [0_u64; 12];
+    for column in (0..sensor_width).filter(|column| !(x0..x1).contains(column)) {
+        x_mask[column / 64] |= 1 << (column % 64);
+    }
+    for row in (0..sensor_height).filter(|row| !(y0..y1).contains(row)) {
+        let bit = sensor_height - 1 - row;
+        y_mask[bit / 64] |= 1 << (bit % 64);
+    }
+    Ok((x_mask, y_mask))
+}
+
+/// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity
+/// event as `(x, y, t_us, positive)` and discarding the IMU/trigger/APS streams. The single place
+/// the per-device adapter variants are matched, shared by every decode path above.
+fn convert_buffer(
+    adapter: &mut Adapter,
+    slice: &[u8],
+    mut on_event: impl FnMut(u16, u16, i64, bool),
+) {
+    let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
+        on_event(
+            event.x,
+            event.y,
+            event.t as i64,
+            matches!(event.polarity, Polarity::On),
+        );
+    };
+    match adapter {
+        Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
+        Adapter::Dvxplorer(adapter) => adapter.convert(slice, handle, |_imu| {}, |_trigger| {}),
+        Adapter::Davis346(adapter) => {
+            adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
+        }
     }
 }
 
@@ -465,7 +628,50 @@ fn device_dimensions(device: &nd::Device) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Window, Windower};
+    use super::{rate_limiter, region_masks, Window, Windower};
+
+    #[test]
+    fn rate_limiter_converts_events_per_second_to_a_period_budget() {
+        // 50 Mev/s over a 1 ms reference period is 50k events per period.
+        assert_eq!(rate_limiter(Some(50_000_000)), Some((1000, 50_000)));
+        assert_eq!(rate_limiter(None), None);
+        // Below one event per period the register still has to admit one.
+        assert_eq!(rate_limiter(Some(100)), Some((1000, 1)));
+        // Beyond the 22-bit budget the cap saturates rather than wrapping.
+        assert_eq!(rate_limiter(Some(u64::MAX / 1000)), Some((1000, (1 << 22) - 1)));
+    }
+
+    #[test]
+    fn region_masks_block_everything_outside_the_rectangle() {
+        let (x_mask, y_mask) = region_masks((100, 50, 200, 100), 1280, 720).unwrap();
+        let bit = |mask: &[u64], index: usize| mask[index / 64] & (1 << (index % 64)) != 0;
+        // Columns map straight across; rows are stored bottom-up.
+        let column_blocked = |column: usize| bit(&x_mask, column);
+        let row_blocked = |row: usize| bit(&y_mask, 720 - 1 - row);
+
+        assert!(column_blocked(99) && column_blocked(300)); // just outside
+        assert!(!column_blocked(100) && !column_blocked(299)); // the edges are kept
+        assert!(row_blocked(49) && row_blocked(150));
+        assert!(!row_blocked(50) && !row_blocked(149));
+        // Bits past the sensor height belong to no row, so they stay clear.
+        assert!(!bit(&y_mask, 720));
+    }
+
+    #[test]
+    fn region_masks_store_rows_bottom_up() {
+        // A top-left region: rows 0..199 kept. Stored bottom-up, the *kept* bits are the top ones.
+        let (_, y_mask) = region_masks((0, 0, 200, 200), 1280, 720).unwrap();
+        let bit = |index: usize| y_mask[index / 64] & (1 << (index % 64)) != 0;
+        assert!(bit(0) && bit(519), "rows 200..719 must be blocked, low bits set");
+        assert!(!bit(520) && !bit(719), "rows 0..199 must be kept, high bits clear");
+    }
+
+    #[test]
+    fn region_masks_reject_a_rectangle_off_the_sensor() {
+        assert!(region_masks((0, 0, 1280, 720), 1280, 720).is_ok());
+        assert!(region_masks((1, 0, 1280, 720), 1280, 720).is_err());
+        assert!(region_masks((0, 0, 0, 100), 1280, 720).is_err());
+    }
 
     #[test]
     fn count_windows_split_by_event_count() {

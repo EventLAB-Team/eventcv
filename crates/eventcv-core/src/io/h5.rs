@@ -1174,6 +1174,137 @@ impl Hdf5FrameSink {
     }
 }
 
+/// Events per chunk in the extendable `events/*` datasets. Large enough that appending many small
+/// live windows (a 30 ms camera window may hold only a few thousand events) doesn't litter the file
+/// with tiny chunks, small enough that the write cache for four columns stays modest.
+const EVENT_CHUNK: usize = 1 << 16;
+
+/// The four extendable column datasets, created lazily once the first window fixes the sensor grid.
+struct SinkColumns {
+    x: Dataset,
+    y: Dataset,
+    t: Dataset,
+    p: Dataset,
+}
+
+/// Streams [`EventStream`] windows into extendable `events/{x,y,t,p}` datasets — the event-level
+/// counterpart of [`Hdf5FrameSink`]. Where that sink appends computed frames, this appends the raw
+/// events themselves, so a live camera can be recorded to disk window-by-window without holding the
+/// whole session in memory. The file it produces is read back by [`read_hdf5`] / [`open_hdf5_slice`]
+/// exactly like a recording written by [`write_hdf5_stream`]: the same `events` group, the same
+/// `width` / `height` / `timestamp_scale_ms` root attributes, and the `t` column in the stream's own
+/// raw units (microseconds for the usual `0.001` scale).
+///
+/// The sensor size and time base are taken from the first appended window (mirroring how
+/// [`Hdf5FrameSink`] takes its shape from the first frame), so no dimensions are needed up front.
+/// The datasets are chunked (required for the unlimited append axis) and, by default, uncompressed
+/// for maximum write throughput; pass a gzip level to [`open`](Self::open) to trade CPU for size.
+pub struct Hdf5EventSink {
+    file: File,
+    compression: Option<u8>,
+    // `None` until the first non-empty append creates the group, datasets, and metadata attributes.
+    columns: Option<SinkColumns>,
+    count: usize,
+}
+
+impl Hdf5EventSink {
+    /// Creates the output file; the `events` group and its column datasets are created lazily on the
+    /// first non-empty [`append`](Self::append), which also stamps the sensor size and time base.
+    /// `compression` is an optional gzip level (`0..=9`); `None` leaves the columns uncompressed
+    /// (the default — fastest to write).
+    pub fn open(path: impl AsRef<Path>, compression: Option<u8>) -> Result<Self, IoError> {
+        let file = File::create(path.as_ref()).map_err(map_hdf5_error)?;
+        Ok(Self {
+            file,
+            compression,
+            columns: None,
+            count: 0,
+        })
+    }
+
+    /// Appends one window's events to the end of every column. Empty windows are a no-op. The first
+    /// non-empty window creates the datasets and writes `width` / `height` / `timestamp_scale_ms`
+    /// from the stream. The `t` values are written verbatim (the stream's raw units), matching
+    /// [`write_hdf5_stream`].
+    pub fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        let n = stream.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if self.columns.is_none() {
+            let (width, height) = stream.sensor_size();
+            let events = self.file.create_group("events").map_err(map_hdf5_error)?;
+            let columns = SinkColumns {
+                x: new_event_column::<u16>(&events, "x", self.compression)?,
+                y: new_event_column::<u16>(&events, "y", self.compression)?,
+                t: new_event_column::<i64>(&events, "t", self.compression)?,
+                p: new_event_column::<u8>(&events, "p", self.compression)?,
+            };
+            write_scalar_attr(&self.file, "width", width as u64)?;
+            write_scalar_attr(&self.file, "height", height as u64)?;
+            write_scalar_attr(&self.file, "timestamp_scale_ms", stream.timestamp_scale_ms())?;
+            self.columns = Some(columns);
+        }
+        let columns = self.columns.as_ref().expect("created above");
+        let start = self.count;
+        let end = start + n;
+        append_column(&columns.x, start, end, stream.xs())?;
+        append_column(&columns.y, start, end, stream.ys())?;
+        append_column(&columns.t, start, end, stream.ts())?;
+        let polarities: Vec<u8> = stream.ps().iter().map(|&p| u8::from(p)).collect();
+        append_column(&columns.p, start, end, &polarities)?;
+        self.count = end;
+        Ok(())
+    }
+
+    /// Total events written so far (the shared length of every column).
+    pub fn n_events(&self) -> usize {
+        self.count
+    }
+
+    /// Forces buffered data out to the file without closing it, so a crash mid-recording keeps
+    /// everything appended so far. Call periodically during a long capture.
+    pub fn flush(&self) -> Result<(), IoError> {
+        self.file.flush().map_err(map_hdf5_error)
+    }
+
+    /// Flushes and closes the file (dropping the sink also closes it).
+    pub fn finish(self) -> Result<(), IoError> {
+        self.file.flush().map_err(map_hdf5_error)
+    }
+}
+
+/// Creates one empty, extendable (`0..` on the append axis), chunked column dataset, optionally
+/// gzip-compressed.
+fn new_event_column<T: H5Type>(
+    group: &Group,
+    name: &str,
+    compression: Option<u8>,
+) -> Result<Dataset, IoError> {
+    let mut builder = group.new_dataset::<T>().chunk(EVENT_CHUNK);
+    if let Some(level) = compression {
+        builder = builder.deflate(level);
+    }
+    builder
+        .shape((0usize..,))
+        .create(name)
+        .map_err(map_hdf5_error)
+}
+
+/// Resizes `dataset` to `end` and writes `values` into the freshly opened `start..end` tail.
+fn append_column<T: H5Type + Clone>(
+    dataset: &Dataset,
+    start: usize,
+    end: usize,
+    values: &[T],
+) -> Result<(), IoError> {
+    dataset.resize(end).map_err(map_hdf5_error)?;
+    let array = Array1::from_vec(values.to_vec());
+    dataset
+        .write_slice(&array, ndarray::s![start..end])
+        .map_err(map_hdf5_error)
+}
+
 fn write_dataset<T: H5Type + Clone>(group: &Group, name: &str, data: &[T]) -> Result<(), IoError> {
     let array = Array1::from_vec(data.to_vec());
     group
@@ -1819,6 +1950,62 @@ mod tests {
         let file = File::open(&path).unwrap();
         let dataset = file.dataset("frames").unwrap();
         assert_eq!(dataset.shape(), vec![3, channels, height, width]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn event_sink_appends_windows_and_round_trips() {
+        // Two windows appended one after another must read back as one concatenated recording,
+        // in order, with the sensor size and time base recovered from the attributes alone.
+        let window = |events: &[(u16, u16, i64, bool)]| {
+            let mut builder = EventStreamBuilder::new(12, 9, 0.001);
+            for &(x, y, t, p) in events {
+                builder.push(x, y, t, p);
+            }
+            builder.build()
+        };
+        let first = window(&[(1, 2, 100, true), (3, 4, 200, false)]);
+        let second = window(&[(5, 6, 300, true), (11, 8, 400, false), (0, 0, 500, true)]);
+
+        let dir = temp_dir("h5eventsink");
+        let path = dir.join("live.h5");
+        let mut sink = Hdf5EventSink::open(&path, None).unwrap();
+        sink.append(&first).unwrap();
+        sink.append(&window(&[])).unwrap(); // empty window is a no-op
+        sink.flush().unwrap();
+        sink.append(&second).unwrap();
+        assert_eq!(sink.n_events(), 5);
+        sink.finish().unwrap();
+
+        // No options: size and unit come from the saved attributes, not inference.
+        let loaded = read_hdf5(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(loaded.sensor_size(), (12, 9));
+        assert_eq!(loaded.xs(), &[1, 3, 5, 11, 0]);
+        assert_eq!(loaded.ys(), &[2, 4, 6, 8, 0]);
+        assert_eq!(loaded.ts(), &[100, 200, 300, 400, 500]);
+        assert_eq!(loaded.ps(), &[true, false, true, false, true]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn event_sink_compressed_round_trips() {
+        let mut builder = EventStreamBuilder::new(6, 6, 0.001);
+        for t in 0..1000i64 {
+            builder.push((t % 6) as u16, ((t / 6) % 6) as u16, t * 10, t % 2 == 0);
+        }
+        let stream = builder.build();
+
+        let dir = temp_dir("h5eventsinkgz");
+        let path = dir.join("live-gz.h5");
+        let mut sink = Hdf5EventSink::open(&path, Some(4)).unwrap();
+        sink.append(&stream).unwrap();
+        sink.finish().unwrap();
+
+        let loaded = read_hdf5(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(loaded.len(), 1000);
+        assert_eq!(loaded.xs(), stream.xs());
+        assert_eq!(loaded.ts(), stream.ts());
+        assert_eq!(loaded.ps(), stream.ps());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
