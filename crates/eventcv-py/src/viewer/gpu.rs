@@ -110,11 +110,6 @@ struct LiveApp<P> {
     window: Option<Arc<Window>>,
     render: Option<Render>,
     error: Option<String>,
-    // DEBUG ONLY (perf investigation): auto-closes after `EVENTCV_SHOW_TIMEOUT_S` seconds via the
-    // normal shutdown path, so scripted timing runs don't need `timeout`/SIGTERM (which skips
-    // `Capture`'s Drop and can leave the USB device wedged). Remove before merging.
-    started: Instant,
-    timeout: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "camera")]
@@ -123,10 +118,6 @@ where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
     fn new(producer: P, width: u32, height: u32, title: String) -> Self {
-        let timeout = std::env::var("EVENTCV_SHOW_TIMEOUT_S")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .map(std::time::Duration::from_secs_f64);
         Self {
             producer,
             width,
@@ -135,8 +126,6 @@ where
             window: None,
             render: None,
             error: None,
-            started: Instant::now(),
-            timeout,
         }
     }
 
@@ -218,26 +207,13 @@ where
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(timeout) = self.timeout {
-            if self.started.elapsed() >= timeout {
-                return self.shutdown(event_loop);
-            }
-        }
-        let debug = std::env::var_os("EVENTCV_PERF_DEBUG").is_some();
-        let t_producer = Instant::now();
         match (self.producer)() {
             Ok(Some(image)) => {
-                let producer_dt = t_producer.elapsed();
-                let t_upload = Instant::now();
                 if let Some(render) = &mut self.render {
                     render.update_image(&image);
                 }
-                let upload_dt = t_upload.elapsed();
                 if let Some(window) = &self.window {
                     window.request_redraw();
-                }
-                if debug {
-                    eprintln!("[perf] producer={:?} upload={:?}", producer_dt, upload_dt);
                 }
             }
             Ok(None) => {}
@@ -493,9 +469,6 @@ impl Render {
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        if std::env::var_os("EVENTCV_PERF_DEBUG").is_some() {
-            eprintln!("[perf] present_modes={:?} alpha_modes={:?}", caps.present_modes, caps.alpha_modes);
-        }
         let format = caps
             .formats
             .iter()
@@ -578,8 +551,6 @@ impl Render {
     }
 
     fn draw(&mut self, pitch: f32, yaw: f32, distance: f32) -> Result<(), String> {
-        let debug = std::env::var_os("EVENTCV_PERF_DEBUG").is_some();
-        let t0 = std::time::Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             // Reconfigure and skip this frame on a lost/outdated surface.
@@ -588,7 +559,6 @@ impl Render {
                 return Ok(());
             }
         };
-        let t_acquire = t0.elapsed();
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -680,27 +650,8 @@ impl Render {
             }
         }
 
-        let t_encode = t0.elapsed();
         self.queue.submit(std::iter::once(encoder.finish()));
-        let t_submit = t0.elapsed();
         frame.present();
-        if debug {
-            // Process-relative wall clock so post-processing can recover the true inter-frame
-            // interval (hence instantaneous FPS) during motion, robust to idle gaps.
-            static DRAW_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            let t_ms = DRAW_CLOCK
-                .get_or_init(std::time::Instant::now)
-                .elapsed()
-                .as_secs_f64()
-                * 1000.0;
-            eprintln!(
-                "[perf] acquire={:?} encode={:?} submit={:?} present_total={:?} t_ms={t_ms:.1}",
-                t_acquire,
-                t_encode - t_acquire,
-                t_submit - t_encode,
-                t0.elapsed()
-            );
-        }
         Ok(())
     }
 }

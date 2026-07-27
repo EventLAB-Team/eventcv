@@ -2142,6 +2142,12 @@ const LIVE_REPR_WINDOW_MS: u64 = 33;
 #[cfg(feature = "camera")]
 const LIVE_DRAIN_BUDGET_MS: u64 = 10;
 
+/// How often the capture thread renders a fresh frame for the display (~60 FPS). This paces only
+/// the *rendering*; the thread keeps draining the driver ring continuously between renders, so the
+/// USB pipeline stays fed even while the GPU thread is blocked on vsync.
+#[cfg(feature = "camera")]
+const LIVE_RENDER_INTERVAL_MS: u64 = 16;
+
 /// How the live event stream is turned into frames for the interactive viewer.
 #[cfg(feature = "camera")]
 enum LiveRenderer {
@@ -2164,42 +2170,45 @@ enum LiveRenderer {
 
 #[cfg(feature = "camera")]
 impl LiveRenderer {
-    /// Drains the driver ring **in full** and returns the next frame to display (or `None` when
-    /// nothing new this cycle). Draining every call — rather than stopping at the first window
-    /// boundary — is what keeps the driver ring from backing up and the view from lagging.
-    fn drain(
-        &mut self,
-        capture: &mut eventcv_core::device::Capture,
-    ) -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
-        match self {
+    /// Drains the driver ring (budgeted) and folds the events into the running view — stamping the
+    /// raw surface, or accumulating into the representation builder. Produces no image; that is
+    /// [`render`](Self::render)'s job, paced separately to the display.
+    ///
+    /// Meant to be called back-to-back on the capture thread so the ring is emptied continuously and
+    /// the driver never stalls (a stop-start consumer makes the driver deliver in large bursts, which
+    /// is what made the single-threaded viewer sluggish). Returns whether any events arrived this
+    /// call, so an idle loop can back off instead of busy-spinning.
+    fn pump(&mut self, capture: &mut eventcv_core::device::Capture) -> Result<bool, String> {
+        let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
+        let mut lit = false;
+        let overflow = match self {
             LiveRenderer::Raw(surface) => {
-                let debug = std::env::var_os("EVENTCV_PERF_DEBUG").is_some();
-                let mut lit = false;
-                let mut n = 0u64;
-                let t_drain = std::time::Instant::now();
-                let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
-                let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
+                capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
                     lit = true;
-                    n += 1;
                     surface.stamp(x as usize, y as usize, t_us as f64 * 0.001, positive);
-                })?;
-                let drain_dt = t_drain.elapsed();
-                if overflow {
-                    note_overflow();
-                }
-                let t_render = std::time::Instant::now();
-                let image = lit.then(|| surface.render());
-                if debug {
-                    eprintln!(
-                        "[perf]   drain={:?} (n={}) render={:?} backlog={}",
-                        drain_dt,
-                        n,
-                        t_render.elapsed(),
-                        capture.backlog()
-                    );
-                }
-                Ok(image)
+                })?
             }
+            LiveRenderer::Repr { builder, .. } => {
+                capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
+                    lit = true;
+                    builder.push(x, y, t_us, positive);
+                })?
+            }
+        };
+        if overflow {
+            note_overflow();
+        }
+        Ok(lit)
+    }
+
+    /// Produces the next frame to display, or `None` when nothing new is due. The raw surface renders
+    /// every call (it always reflects the freshest events, and the decay animates even between
+    /// events); a representation renders only once its accumulation `window` of wall-clock time has
+    /// elapsed, then resets its builder. Paced by the caller to the display refresh, independent of
+    /// [`pump`](Self::pump)'s continuous drain cadence.
+    fn render(&mut self) -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
+        match self {
+            LiveRenderer::Raw(surface) => Ok(Some(surface.render())),
             LiveRenderer::Repr {
                 spec,
                 colormap,
@@ -2210,13 +2219,6 @@ impl LiveRenderer {
                 builder,
                 last_render,
             } => {
-                let budget = std::time::Duration::from_millis(LIVE_DRAIN_BUDGET_MS);
-                let overflow = capture.drain_events_budgeted(budget, |x, y, t_us, positive| {
-                    builder.push(x, y, t_us, positive);
-                })?;
-                if overflow {
-                    note_overflow();
-                }
                 if last_render.elapsed() < *window || builder.is_empty() {
                     return Ok(None);
                 }
@@ -2230,6 +2232,99 @@ impl LiveRenderer {
             }
         }
     }
+}
+
+/// Shared state between the capture thread (drains + renders) and the main/GPU thread (presents).
+/// The capture thread publishes the freshest frame into `image` and any fatal error into `error`;
+/// the main thread sets `stop` when the window closes.
+#[cfg(feature = "camera")]
+struct LiveShared {
+    image: Mutex<Option<eventcv_core::viz::Rgb8Image>>,
+    error: Mutex<Option<String>>,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// Runs the live viewer with the draining decoupled onto a dedicated thread.
+///
+/// A background thread takes ownership of `capture` + `renderer` and continuously drains the driver
+/// ring — so the USB pipeline keeps flowing even while the GPU thread is blocked in `present()`
+/// waiting for vsync (the coupling that throttled the old single-threaded loop to ~22 FPS). It
+/// renders a frame at [`LIVE_RENDER_INTERVAL_MS`] and publishes it; the main thread's producer just
+/// hands the viewer whatever frame is freshest. Returns the reclaimed `capture` (so the camera stays
+/// usable after `show()` returns) and the viewer's result. `capture` is `None` only if the drain
+/// thread panicked.
+#[cfg(feature = "camera")]
+fn run_live_threaded(
+    capture: eventcv_core::device::Capture,
+    renderer: LiveRenderer,
+    width: u32,
+    height: u32,
+    title: String,
+) -> (Option<eventcv_core::device::Capture>, Result<(), String>) {
+    use std::sync::atomic::Ordering;
+
+    let shared = Arc::new(LiveShared {
+        image: Mutex::new(None),
+        error: Mutex::new(None),
+        stop: std::sync::atomic::AtomicBool::new(false),
+    });
+
+    let worker = Arc::clone(&shared);
+    let handle = std::thread::spawn(move || {
+        let mut capture = capture;
+        let mut renderer = renderer;
+        let render_interval = std::time::Duration::from_millis(LIVE_RENDER_INTERVAL_MS);
+        let mut last_render = std::time::Instant::now();
+        while !worker.stop.load(Ordering::Acquire) {
+            let lit = match renderer.pump(&mut capture) {
+                Ok(lit) => lit,
+                Err(message) => {
+                    *worker.error.lock().unwrap() = Some(message);
+                    break;
+                }
+            };
+            if last_render.elapsed() >= render_interval {
+                match renderer.render() {
+                    Ok(Some(image)) => *worker.image.lock().unwrap() = Some(image),
+                    Ok(None) => {}
+                    Err(message) => {
+                        *worker.error.lock().unwrap() = Some(message);
+                        break;
+                    }
+                }
+                last_render = std::time::Instant::now();
+            }
+            // Nothing to decode: sleep briefly so an idle scene doesn't peg a core. When events are
+            // flowing this never runs, so draining stays continuous.
+            if !lit {
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
+            }
+        }
+        capture
+    });
+
+    // Main-thread producer: hand the viewer the freshest published frame (taken, so an unchanged
+    // view isn't re-uploaded), surfacing any fatal drain error.
+    let producer_shared = Arc::clone(&shared);
+    let producer = move || -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
+        if let Some(message) = producer_shared.error.lock().unwrap().take() {
+            return Err(message);
+        }
+        Ok(producer_shared.image.lock().unwrap().take())
+    };
+
+    let result = viewer::run_live(producer, width, height, title);
+
+    // Stop the drain thread and reclaim the capture.
+    shared.stop.store(true, Ordering::Release);
+    handle.thread().unpark();
+    let capture = handle.join().ok();
+    // A drain-thread error is the root cause, so prefer it over the viewer's shutdown result.
+    let result = match shared.error.lock().unwrap().take() {
+        Some(message) => Err(message),
+        None => result,
+    };
+    (capture, result)
 }
 
 /// Warns (once per overflow edge) that the driver's ring buffer overflowed and dropped events.
@@ -2328,9 +2423,11 @@ impl PyEventCamera {
         let default_decay = self.decay_ms;
         let stored_repr = self.repr;
         let colormap_value = parse_colormap(colormap)?;
+        // Take ownership so the capture can move onto the dedicated drain thread; it is restored
+        // into `self` when the viewer closes, so the camera stays usable afterwards.
         let capture = self
             .capture
-            .as_mut()
+            .take()
             .ok_or_else(|| PyRuntimeError::new_err("camera is closed"))?;
         let (width, height) = (capture.width() as u32, capture.height() as u32);
         let title = capture.name().to_owned();
@@ -2352,7 +2449,7 @@ impl PyEventCamera {
             builder: EventStreamBuilder::new(width as usize, height as usize, 0.001),
             last_render: std::time::Instant::now(),
         };
-        let mut renderer = match representation.as_deref() {
+        let renderer = match representation.as_deref() {
             Some("raw") => raw(decay_ms),
             Some(name) => repr(ReprSpec::new(name, None, None, None, None, None, Some(normalize))?),
             None => match stored_repr {
@@ -2361,13 +2458,13 @@ impl PyEventCamera {
             },
         };
 
-        // The producer runs on the viewer (main) thread with the GIL released: each display frame
-        // it fully drains the driver ring into the renderer and returns the latest frame, so the
-        // camera never backs up behind the ~60 FPS render loop.
-        let producer = move || renderer.drain(capture);
-
-        py.detach(move || viewer::run_live(producer, width, height, title))
-            .map_err(PyRuntimeError::new_err)
+        // Draining runs on a dedicated thread that owns the capture, decoupled from the GPU thread's
+        // vsync-bound present loop (see `run_live_threaded`). The camera is reclaimed and restored
+        // into `self` on close so it stays usable.
+        let (capture, result) =
+            py.detach(move || run_live_threaded(capture, renderer, width, height, title));
+        self.capture = capture;
+        result.map_err(PyRuntimeError::new_err)
     }
 
     /// Records the live stream to `path` (format by extension, like `eventcv.save`). Blocks until
