@@ -101,6 +101,25 @@ class CameraApiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eventcv.stream(repr="flow", window=0)
 
+    def test_stream_accepts_the_source_limit_options(self):
+        import inspect
+
+        parameters = inspect.signature(eventcv.stream).parameters
+        for name in ("max_event_rate", "roi"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIsNone(parameters[name].default)
+
+    def test_source_limits_are_validated_before_the_device_is_opened(self):
+        for kwargs in (
+            {"max_event_rate": 0},
+            {"max_event_rate": -1},
+            {"roi": (-1, 0, 10, 10)},
+            {"roi": (0, 0, 0, 10)},
+        ):
+            with self.assertRaises(ValueError, msg=f"{kwargs} must be rejected"):
+                eventcv.stream(**kwargs)
+
     def test_stream_accepts_the_sink_options(self):
         # `record`/`compression`/`latest` are keyword-only and reach the Rust binding — a signature
         # mismatch would raise TypeError here rather than at capture time.

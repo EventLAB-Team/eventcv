@@ -245,8 +245,10 @@ impl PyEventStream {
         self.wrap(py.detach(|| self.inner.harris_corners(threshold)))
     }
 
-    /// Dense Lucas-Kanade optical flow on the time surface. Returns a two-channel `(flow_x,
-    /// flow_y)` frame in pixels/ms; `window` is the half-width of the least-squares neighbourhood.
+    /// Dense Lucas-Kanade optical flow on the time surface.
+    ///
+    /// Returns a two-channel `(flow_x, flow_y)` frame in pixels/ms; `window` is the half-width of
+    /// the least-squares neighbourhood.
     #[pyo3(signature = (*, window=3))]
     fn optical_flow(&self, py: Python<'_>, window: usize) -> PyResult<PyEventFrame> {
         py.detach(|| self.inner.optical_flow(window))
@@ -2643,6 +2645,58 @@ impl PyEventCamera {
         self.record_buffered(py, path, seconds)
     }
 
+    /// Headless diagnostic: splits the cost of a captured event into **parsing** it out of the
+    /// device's wire format and **accumulating** it into a window, which decides whether decode
+    /// throughput is worth parallelising.
+    ///
+    /// Both phases first let the driver's ring fill for `fill_ms`, then decode that backlog
+    /// back-to-back, so the measurement is CPU-bound rather than limited by how fast the scene
+    /// happens to produce events. Phase one runs `drain_events` with a counting callback (wire
+    /// format only); phase two decodes the same data into the window builder (the path a live
+    /// `read()` uses). Returns each phase's events, milliseconds, and nanoseconds per event.
+    #[pyo3(signature = (*, fill_ms=1000.0))]
+    fn _decode_benchmark(&mut self, py: Python<'_>, fill_ms: f64) -> PyResult<Py<PyDict>> {
+        let capture = self.parked_capture()?;
+        let fill = std::time::Duration::from_secs_f64(fill_ms.max(0.0) / 1000.0);
+        let measure = |capture: &mut eventcv_core::device::Capture, accumulate: bool| {
+            std::thread::sleep(fill); // let the ring back up so there is a batch to decode
+            let backlog = capture.backlog();
+            let mut events = 0usize;
+            let start = std::time::Instant::now();
+            if accumulate {
+                while capture.decode_next(std::time::Duration::ZERO)? {
+                    while let Some(window) = capture.take_pending() {
+                        events += window.stream.len();
+                    }
+                }
+            } else {
+                capture.drain_events(|_x, _y, _t, _polarity| events += 1)?;
+            }
+            Ok::<_, String>((events, start.elapsed().as_secs_f64() * 1000.0, backlog))
+        };
+        let ((parse_events, parse_ms, parse_backlog), (window_events, window_ms, window_backlog)) =
+            py.detach(|| Ok::<_, String>((measure(capture, false)?, measure(capture, true)?)))
+                .map_err(PyRuntimeError::new_err)?;
+
+        let per_event = |events: usize, ms: f64| {
+            if events == 0 {
+                0.0
+            } else {
+                ms * 1e6 / events as f64
+            }
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("parse_events", parse_events)?;
+        dict.set_item("parse_ms", parse_ms)?;
+        dict.set_item("parse_ns_per_event", per_event(parse_events, parse_ms))?;
+        dict.set_item("parse_backlog", parse_backlog)?;
+        dict.set_item("window_events", window_events)?;
+        dict.set_item("window_ms", window_ms)?;
+        dict.set_item("window_ns_per_event", per_event(window_events, window_ms))?;
+        dict.set_item("window_backlog", window_backlog)?;
+        Ok(dict.unbind())
+    }
+
     /// Headless diagnostic: runs the live drain/render loop for `seconds` at ~60 FPS **without**
     /// opening a window, returning `{frames, events, events_per_s, max_backlog, seconds}`. A
     /// healthy viewer keeps `max_backlog` near zero and renders ~60 frames/second.
@@ -2930,6 +2984,44 @@ impl PyEventCamera {
     }
 }
 
+/// Validates the source-side caps before the camera is opened, so a bad rate or rectangle raises
+/// the same way with or without hardware attached.
+#[cfg(feature = "camera")]
+fn parse_limits(
+    max_event_rate: Option<f64>,
+    roi: Option<(i64, i64, i64, i64)>,
+) -> PyResult<eventcv_core::device::Limits> {
+    let max_event_rate = max_event_rate
+        .map(|rate| {
+            if !rate.is_finite() || rate < 1.0 {
+                return Err(PyValueError::new_err(
+                    "max_event_rate must be at least 1 event per second",
+                ));
+            }
+            Ok(rate as u64)
+        })
+        .transpose()?;
+    let roi = roi
+        .map(|(x0, y0, width, height)| {
+            if x0 < 0 || y0 < 0 {
+                return Err(PyValueError::new_err(
+                    "roi must be (x0, y0, width, height) with a non-negative origin",
+                ));
+            }
+            if width < 1 || height < 1 {
+                return Err(PyValueError::new_err(
+                    "roi width and height must be at least 1",
+                ));
+            }
+            Ok((x0 as usize, y0 as usize, width as usize, height as usize))
+        })
+        .transpose()?;
+    Ok(eventcv_core::device::Limits {
+        max_event_rate,
+        roi,
+    })
+}
+
 /// Lists every connected, supported event camera as a list of dicts (`kind`, `name`, `serial`,
 /// `bus`, `address`, `speed`). A `serial` can be passed to `eventcv.stream(serial=…)`.
 #[cfg(feature = "camera")]
@@ -2959,14 +3051,14 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 /// same per-representation options `EventReader.with_repr` takes (`bins`, `window_ms`, `tau_ms`,
 /// `max_window_ms`, `window`, `normalize`). `record` archives every window's raw events to an HDF5
 /// file as it is read (`compression` is its optional gzip level). `latest` keeps a slow loop on live
-/// data by handing back the newest window instead of the oldest. `decay_ms` is the default fade for
-/// the raw `show()` view.
+/// data by handing back the newest window instead of the oldest. `max_event_rate` and `roi` cap what
+/// the sensor emits, in hardware. `decay_ms` is the default fade for the raw `show()` view.
 #[cfg(feature = "camera")]
 #[pyfunction]
 #[pyo3(signature = (
     serial=None, *, dt_ms=None, max_events=None, repr=None, bins=None, window_ms=None, tau_ms=None,
     max_window_ms=None, window=None, normalize=None, record=None, compression=None, latest=false,
-    decay_ms=30.0
+    max_event_rate=None, roi=None, decay_ms=30.0
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stream(
@@ -2984,6 +3076,8 @@ fn stream(
     record: Option<String>,
     compression: Option<u8>,
     latest: bool,
+    max_event_rate: Option<f64>,
+    roi: Option<(i64, i64, i64, i64)>,
     decay_ms: f64,
 ) -> PyResult<PyEventCamera> {
     let windowing = match (dt_ms, max_events) {
@@ -3027,8 +3121,9 @@ fn stream(
             "record= needs HDF5 support, which this build of eventcv was compiled without",
         ));
     }
+    let limits = parse_limits(max_event_rate, roi)?;
     let capture = py
-        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing))
+        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing, limits))
         .map_err(PyRuntimeError::new_err)?;
     // Created only now, so a failed camera open never leaves an empty recording behind.
     #[cfg(feature = "hdf5")]

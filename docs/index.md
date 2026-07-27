@@ -7,6 +7,8 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
   (AEDAT 2.0), and Prophesee `.dat` — through one {func}`eventcv.load`.
 - **Stream** multi-gigabyte recordings without loading them whole via
   {func}`eventcv.open`, with on-disk indexed slicing.
+- **Capture live** from a USB event camera with {func}`eventcv.stream` — representations
+  per window, recording straight to disk, and hardware caps on the event rate.
 - **Transform** streams with chainable, functional geometry / temporal / polarity ops.
 - **Represent** events as dense tensors (voxel grids, time surfaces, count images, …)
   ready for NumPy and PyTorch.
@@ -22,6 +24,7 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
 quickstart
 representations
 feature-detection
+streaming
 tutorials/index
 api
 ```

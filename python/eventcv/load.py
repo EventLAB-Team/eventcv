@@ -267,6 +267,8 @@ def stream(
     record: str | None = None,
     compression: int | None = None,
     latest: bool = False,
+    max_event_rate: float | None = None,
+    roi: tuple[int, int, int, int] | None = None,
     decay_ms: float = 30.0,
 ) -> EventCamera:
     """Open a live USB event camera — the streaming twin of :func:`open`.
@@ -304,6 +306,17 @@ def stream(
     the ``with`` block, and :attr:`EventCamera.n_recorded` counts what has been written. Only windows
     that are actually read are recorded (``show()`` doesn't poll them); to record without a loop, use
     :meth:`EventCamera.record` instead.
+
+    **Capping the source.** Every event costs time to decode, window, and render, so the cheapest
+    event is one the camera never sends. ``max_event_rate`` (events per second) enables the sensor's
+    on-chip event-rate controller, and ``roi=(x0, y0, width, height)`` masks every pixel outside that
+    rectangle, so neither costs the host anything. Both are Prophesee features (EVK4, EVK3 HD); on
+    other cameras they raise rather than silently doing nothing. A saturating scene on a 1280×720
+    sensor can emit far more than one core can decode, and capping the source is the only fix that
+    keeps the events you *do* get contiguous rather than punched full of dropout holes::
+
+        ecv.stream(dt_ms=50, max_event_rate=40_000_000)     # 40 Mev/s ceiling, enforced on-chip
+        ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))      # centre quarter only
 
     Decoding, and any ``record=`` writing, run on a **background thread** that owns the camera, so
     the driver's ring is drained continuously no matter what your loop is doing — the loop only
@@ -383,6 +396,8 @@ def stream(
         record=record,
         compression=compression,
         latest=latest,
+        max_event_rate=max_event_rate,
+        roi=roi,
         decay_ms=decay_ms,
     )
 
