@@ -79,6 +79,7 @@ class CameraApiTests(unittest.TestCase):
             "n_recorded",
             "n_skipped",
             "n_overflows",
+            "bias_state",
         ):
             self.assertTrue(
                 hasattr(eventcv.EventCamera, prop),
@@ -119,6 +120,54 @@ class CameraApiTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError, msg=f"{kwargs} must be rejected"):
                 eventcv.stream(**kwargs)
+
+    def test_stream_accepts_the_adaptive_bias_option(self):
+        import inspect
+
+        parameters = inspect.signature(eventcv.stream).parameters
+        self.assertIn("adaptive_bias", parameters)
+        self.assertIs(parameters["adaptive_bias"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameters["adaptive_bias"].default, "biasing must be opt-in")
+
+    def test_adaptive_bias_is_validated_before_the_device_is_opened(self):
+        # Every one of these is rejected while parsing the argument, so the error is the same with
+        # or without a camera attached.
+        for kwargs, expected in (
+            ({"adaptive_bias": "yes"}, TypeError),
+            ({"adaptive_bias": 3}, TypeError),
+            ({"adaptive_bias": {"not_an_option": 1}}, ValueError),
+            ({"adaptive_bias": {"period_ms": 0}}, ValueError),
+            ({"adaptive_bias": {"period_ms": -5}}, ValueError),
+            # A band the controller cannot map: high must exceed low.
+            ({"adaptive_bias": {"target_rate": (2.5e6, 5e5)}}, ValueError),
+            # Zero slew would freeze the fast loop where it started.
+            ({"adaptive_bias": {"max_slew": 0}}, ValueError),
+            ({"adaptive_bias": {"throttle_range": (1084, 801)}}, ValueError),
+            ({"adaptive_bias": {"limits": (2040, 0)}}, ValueError),
+            ({"adaptive_bias": {"limits": {"nope": (0, 10)}}}, ValueError),
+            ({"adaptive_bias": {"limits": "wide"}}, TypeError),
+        ):
+            with self.assertRaises(expected, msg=f"{kwargs} must be rejected"):
+                eventcv.stream(**kwargs)
+
+    def test_adaptive_bias_accepts_both_limit_forms(self):
+        # One range for every bias, or a dict naming them — the per-bias form is what an IMX636
+        # needs, since its ON and OFF thresholds sit on opposite sides of a shared reference.
+        # With no camera these reach *open* and fail there, not while parsing.
+        if eventcv.list_cameras():
+            self.skipTest("a camera is attached")
+        for limits in ((30, 190), {"on_threshold": (83, 140), "off_threshold": (35, 76)}):
+            with self.assertRaises(RuntimeError):
+                eventcv.stream(adaptive_bias={"limits": limits})
+
+    def test_adaptive_bias_disabled_forms_do_not_raise_on_parsing(self):
+        # False and None mean "off" and must be indistinguishable from omitting it: with no camera
+        # attached they fail at *open*, not at parsing.
+        if eventcv.list_cameras():
+            self.skipTest("a camera is attached")
+        for value in (False, None):
+            with self.assertRaises(RuntimeError):
+                eventcv.stream(adaptive_bias=value)
 
     def test_stream_accepts_the_sink_options(self):
         # `record`/`compression`/`latest` are keyword-only and reach the Rust binding — a signature

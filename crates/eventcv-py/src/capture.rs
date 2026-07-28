@@ -18,6 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use eventcv_core::bias::BiasState;
 use eventcv_core::device::{Capture, CaptureWindow};
 
 use crate::Recorder;
@@ -56,6 +57,9 @@ struct Shared {
     stop: AtomicBool,
     /// Driver ring buffers waiting, republished by the pump each pass.
     backlog: AtomicUsize,
+    /// The adaptive-bias controller's state, republished by the pump each pass so Python can read
+    /// it without stopping the thread that owns the camera. `None` when biasing is off.
+    bias: Mutex<Option<BiasState>>,
     /// Events written to the `record=` file so far.
     recorded: AtomicUsize,
     /// Windows that arrived first-after-overflow — i.e. the driver dropped events before them.
@@ -91,6 +95,7 @@ impl Pump {
             signal: Condvar::new(),
             stop: AtomicBool::new(false),
             backlog: AtomicUsize::new(0),
+            bias: Mutex::new(capture.bias_state()),
             recorded: AtomicUsize::new(recorder.as_ref().map_or(0, Recorder::n_events)),
             overflows: AtomicUsize::new(0),
         });
@@ -123,6 +128,10 @@ impl Pump {
 
     pub(crate) fn backlog(&self) -> usize {
         self.shared.backlog.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bias_state(&self) -> Option<BiasState> {
+        *self.shared.bias.lock().unwrap()
     }
 
     pub(crate) fn n_recorded(&self) -> usize {
@@ -179,6 +188,9 @@ fn run(
             }
         };
         shared.backlog.store(capture.backlog(), Ordering::Relaxed);
+        if let Some(state) = capture.bias_state() {
+            *shared.bias.lock().unwrap() = Some(state);
+        }
         while let Some(window) = capture.take_pending() {
             if window.first_after_overflow {
                 shared.overflows.fetch_add(1, Ordering::Relaxed);

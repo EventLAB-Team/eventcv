@@ -103,6 +103,37 @@ Windowing mirrors `open` (`dt_ms` or `max_events`), `repr=` and its options rend
 caps, and troubleshooting. These functions are built into wheels that include camera support; on
 Linux the camera needs udev rules for non-root USB access.
 
+### Adaptive biasing
+
+Fixed biases make the same scene produce wildly different event rates as the light changes.
+`adaptive_bias=True` measures the rate and retunes the sensor's bias currents as it runs, after
+Nair et al., *Enhancing Visual Place Recognition via Fast and Slow Adaptive Biasing in Event
+Cameras* (IROS 2024) — a fast loop mapping the rate onto the refractory period several times a
+second, and a slow loop shifting the photoreceptor and threshold biases when the fast one runs out
+of travel. It starts from the camera's stock biases, so enabling it never jumps the picture, and
+{attr}`~eventcv.EventCamera.bias_state` reports what it is doing.
+
+```python
+with ecv.stream(dt_ms=50, adaptive_bias={"target_rate": (3e4, 1.2e5)}) as cam:
+    while running:
+        infer(cam.read().numpy())
+        print(cam.bias_state)   # event_rate, the five bias values, authority, n_slow_steps
+```
+
+**It measures your scene first.** For about the first second the controller changes nothing and
+just watches, then centres its band on the rate the camera was actually producing — so
+`adaptive_bias=True` means "hold the event rate wherever this scene started", with no numbers to
+pick. Asking for a rate a scene cannot supply at any bias setting is the one way to get bad results
+(it drives the sensor into amplifying its own noise), and measuring first avoids it. Pass
+`target_rate` only for a specific absolute rate; that skips the measurement. `bias_state` reports
+the band chosen, whether it is still `calibrating`, and an `authority` of `"hunting"` if the band
+turns out to be unreachable anyway.
+
+Supported on the iniVation DAVIS346 and the Prophesee EVK4, each with its own defaults. Measured on
+a DAVIS346 over a static indoor scene, the median rate held within 1.2x across runs where the
+unbiased camera wandered 5.7x; on an EVK4, 1.8x against 4.2x. Other cameras raise rather than
+silently doing nothing.
+
 ```{eval-rst}
 .. currentmodule:: eventcv
 

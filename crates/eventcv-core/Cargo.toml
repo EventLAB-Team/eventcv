@@ -35,12 +35,17 @@ hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true, defa
 # at runtime, keeping the pure-Rust wheel story intact (a C compiler is already required for the
 # libhdf5 build). MIT-licensed. Needs udev rules on Linux for non-root USB access. `--features camera`.
 neuromorphic-drivers = { version = "0.17", optional = true }
+# Adaptive biasing has to rewrite individual fields of the driver's `Biases`, whose fields are
+# private with no setters. The struct derives Serialize/Deserialize, so a JSON round trip is the
+# supported way in; it runs a few times a second at most. (`serde` is already in the tree via the
+# driver.) Remove this once the fields are public upstream.
+serde_json = { version = "1", optional = true }
 
 # The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
 # The `camera` feature turns on USB streaming (compiles the driver crate + a vendored libusb).
 [features]
 hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
-camera = ["dep:neuromorphic-drivers"]
+camera = ["dep:neuromorphic-drivers", "dep:serde_json"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.

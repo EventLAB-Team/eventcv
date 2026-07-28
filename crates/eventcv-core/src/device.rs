@@ -17,12 +17,13 @@
 //! rules for non-root USB access — see the crate README.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use neuromorphic_drivers as nd;
 use neuromorphic_drivers::types::Polarity;
 use neuromorphic_drivers::Adapter;
 
+use crate::bias::{BiasConfig, BiasController, BiasOverrides, BiasState, BiasValues};
 use crate::{EventStream, EventStreamBuilder};
 
 /// Device timestamps are microseconds, so one timestamp unit is `0.001` ms. Live streams carry
@@ -267,6 +268,52 @@ impl Windower {
     }
 }
 
+/// The adaptive-bias controller bound to an open device, with the clock that paces it.
+///
+/// The controller itself is device-agnostic and knows nothing about USB; this pairs it with the
+/// wall clock so each decode pass can report how much time it covered.
+struct AdaptiveBias {
+    controller: BiasController,
+    /// When the previous decode pass was reported.
+    last_pass: Instant,
+}
+
+impl AdaptiveBias {
+    /// Starts a controller from the biases `device` is already running — its stock configuration,
+    /// unless something else has changed them since it was opened.
+    ///
+    /// Errors when the camera isn't one the controller can drive, rather than quietly doing
+    /// nothing: a caller that asked for a steady event rate should not be left believing it got
+    /// one. (Only the DAVIS346 is wired up so far.)
+    fn new(overrides: BiasOverrides, device: &nd::Device) -> Result<Self, String> {
+        // The defaults the request lands on are the sensor's own: rates scale with pixel count, and
+        // the registers are a 2041-step current ladder on one sensor and plain bytes on the other.
+        let (base, start) = match device.current_configuration() {
+            nd::Configuration::InivationDavis346(configuration) => (
+                BiasConfig::davis346(),
+                davis346_biases(&configuration)?,
+            ),
+            nd::Configuration::PropheseeEvk4(configuration) => (
+                BiasConfig::prophesee_evk4(),
+                evk4_biases(&configuration),
+            ),
+            _ => {
+                return Err(format!(
+                    "adaptive_bias is not supported on the {} — it is implemented for the \
+                     iniVation DAVIS346 and the Prophesee EVK4 so far",
+                    device.name(),
+                ))
+            }
+        };
+        let config = overrides.apply(base);
+        config.validate()?;
+        Ok(Self {
+            controller: BiasController::new(config, start),
+            last_pass: Instant::now(),
+        })
+    }
+}
+
 /// A live capture session bound to one camera. Construct with [`Capture::open`], then drive it by
 /// calling [`Capture::poll`] in a loop (typically on a dedicated thread that owns the `Capture`).
 pub struct Capture {
@@ -276,6 +323,8 @@ pub struct Capture {
     _event_loop: std::sync::Arc<nd::UsbEventLoop>,
     flag: nd::Flag<nd::Error, nd::UsbOverflow>,
     windower: Windower,
+    /// Closed-loop bias control, when `stream(adaptive_bias=…)` asked for it.
+    bias: Option<AdaptiveBias>,
     width: usize,
     height: usize,
     name: String,
@@ -285,12 +334,20 @@ pub struct Capture {
 impl Capture {
     /// Opens a camera and begins streaming. `serial` selects a specific device (from
     /// [`CameraInfo::serial`]); `None` opens the first supported camera found. `window` sets how the
-    /// stream is cut into [`CaptureWindow`]s, and `limits` caps what the sensor emits.
+    /// stream is cut into [`CaptureWindow`]s, and `limits` caps what the sensor emits. `bias` turns
+    /// on closed-loop [adaptive biasing](crate::bias), which holds the event rate steady across
+    /// changing light by retuning the sensor's biases as it runs.
     ///
-    /// Apart from `limits` the device is opened with its default configuration (biases, clock, …).
-    /// Errors — no camera found, permission denied (missing udev rules on Linux), an unreadable
-    /// serial, or limits the device can't honour — are returned as a human-readable string.
-    pub fn open(serial: Option<&str>, window: Window, limits: Limits) -> Result<Self, String> {
+    /// Apart from `limits` the device is opened with its default configuration (biases, clock, …),
+    /// and adaptive biasing starts from those stock biases. Errors — no camera found, permission
+    /// denied (missing udev rules on Linux), an unreadable serial, or limits the device can't
+    /// honour — are returned as a human-readable string.
+    pub fn open(
+        serial: Option<&str>,
+        window: Window,
+        limits: Limits,
+        bias: Option<BiasOverrides>,
+    ) -> Result<Self, String> {
         let (flag, event_loop) = nd::flag_and_event_loop().map_err(|error| error.to_string())?;
         let selector = match serial {
             Some(serial) => nd::SerialOrBusNumberAndAddress::Serial(serial),
@@ -306,17 +363,73 @@ impl Capture {
         let name = device.name().to_owned();
         let serial = device.serial();
         let adapter = device.create_adapter();
+        let bias = bias
+            .map(|overrides| AdaptiveBias::new(overrides, &device))
+            .transpose()?;
         Ok(Self {
             device,
             adapter,
             _event_loop: event_loop,
             flag,
             windower: Windower::new(width, height, window),
+            bias,
             width,
             height,
             name,
             serial,
         })
+    }
+
+    /// A snapshot of the adaptive-bias controller, or `None` when the camera was opened without it.
+    pub fn bias_state(&self) -> Option<BiasState> {
+        self.bias.as_ref().map(|bias| bias.controller.state())
+    }
+
+    /// Reports one decode pass to the adaptive-bias controller and writes back whatever bias change
+    /// it asks for. `undercounted` marks a pass that dropped buffers without decoding them, so
+    /// `events` understates the rate.
+    ///
+    /// Called on **every** pass, including ones that decoded nothing — a scene too dark to trigger
+    /// an event is exactly when the controller has to open the sensor up, and it can only do that
+    /// if the empty passes keep its clock running.
+    fn tick_bias(&mut self, events: u64, undercounted: bool) {
+        let update = {
+            let Some(bias) = self.bias.as_mut() else {
+                return;
+            };
+            let now = Instant::now();
+            let elapsed = now.duration_since(bias.last_pass);
+            bias.last_pass = now;
+            if undercounted {
+                bias.controller.invalidate();
+            }
+            bias.controller.observe(events, elapsed)
+        };
+        let Some(values) = update else {
+            return;
+        };
+        // Only unreachable failures are possible here: the device type and the bias field names
+        // were both proven when the controller was built. Dropping an update would at worst leave
+        // the biases as they are, which is far better than ending a live capture.
+        let _ = self.apply_biases(values);
+    }
+
+    /// Hands a new bias set to the driver. This does not touch the wire: the driver diffs it
+    /// against the current configuration and writes only the changed registers, on its own thread.
+    fn apply_biases(&mut self, values: BiasValues) -> Result<(), String> {
+        let updated = match self.device.current_configuration() {
+            nd::Configuration::InivationDavis346(configuration) => {
+                nd::Configuration::InivationDavis346(davis346_with_biases(&configuration, values)?)
+            }
+            nd::Configuration::PropheseeEvk4(configuration) => {
+                nd::Configuration::PropheseeEvk4(evk4_with_biases(&configuration, values))
+            }
+            // Unreachable: the device type was checked when the controller was built.
+            _ => return Err("adaptive biasing is not implemented for this camera".to_owned()),
+        };
+        self.device
+            .update_configuration(updated)
+            .map_err(|error| error.to_string())
     }
 
     /// Sensor width in pixels.
@@ -358,6 +471,7 @@ impl Capture {
         // Surface any error raised by the driver's background USB thread (e.g. a disconnect).
         self.flag.load_error().map_err(|error| error.to_string())?;
 
+        let mut events = 0;
         if let Some(view) = self.device.next_with_timeout(&POLL_TIMEOUT) {
             if view.first_after_overflow {
                 self.windower.mark_overflow();
@@ -367,6 +481,7 @@ impl Capture {
             // `self.windower`, and `convert_buffer` borrows `self.adapter`.
             let windower = &mut self.windower;
             convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
+                events += 1;
                 windower.push(x, y, t, polarity)
             });
             // Flush the current window if its boundary has passed, so a mid-window pause doesn't
@@ -374,6 +489,7 @@ impl Capture {
             let current_t = self.adapter.current_t() as i64;
             self.windower.seal_until(current_t);
         }
+        self.tick_bias(events, false);
         Ok(self.windower.pending.pop_front())
     }
 
@@ -389,24 +505,29 @@ impl Capture {
     /// windows the caller simply stops calling this, and the ring (not memory) absorbs the excess.
     pub fn decode_next(&mut self, timeout: Duration) -> Result<bool, String> {
         self.flag.load_error().map_err(|error| error.to_string())?;
-        let Some(view) = self.device.next_with_timeout(&timeout) else {
-            // Nothing arrived, but the device clock still moved: flush a window whose boundary has
-            // passed so a mid-window pause doesn't stall delivery.
-            let current_t = self.adapter.current_t() as i64;
-            self.windower.seal_until(current_t);
-            return Ok(false);
+        let mut events = 0;
+        // Scoped so the buffer view — which borrows the device and frees its ring slot when
+        // dropped — is released before the bias controller is handed the device below.
+        let decoded = if let Some(view) = self.device.next_with_timeout(&timeout) {
+            if view.first_after_overflow {
+                self.windower.mark_overflow();
+            }
+            let slice = view.slice;
+            let windower = &mut self.windower;
+            convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
+                events += 1;
+                windower.push(x, y, t, polarity)
+            });
+            true
+        } else {
+            false
         };
-        if view.first_after_overflow {
-            self.windower.mark_overflow();
-        }
-        let slice = view.slice;
-        let windower = &mut self.windower;
-        convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
-            windower.push(x, y, t, polarity)
-        });
+        // Whether or not anything arrived, the device clock moved: flush a window whose boundary
+        // has passed so a mid-window pause doesn't stall delivery.
         let current_t = self.adapter.current_t() as i64;
         self.windower.seal_until(current_t);
-        Ok(true)
+        self.tick_bias(events, false);
+        Ok(decoded)
     }
 
     /// Takes the next window that has **already** completed, without touching the device. Returns
@@ -435,12 +556,17 @@ impl Capture {
     {
         self.flag.load_error().map_err(|error| error.to_string())?;
         let mut overflow = false;
+        let mut events = 0;
         while let Some(view) = self.device.next_with_timeout(&Duration::ZERO) {
             if view.first_after_overflow {
                 overflow = true;
             }
-            convert_buffer(&mut self.adapter, view.slice, &mut on_event);
+            convert_buffer(&mut self.adapter, view.slice, |x, y, t, polarity| {
+                events += 1;
+                on_event(x, y, t, polarity)
+            });
         }
+        self.tick_bias(events, false);
         Ok(overflow)
     }
 
@@ -463,21 +589,31 @@ impl Capture {
         F: FnMut(u16, u16, i64, bool),
     {
         self.flag.load_error().map_err(|error| error.to_string())?;
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut overflow = false;
         let mut decoding = true;
+        let mut events = 0;
+        let mut dropped = false;
         while let Some(view) = self.device.next_with_timeout(&Duration::ZERO) {
             if view.first_after_overflow {
                 overflow = true;
             }
             if !decoding {
-                continue; // over budget: drop the buffer, freeing its ring slot without decoding.
+                // Over budget: drop the buffer, freeing its ring slot without decoding.
+                dropped = true;
+                continue;
             }
-            convert_buffer(&mut self.adapter, view.slice, &mut on_event);
+            convert_buffer(&mut self.adapter, view.slice, |x, y, t, polarity| {
+                events += 1;
+                on_event(x, y, t, polarity)
+            });
             if start.elapsed() >= budget {
                 decoding = false;
             }
         }
+        // Dropped buffers make `events` a lower bound, and a bias controller that mistook the
+        // undercount for a quiet scene would open the sensor up and deepen the overload.
+        self.tick_bias(events, dropped);
         Ok(overflow)
     }
 }
@@ -585,6 +721,102 @@ fn region_masks(
         y_mask[bit / 64] |= 1 << (bit % 64);
     }
     Ok((x_mask, y_mask))
+}
+
+/// The DAVIS346 bias registers the controller drives, named as the driver's `Biases` struct spells
+/// them. Their values are indices into the sensor's monotonic coarse/fine current ladder, which is
+/// the space [`BiasController`] already works in, so no conversion is needed either way.
+///
+/// The driver keeps these fields private and offers no accessors, so the `Serialize`/`Deserialize`
+/// it derives on `Biases` is the only way to read and rewrite them. Both helpers below go through
+/// a `serde_json::Value`; they run at the control period (a few times a second at most), never per
+/// event. Once the fields are public upstream, both collapse to field access.
+/// Listed in [`BiasValues`] field order: refractory, photoreceptor, follower, ON, OFF.
+const DAVIS346_BIASES: [&str; 5] = ["refrbp", "prbp", "prsfbp", "onbn", "offbn"];
+
+/// Reads the controlled biases out of a DAVIS346 configuration.
+fn davis346_biases(
+    configuration: &nd::devices::inivation_davis346::Configuration,
+) -> Result<BiasValues, String> {
+    let value = serde_json::to_value(&configuration.biases)
+        .map_err(|error| format!("could not read the camera's biases ({error})"))?;
+    let read = |field: &str| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| format!("the camera's biases have no readable {field}"))
+    };
+    Ok(BiasValues {
+        refractory: read(DAVIS346_BIASES[0])?,
+        photoreceptor: read(DAVIS346_BIASES[1])?,
+        follower: read(DAVIS346_BIASES[2])?,
+        on_threshold: read(DAVIS346_BIASES[3])?,
+        off_threshold: read(DAVIS346_BIASES[4])?,
+    })
+}
+
+/// Returns `configuration` with the controlled biases replaced by `values` and everything else —
+/// the other seventeen biases, the ROI, the filters, the APS timings — left exactly as it was.
+fn davis346_with_biases(
+    configuration: &nd::devices::inivation_davis346::Configuration,
+    values: BiasValues,
+) -> Result<nd::devices::inivation_davis346::Configuration, String> {
+    let mut biases = serde_json::to_value(&configuration.biases)
+        .map_err(|error| format!("could not read the camera's biases ({error})"))?;
+    let written = [
+        values.refractory,
+        values.photoreceptor,
+        values.follower,
+        values.on_threshold,
+        values.off_threshold,
+    ];
+    for (field, value) in DAVIS346_BIASES.iter().zip(written) {
+        biases[field] = serde_json::Value::from(value);
+    }
+    let mut configuration = configuration.clone();
+    configuration.biases = serde_json::from_value(biases)
+        .map_err(|error| format!("could not apply the new biases ({error})"))?;
+    Ok(configuration)
+}
+
+/// Reads the controlled biases out of a Prophesee EVK4 configuration.
+///
+/// The five map one-to-one onto the DAVIS346's, with the same directions, so the control law needs
+/// no per-sensor special casing: `pr`/`fo` are the photoreceptor and its follower, `diff_on` and
+/// `diff_off` sit either side of `diff` as the ON and OFF contrast thresholds, and `refr` sets the
+/// refractory period. `hpf` is left alone — its high-pass cutoff removes slow signal rather than
+/// scaling sensitivity, so it is not a lever the rate controller should be pulling.
+///
+/// Unlike the DAVIS346's these fields are public, so this is plain field access. Values are `u8`
+/// registers widened into the controller's `u16` ladder space.
+fn evk4_biases(configuration: &nd::devices::prophesee_evk4::Configuration) -> BiasValues {
+    let biases = &configuration.biases;
+    BiasValues {
+        refractory: biases.refr.into(),
+        photoreceptor: biases.pr.into(),
+        follower: biases.fo.into(),
+        on_threshold: biases.diff_on.into(),
+        off_threshold: biases.diff_off.into(),
+    }
+}
+
+/// Returns `configuration` with the controlled biases replaced by `values`, everything else — the
+/// other biases, the masks, the rate limiter, the clock — left exactly as it was.
+fn evk4_with_biases(
+    configuration: &nd::devices::prophesee_evk4::Configuration,
+    values: BiasValues,
+) -> nd::devices::prophesee_evk4::Configuration {
+    let mut configuration = configuration.clone();
+    // Saturating: the controller's ladder is `u16`, these registers are `u8`. `BiasConfig::limits`
+    // already holds the values in range, so this only guards a caller that widened them.
+    let byte = |value: u16| value.min(u16::from(u8::MAX)) as u8;
+    configuration.biases.refr = byte(values.refractory);
+    configuration.biases.pr = byte(values.photoreceptor);
+    configuration.biases.fo = byte(values.follower);
+    configuration.biases.diff_on = byte(values.on_threshold);
+    configuration.biases.diff_off = byte(values.off_threshold);
+    configuration
 }
 
 /// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity

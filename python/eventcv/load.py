@@ -269,6 +269,7 @@ def stream(
     latest: bool = False,
     max_event_rate: float | None = None,
     roi: tuple[int, int, int, int] | None = None,
+    adaptive_bias: bool | dict | None = None,
     decay_ms: float = 30.0,
 ) -> EventCamera:
     """Open a live USB event camera — the streaming twin of :func:`open`.
@@ -317,6 +318,54 @@ def stream(
 
         ecv.stream(dt_ms=50, max_event_rate=40_000_000)     # 40 Mev/s ceiling, enforced on-chip
         ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))      # centre quarter only
+
+    **Adaptive biasing.** A camera left on fixed biases produces wildly different event rates as the
+    light changes — the same scene can starve at dusk and saturate in sun, and anything downstream
+    that was tuned on one no longer works on the other. ``adaptive_bias=True`` closes the loop:
+    eventcv measures the event rate and retunes the sensor's bias currents as it runs, so the stream
+    stays comparable across conditions. Two loops do it, after Nair et al., *Enhancing Visual Place
+    Recognition via Fast and Slow Adaptive Biasing in Event Cameras* (IROS 2024) — a fast one that
+    maps the rate onto the refractory period several times a second, and a slow one that shifts the
+    photoreceptor and threshold biases whenever the fast one runs out of room::
+
+        ecv.stream(adaptive_bias=True)                              # the paper's tuning
+        ecv.stream(adaptive_bias={"target_rate": (2e5, 1e6)})       # aim for a quieter stream
+
+    It starts from whatever biases the camera is already running (its stock configuration) and
+    adjusts from there, so turning it on never jumps the picture. Pass a dict to override any of
+    ``period_ms``, ``target_rate`` (a ``(low, high)`` band in events/second), ``throttle_range``,
+    ``max_slew``, ``patience``, ``step``, or ``limits``; :attr:`EventCamera.bias_state` reports what
+    the controller is doing, including an ``authority`` of ``"hunting"`` when the band you asked for
+    is not reachable at all. Supported on the iniVation DAVIS346 and the Prophesee EVK4; other
+    cameras raise rather than silently doing nothing.
+
+    Defaults are per sensor, so ``adaptive_bias=True`` means something sensible on either — the EVK4
+    has 10x the pixels and plain byte registers rather than the DAVIS346's 2041-step current ladder,
+    so its rates, step sizes and bounds all differ. Anything you pass overrides just that field and
+    leaves the rest to the camera. ``limits`` takes either one ``(low, high)`` for every bias or a
+    dict naming them (``photoreceptor``, ``follower``, ``on_threshold``, ``off_threshold``); the
+    per-bias form matters on an IMX636, whose ON and OFF thresholds must stay on opposite sides of
+    its ``diff`` reference.
+
+    **It measures your scene first.** For about the first second the controller changes nothing and
+    just watches, then centres its target band on the rate the camera was actually producing. So
+    ``adaptive_bias=True`` means "hold the event rate wherever this scene started" — the reference
+    condition is whatever it saw at startup, and the loops then work to keep later conditions
+    looking like it. That is what you want for consistency across lighting, and it avoids the trap
+    of asking for a rate the scene cannot supply at any bias setting, which would drive the sensor
+    into the regime where it is amplifying its own noise.
+
+    Pass ``target_rate`` only when you need a *specific* absolute rate; doing so skips the
+    measurement. ``bias_state`` reports the band that was chosen, and ``calibrating`` while it is
+    still measuring::
+
+        ecv.stream(adaptive_bias=True)                              # hold this scene's rate
+        ecv.stream(adaptive_bias={"target_rate": (3e4, 1.2e5)})     # hold this exact band
+        ecv.stream(adaptive_bias={"calibrate": 20})                 # measure for longer first
+
+    This complements ``max_event_rate`` rather than replacing it: the rate limiter is a hard on-chip
+    ceiling that *discards* events once you exceed it, while adaptive biasing changes what the pixels
+    produce in the first place, so the events you keep stay evenly spread rather than clipped.
 
     Decoding, and any ``record=`` writing, run on a **background thread** that owns the camera, so
     the driver's ring is drained continuously no matter what your loop is doing — the loop only
@@ -398,6 +447,7 @@ def stream(
         latest=latest,
         max_event_rate=max_event_rate,
         roi=roi,
+        adaptive_bias=adaptive_bias,
         decay_ms=decay_ms,
     )
 

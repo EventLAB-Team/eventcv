@@ -2519,6 +2519,61 @@ impl PyEventCamera {
         }
     }
 
+    /// What the adaptive-bias controller is doing, or `None` when the camera was opened without
+    /// `stream(adaptive_bias=…)`.
+    ///
+    /// A dict of the last measured `event_rate` (events/second), the `target_rate` band being
+    /// aimed at, whether it is still `calibrating`, the five bias values the controller drives, its
+    /// `authority`, and `n_slow_steps` — how many times the slow loop has had to shift the
+    /// operating point.
+    ///
+    /// For the first second or so `calibrating` is true: the controller is measuring the scene at
+    /// the camera's stock biases and has changed nothing. `target_rate` afterwards is the band it
+    /// settled on, which is the number to look at if the results surprise you.
+    ///
+    /// `authority` says how the fast loop is coping, and is the field to watch:
+    ///
+    /// - `"tracking"` — fine: the rate is in your band, or the loop is on its way there.
+    /// - `"starved"` / `"flooded"` — the refractory bias is at one end of its travel and the rate
+    ///   is still out of band, so the slow loop is shifting the operating point to help.
+    /// - `"hunting"` — the loop keeps reversing without ever landing in the band, which means no
+    ///   bias setting reaches it. Almost always a sign that `target_rate` does not match what the
+    ///   scene can produce; measure the scene unbiased and re-bracket it.
+    ///
+    /// Note `event_rate` was measured over the period *before* the biases now reported were
+    /// applied — the two come from consecutive periods, not the same one.
+    #[getter]
+    fn bias_state(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let state = match &self.state {
+            CameraState::Pumping(pump) => pump.bias_state(),
+            CameraState::Idle { capture, .. } => capture.bias_state(),
+            CameraState::Closed => return Ok(None),
+        };
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("event_rate", state.event_rate)?;
+        dict.set_item("target_rate", state.target_rate)?;
+        dict.set_item("calibrating", state.calibrating)?;
+        dict.set_item("refractory", state.values.refractory)?;
+        dict.set_item("photoreceptor", state.values.photoreceptor)?;
+        dict.set_item("follower", state.values.follower)?;
+        dict.set_item("on_threshold", state.values.on_threshold)?;
+        dict.set_item("off_threshold", state.values.off_threshold)?;
+        dict.set_item(
+            "authority",
+            match state.authority {
+                eventcv_core::bias::Authority::Tracking => "tracking",
+                eventcv_core::bias::Authority::Starved => "starved",
+                eventcv_core::bias::Authority::Flooded => "flooded",
+                eventcv_core::bias::Authority::Hunting => "hunting",
+            },
+        )?;
+        dict.set_item("n_slow_steps", state.slow_steps)?;
+        Ok(Some(dict.unbind()))
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -3022,6 +3077,97 @@ fn parse_limits(
     })
 }
 
+/// Parses `adaptive_bias=` into a controller configuration: `True` for the reference tuning,
+/// `False`/`None` for off, or a dict overriding individual fields of that tuning. Validated here so
+/// bad options raise before the device is touched, with or without hardware attached.
+#[cfg(feature = "camera")]
+fn parse_adaptive_bias(
+    adaptive_bias: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<eventcv_core::bias::BiasOverrides>> {
+    use eventcv_core::bias::BiasOverrides;
+
+    let Some(value) = adaptive_bias else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    // `bool` first: in Python `True` is also an int, so a looser extract would swallow it.
+    if let Ok(enabled) = value.extract::<bool>() {
+        return Ok(enabled.then(BiasOverrides::default));
+    }
+    let Ok(options) = value.cast::<PyDict>() else {
+        return Err(PyTypeError::new_err(
+            "adaptive_bias must be True, False, or a dict of controller options",
+        ));
+    };
+    // Only what the caller names is overridden; the rest comes from the camera's own defaults once
+    // it is open, since the sensible rates and register ranges differ per sensor.
+    let mut overrides = BiasOverrides::default();
+    for (key, option) in options.iter() {
+        match key.extract::<String>()?.as_str() {
+            "period_ms" => {
+                let ms = option.extract::<f64>()?;
+                if !ms.is_finite() || ms <= 0.0 {
+                    return Err(PyValueError::new_err("period_ms must be greater than zero"));
+                }
+                overrides.period = Some(std::time::Duration::from_secs_f64(ms / 1000.0));
+            }
+            "target_rate" => overrides.target_rate = Some(option.extract()?),
+            "throttle_range" => overrides.throttle_range = Some(option.extract()?),
+            "max_slew" => overrides.max_slew = Some(option.extract()?),
+            "calibrate" => overrides.calibrate = Some(option.extract()?),
+            "patience" => overrides.patience = Some(option.extract()?),
+            "step" => overrides.step = Some(option.extract()?),
+            "limits" => overrides.limits = Some(parse_bias_limits(&option)?),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown adaptive_bias option {other:?} — expected any of period_ms, \
+                     target_rate, calibrate, throttle_range, max_slew, patience, step, limits"
+                )))
+            }
+        }
+    }
+    overrides.validate().map_err(PyValueError::new_err)?;
+    Ok(Some(overrides))
+}
+
+/// Parses `limits`: one `(low, high)` for every bias, or a dict naming them individually. The
+/// per-bias form exists because a sensor whose thresholds are defined against a shared reference
+/// (the IMX636's `diff`) needs the ON and OFF bounds on opposite sides of it.
+#[cfg(feature = "camera")]
+fn parse_bias_limits(value: &Bound<'_, PyAny>) -> PyResult<eventcv_core::bias::BiasLimits> {
+    use eventcv_core::bias::BiasLimits;
+
+    if let Ok((low, high)) = value.extract::<(u16, u16)>() {
+        return Ok(BiasLimits::uniform(low, high));
+    }
+    let Ok(per_bias) = value.cast::<PyDict>() else {
+        return Err(PyTypeError::new_err(
+            "limits must be (low, high) or a dict of per-bias (low, high) ranges",
+        ));
+    };
+    // Unnamed biases keep the sensor's default, which is only known once the camera is open — so
+    // start from the widest range and let the resolved config narrow nothing it wasn't asked to.
+    let mut limits = BiasLimits::uniform(0, u16::MAX);
+    for (key, range) in per_bias.iter() {
+        let range = range.extract::<(u16, u16)>()?;
+        match key.extract::<String>()?.as_str() {
+            "photoreceptor" => limits.photoreceptor = range,
+            "follower" => limits.follower = range,
+            "on_threshold" => limits.on_threshold = range,
+            "off_threshold" => limits.off_threshold = range,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown limits entry {other:?} — expected any of photoreceptor, follower, \
+                     on_threshold, off_threshold"
+                )))
+            }
+        }
+    }
+    Ok(limits)
+}
+
 /// Lists every connected, supported event camera as a list of dicts (`kind`, `name`, `serial`,
 /// `bus`, `address`, `speed`). A `serial` can be passed to `eventcv.stream(serial=…)`.
 #[cfg(feature = "camera")]
@@ -3052,13 +3198,15 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 /// `max_window_ms`, `window`, `normalize`). `record` archives every window's raw events to an HDF5
 /// file as it is read (`compression` is its optional gzip level). `latest` keeps a slow loop on live
 /// data by handing back the newest window instead of the oldest. `max_event_rate` and `roi` cap what
-/// the sensor emits, in hardware. `decay_ms` is the default fade for the raw `show()` view.
+/// the sensor emits, in hardware. `adaptive_bias` holds the event rate steady across changing light
+/// by retuning the sensor's biases as it runs. `decay_ms` is the default fade for the raw `show()`
+/// view.
 #[cfg(feature = "camera")]
 #[pyfunction]
 #[pyo3(signature = (
     serial=None, *, dt_ms=None, max_events=None, repr=None, bins=None, window_ms=None, tau_ms=None,
     max_window_ms=None, window=None, normalize=None, record=None, compression=None, latest=false,
-    max_event_rate=None, roi=None, decay_ms=30.0
+    max_event_rate=None, roi=None, adaptive_bias=None, decay_ms=30.0
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stream(
@@ -3078,6 +3226,7 @@ fn stream(
     latest: bool,
     max_event_rate: Option<f64>,
     roi: Option<(i64, i64, i64, i64)>,
+    adaptive_bias: Option<&Bound<'_, PyAny>>,
     decay_ms: f64,
 ) -> PyResult<PyEventCamera> {
     let windowing = match (dt_ms, max_events) {
@@ -3122,8 +3271,9 @@ fn stream(
         ));
     }
     let limits = parse_limits(max_event_rate, roi)?;
+    let bias = parse_adaptive_bias(adaptive_bias)?;
     let capture = py
-        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing, limits))
+        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing, limits, bias))
         .map_err(PyRuntimeError::new_err)?;
     // Created only now, so a failed camera open never leaves an empty recording behind.
     #[cfg(feature = "hdf5")]

@@ -17,6 +17,7 @@
 //! - [`features`], [`flow`], [`cluster`] — corner detection, optical flow, connected components.
 //! - [`feast`] — unsupervised online feature learning (FEAST adaptive-threshold clustering).
 //! - [`filter`], [`image`], [`viz`] — hot-pixel filtering, frame-domain resize, colormapped export.
+//! - [`bias`] — the adaptive-biasing control law that holds a live camera's event rate steady.
 //! - `device` — live USB event-camera capture into [`EventStream`] windows (`camera` feature).
 //!
 //! The `hdf5` feature (off by default to keep `cargo test` fast) enables the `.h5`/`.hdf5`
@@ -25,6 +26,7 @@
 
 use ndarray::Array2;
 
+pub mod bias;
 pub mod camera;
 pub mod cluster;
 #[cfg(feature = "camera")]
