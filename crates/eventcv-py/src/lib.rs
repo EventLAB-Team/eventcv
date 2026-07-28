@@ -16,8 +16,9 @@ use eventcv_core::{
         Reader, SaveOptions, TimeUnit,
     },
     representation::{
-        AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, EventPointSet, Mcts,
-        PointSet, Polarity, Representation, RepresentationError, Tencode, TimeSurface, VoxelGrid,
+        AveragedTimeSurface, Binary, CountMask, EventCount, EventFrame, EventFrameData,
+        EventPointSet, Mcts, PointSet, Polarity, Representation, RepresentationError, Tencode,
+        TimeSurface, VoxelGrid,
     },
     viz::Colormap,
     EventStream, EventStreamBuilder,
@@ -328,6 +329,19 @@ impl PyEventStream {
             .map_err(map_representation_error)
     }
 
+    /// Count-mask image (GEPT, Sec. 3.2) — red holds the per-pixel positive-event count, blue the
+    /// negative one, and green is a binary activity mask at full scale wherever any event landed.
+    /// Both count planes are clipped and normalized by a single scale: the `pct`-th percentile of
+    /// the non-zero counts of the two planes pooled together. Timestamps are not used.
+    /// `white_frame` inverts to a white background — the black-background default is the form
+    /// downstream descriptor models expect.
+    #[pyo3(signature = (*, pct=99.0, white_frame=false))]
+    fn countmask(&self, py: Python<'_>, pct: f64, white_frame: bool) -> PyResult<PyEventFrame> {
+        py.detach(|| CountMask::new(pct, white_frame).generate(&self.inner))
+            .map(|inner| PyEventFrame { inner })
+            .map_err(map_representation_error)
+    }
+
     #[pyo3(signature = (*, max_window_ms=30.0))]
     fn mcts(&self, py: Python<'_>, max_window_ms: f64) -> PyResult<PyEventFrame> {
         py.detach(|| Mcts::new(max_window_ms).generate(&self.inner))
@@ -391,7 +405,7 @@ impl PyEventStream {
         // A representation *name* ("count", "flow", "voxel", …) renders that repr with its
         // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
         if let Ok(name) = representation.extract::<String>() {
-            let spec = ReprSpec::new(&name, None, None, None, None, None, normalize)?;
+            let spec = ReprSpec::named(&name, normalize)?;
             return py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
@@ -842,9 +856,7 @@ fn open(
         (None, None) => None,
     };
     let offset_us = parse_offset(offset)?;
-    let repr = repr
-        .map(|name| ReprSpec::new(name, None, None, None, None, None, None))
-        .transpose()?;
+    let repr = repr.map(|name| ReprSpec::named(name, None)).transpose()?;
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
         time_unit: parse_time_unit(time_unit)?,
@@ -1142,7 +1154,7 @@ impl PyEventReader {
     /// Returns a new reader over the same file that renders each slice with `repr` (unset
     /// params take their method defaults). The dataset-mode counterpart of `open(repr=…)`,
     /// but with per-representation options: e.g. `reader.with_repr("voxel", bins=5)`.
-    #[pyo3(signature = (repr, *, bins=None, window_ms=None, tau_ms=None, max_window_ms=None, window=None, normalize=None))]
+    #[pyo3(signature = (repr, *, bins=None, window_ms=None, tau_ms=None, max_window_ms=None, window=None, normalize=None, pct=None, white_frame=None))]
     #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
@@ -1153,6 +1165,8 @@ impl PyEventReader {
         max_window_ms: Option<f64>,
         window: Option<i64>,
         normalize: Option<bool>,
+        pct: Option<f64>,
+        white_frame: Option<bool>,
     ) -> PyResult<PyEventReader> {
         let spec = ReprSpec::new(
             repr,
@@ -1162,6 +1176,8 @@ impl PyEventReader {
             max_window_ms,
             window,
             normalize,
+            pct,
+            white_frame,
         )?;
         Ok(PyEventReader {
             inner: Arc::clone(&self.inner),
@@ -1888,6 +1904,7 @@ enum ReprSpec {
     TimeSurface { tau_ms: f64 },
     AveragedTimeSurface { tau_ms: f64 },
     Tencode { window_ms: f64 },
+    CountMask { pct: f64, white_frame: bool },
     Mcts { max_window_ms: f64 },
     Flow { window: usize },
 }
@@ -1895,6 +1912,7 @@ enum ReprSpec {
 impl ReprSpec {
     /// Builds a spec from a repr name and the optional overrides (unset ones take the
     /// same defaults as the `EventStream` methods: count raw `u64`, polarity normalized).
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: &str,
         bins: Option<i64>,
@@ -1903,6 +1921,8 @@ impl ReprSpec {
         max_window_ms: Option<f64>,
         window: Option<i64>,
         normalize: Option<bool>,
+        pct: Option<f64>,
+        white_frame: Option<bool>,
     ) -> PyResult<Self> {
         Ok(match name {
             "binary" => Self::Binary,
@@ -1931,6 +1951,10 @@ impl ReprSpec {
             "tencode" => Self::Tencode {
                 window_ms: window_ms.unwrap_or(30.0),
             },
+            "countmask" => Self::CountMask {
+                pct: pct.unwrap_or(99.0),
+                white_frame: white_frame.unwrap_or(false),
+            },
             "mcts" => Self::Mcts {
                 max_window_ms: max_window_ms.unwrap_or(30.0),
             },
@@ -1953,6 +1977,12 @@ impl ReprSpec {
         })
     }
 
+    /// A spec from a name alone, for the callers that don't accept per-representation options —
+    /// `open(repr=…)`, `flatten`/`view`, `camera.show` — which take at most `normalize`.
+    fn named(name: &str, normalize: Option<bool>) -> PyResult<Self> {
+        Self::new(name, None, None, None, None, None, normalize, None, None)
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Binary => "binary",
@@ -1962,6 +1992,7 @@ impl ReprSpec {
             Self::TimeSurface { .. } => "tsurf",
             Self::AveragedTimeSurface { .. } => "atsurf",
             Self::Tencode { .. } => "tencode",
+            Self::CountMask { .. } => "countmask",
             Self::Mcts { .. } => "mcts",
             Self::Flow { .. } => "flow",
         }
@@ -1978,6 +2009,9 @@ impl ReprSpec {
                 AveragedTimeSurface::new(tau_ms).generate(stream)
             }
             Self::Tencode { window_ms } => Tencode::new(window_ms).generate(stream),
+            Self::CountMask { pct, white_frame } => {
+                CountMask::new(pct, white_frame).generate(stream)
+            }
             Self::Mcts { max_window_ms } => Mcts::new(max_window_ms).generate(stream),
             Self::Flow { window } => stream.optical_flow(window).map_err(|error| match error {
                 FlowError::SizeOverflow => RepresentationError::SizeOverflow,
@@ -2654,7 +2688,7 @@ impl PyEventCamera {
         };
         let renderer = match representation.as_deref() {
             Some("raw") => raw(decay_ms),
-            Some(name) => repr(ReprSpec::new(name, None, None, None, None, None, Some(normalize))?),
+            Some(name) => repr(ReprSpec::named(name, Some(normalize))?),
             None => match stored_repr {
                 Some(spec) => repr(spec),
                 None => raw(decay_ms),
@@ -3195,7 +3229,8 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 /// `max_events` for fixed-count (mutually exclusive; default `dt_ms=30`). `repr` sets what iterating
 /// the camera yields (a representation name → `EventFrame`s; omit for raw `EventStream`s), with the
 /// same per-representation options `EventReader.with_repr` takes (`bins`, `window_ms`, `tau_ms`,
-/// `max_window_ms`, `window`, `normalize`). `record` archives every window's raw events to an HDF5
+/// `max_window_ms`, `window`, `normalize`, `pct`, `white_frame`). `record` archives every window's
+/// raw events to an HDF5
 /// file as it is read (`compression` is its optional gzip level). `latest` keeps a slow loop on live
 /// data by handing back the newest window instead of the oldest. `max_event_rate` and `roi` cap what
 /// the sensor emits, in hardware. `adaptive_bias` holds the event rate steady across changing light
@@ -3205,7 +3240,8 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 #[pyfunction]
 #[pyo3(signature = (
     serial=None, *, dt_ms=None, max_events=None, repr=None, bins=None, window_ms=None, tau_ms=None,
-    max_window_ms=None, window=None, normalize=None, record=None, compression=None, latest=false,
+    max_window_ms=None, window=None, normalize=None, pct=None, white_frame=None, record=None,
+    compression=None, latest=false,
     max_event_rate=None, roi=None, adaptive_bias=None, decay_ms=30.0
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -3221,6 +3257,8 @@ fn stream(
     max_window_ms: Option<f64>,
     window: Option<i64>,
     normalize: Option<bool>,
+    pct: Option<f64>,
+    white_frame: Option<bool>,
     record: Option<String>,
     compression: Option<u8>,
     latest: bool,
@@ -3256,6 +3294,8 @@ fn stream(
                 max_window_ms.or(span),
                 window,
                 normalize,
+                pct,
+                white_frame,
             )?)
         }
     };

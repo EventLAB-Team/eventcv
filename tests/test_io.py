@@ -379,6 +379,23 @@ class DatasetReaderTests(unittest.TestCase):
         self.assertEqual(reader[0].shape, (5, 8, 8))
         self.assertEqual(reader[0].dtype, np.float32)
 
+    def test_countmask_is_a_dense_dataset(self):
+        # The CHW uint8 dataset contract countmask exists for: open(repr=…) picks it up with its
+        # defaults, and with_repr threads its own options through.
+        reader = self._dataset(repr="countmask")
+        self.assertEqual(reader.repr, "countmask")
+        self.assertEqual(len(reader), reader.n_slices)
+        self.assertEqual(reader[0].shape, (3, 8, 8))
+        self.assertEqual(reader[0].dtype, np.uint8)
+        self.assertEqual(reader.batch([0, 2, 3]).shape, (3, 3, 8, 8))
+        self.assertEqual(reader.slice(0).kind, "countmask")
+
+        inverted = self._dataset(repr=None).with_repr("countmask", white_frame=True)
+        self.assertEqual(inverted.repr, "countmask")
+        # Every pixel of this 4-event fixture is idle in slice 0 except one, so inverting the
+        # background is plainly visible: a black frame becomes a near-white one.
+        self.assertGreater(inverted[0].mean(), reader[0].mean())
+
     def test_slice_renders_open_repr(self):
         # A reader opened with a representation is a frame source: slice()/slice_count()/
         # windows() render each slice to that EventFrame instead of returning a raw stream.

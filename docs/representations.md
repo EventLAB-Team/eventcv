@@ -28,6 +28,7 @@ all three forms; each is flagged in its section below.
 | `tsurf`    | {func}`~eventcv.tsurf`   | 2  | `float32`          | Time surface: `exp(-age/tau_ms)` of the *latest* event per pixel/polarity. |
 | `atsurf`   | {func}`~eventcv.atsurf`  | 2  | `float32`          | Averaged (HATS-style) time surface: mean of `exp(-age/tau_ms)` over *all* events per pixel/polarity. |
 | `tencode`  | {func}`~eventcv.tencode` | 3  | `uint8`            | Latest polarity + normalized age within `window_ms`, as an RGB-like image. |
+| `countmask`| {func}`~eventcv.countmask` | 3 | `uint8`           | Positive/negative event counts in red/blue, jointly normalized by a percentile of the non-zero counts, plus a binary activity mask in green. Timestamps unused. |
 | `mcts`     | {func}`~eventcv.mcts`    | 10 | `float32`          | Multi-channel time surface: 5 log-spaced windows up to `max_window_ms`, per polarity. |
 | `flow`     | {func}`~eventcv.optical_flow` | 2 | `float32`     | Dense Lucas-Kanade optical flow `(flow_x, flow_y)` on the time surface, pixels/ms. |
 | `pset`     | {func}`~eventcv.pset`    | — (`[N, 4]`) | `float32`    | Sparse, normalized `(x, y, t, p)` point array — not a dense frame. |
@@ -139,6 +140,32 @@ recently sets its channel to `255` (the other stays `0`), and the `age` channel 
 event's age rescaled to `0-255` across `window_ms`. Reads like an RGB image (red/green-style
 polarity planes plus a brightness-coded age plane).
 
+## Count mask
+
+```python
+stream.countmask(pct=99.0)
+ecv.countmask(stream, pct=99.0, white_frame=False)
+```
+
+- `pct` (`float`, default `99.0`) — normalization percentile; must be between `0` and `100`.
+- `white_frame` (`bool`, default `False`) — invert to a white background.
+
+Three channels, `[positive, activity, negative]`, `uint8` — the event-accumulation image of the
+GEPT paper (Sec. 3.2, Eq. 2). Red holds the per-pixel count of positive events and blue the count
+of negative ones; green is a binary mask, `255` wherever an event of either polarity landed and
+`0` elsewhere. **Timestamps are not used at all**, which is what separates it from `tencode`
+(latest polarity plus event age) and from `count` (one plane of raw totals).
+
+Both count planes are clipped and rescaled by a **single** scale: the `pct`-th percentile of the
+non-zero counts of the two planes *pooled together*. Pooling matters — a per-channel percentile
+would let a quiet polarity saturate against a busy one, so the joint scale is what keeps red and
+blue comparable. Counts above the percentile clamp to full scale.
+
+Expect a dark red/blue image over a bright green mask; on typical data the green plane averages
+several times brighter than the other two. `white_frame=True` inverts the whole image, background
+included, and exists for parity with the reference renderer — descriptor models trained on these
+frames expect the black-background default.
+
 ## MCTS (multi-channel time surface)
 
 ```python
@@ -202,12 +229,13 @@ each maximal connected blob gets a distinct label `1..k`, with background `0`.
 
 A representation can be picked by string anywhere a name is accepted:
 {meth}`~eventcv.EventStream.flatten`, {meth}`~eventcv.EventStream.view`, `open(..., repr=...)`,
-and `reader.with_repr(...)`. The name is one of `"polarity"`, `"binary"`, `"count"`, `"voxel"`,
-`"tsurf"`, `"atsurf"`, `"tencode"`, `"mcts"`, or `"flow"`.
+and `reader.with_repr(...)`. The name is one of `"polarity"`, `"binary"`, `"count"`,
+`"countmask"`, `"voxel"`, `"tsurf"`, `"atsurf"`, `"tencode"`, `"mcts"`, or `"flow"`.
 
 `flatten`, `view`, and `open(repr=...)` render the representation with its **default**
 parameters — they don't accept a representation's own parameters (`bins`, `tau_ms`, `window_ms`,
-`max_window_ms`, `window`), so `stream.flatten("voxel", bins=5)` is a `TypeError`. The one
+`max_window_ms`, `window`, `pct`, `white_frame`), so `stream.flatten("voxel", bins=5)` is a
+`TypeError`. The one
 exception is `normalize`, which is an argument of `flatten`/`view` themselves, so
 `stream.flatten("count", normalize=True)` does work (and each representation keeps its own
 `normalize` default when the argument is omitted — `False` for `count`, `True` for `polarity`).
@@ -223,6 +251,7 @@ reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")    # mcts, default max_win
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("voxel", bins=5)
 array = reader[0]                                        # [5, H, W] voxel for frame 0
 frame = reader.slice(7)                                  # EventFrame — voxel(bins=5) applied
+reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("countmask", pct=95.0)
 
 # a repr-less reader yields a stream; name the representation on the slice:
 frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")   # → EventFrame

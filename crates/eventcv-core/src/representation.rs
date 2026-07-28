@@ -5,6 +5,7 @@ use crate::{Event, EventStream};
 mod averaged_time_surface;
 mod binary;
 mod count;
+mod countmask;
 mod mcts;
 mod point_set;
 mod polarity;
@@ -15,6 +16,7 @@ mod voxel;
 pub use averaged_time_surface::AveragedTimeSurface;
 pub use binary::Binary;
 pub use count::EventCount;
+pub use countmask::CountMask;
 pub use mcts::Mcts;
 pub use point_set::{EventPointSet, PointSet};
 pub use polarity::Polarity;
@@ -33,6 +35,7 @@ pub enum RepresentationKind {
     AveragedTimeSurface,
     Binary,
     Count,
+    CountMask,
     Flow,
     Labels,
     Mcts,
@@ -48,6 +51,7 @@ impl RepresentationKind {
             Self::AveragedTimeSurface => "atsurf",
             Self::Binary => "binary",
             Self::Count => "count",
+            Self::CountMask => "countmask",
             Self::Flow => "flow",
             Self::Labels => "labels",
             Self::Mcts => "mcts",
@@ -64,6 +68,7 @@ impl RepresentationKind {
             "atsurf" => Self::AveragedTimeSurface,
             "binary" => Self::Binary,
             "count" => Self::Count,
+            "countmask" => Self::CountMask,
             "flow" => Self::Flow,
             "labels" => Self::Labels,
             "mcts" => Self::Mcts,
@@ -228,6 +233,7 @@ impl fmt::Display for RepresentationError {
                 "max_window_ms" => {
                     formatter.write_str("max_window_ms must be finite and at least 1")
                 }
+                "pct" => formatter.write_str("pct must be between 0 and 100"),
                 _ => write!(formatter, "{name} must be finite and positive"),
             },
         }
@@ -241,8 +247,8 @@ mod tests {
     use ndarray::Array2;
 
     use super::{
-        AveragedTimeSurface, Binary, EventCount, EventFrameData, Mcts, PointSet, Representation,
-        RepresentationError, Tencode, TimeSurface, VoxelGrid,
+        AveragedTimeSurface, Binary, CountMask, EventCount, EventFrameData, Mcts, PointSet,
+        Representation, RepresentationError, Tencode, TimeSurface, VoxelGrid,
     };
     use crate::EventStream;
 
@@ -262,6 +268,7 @@ mod tests {
             AveragedTimeSurface::default().generate(&stream).unwrap(),
             Tencode::default().generate(&stream).unwrap(),
             Mcts::default().generate(&stream).unwrap(),
+            CountMask::default().generate(&stream).unwrap(),
         ] {
             match frame.data() {
                 EventFrameData::U8(values) => assert!(values.iter().all(|&value| value == 0)),
@@ -291,6 +298,10 @@ mod tests {
         assert_eq!(
             Mcts::new(0.5).generate(&stream).unwrap_err(),
             RepresentationError::InvalidParameter("max_window_ms")
+        );
+        assert_eq!(
+            CountMask::new(150.0, false).generate(&stream).unwrap_err(),
+            RepresentationError::InvalidParameter("pct")
         );
 
         let oversized = empty_stream(usize::MAX, 2);

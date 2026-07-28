@@ -23,17 +23,7 @@ impl Representation for Polarity {
     type Output = EventFrame;
 
     fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
-        let (width, height, frame_len) = frame_len(stream, 2)?;
-        let plane_len = width * height;
-        // Counts are accumulated as `u64`: a hot pixel on a multi-second recording (or a
-        // busy slice of one) easily exceeds `u16` — see TASKS.md known issues.
-        let mut counts = vec![0_u64; frame_len];
-
-        for event in stream.iter() {
-            let index = event_index(event, width, height)?;
-            let channel_offset = if event.polarity { 0 } else { plane_len };
-            counts[channel_offset + index] += 1;
-        }
+        let (width, height, counts) = polarity_counts(stream)?;
 
         let data = if self.normalize {
             EventFrameData::U8(normalize_u8(counts))
@@ -50,6 +40,28 @@ impl Representation for Polarity {
             channel_names: vec!["positive".to_owned(), "negative".to_owned()],
         })
     }
+}
+
+/// Per-pixel event counts split into a positive plane (offset `0`) and a negative one (offset
+/// `width * height`), row-major within each. Shared with the count-mask representation, which
+/// needs the same two planes before it normalises them differently.
+///
+/// Counts are accumulated as `u64`: a hot pixel on a multi-second recording (or a busy slice of
+/// one) easily exceeds `u16` — see TASKS.md known issues.
+pub(super) fn polarity_counts(
+    stream: &EventStream,
+) -> Result<(usize, usize, Vec<u64>), RepresentationError> {
+    let (width, height, frame_len) = frame_len(stream, 2)?;
+    let plane_len = width * height;
+    let mut counts = vec![0_u64; frame_len];
+
+    for event in stream.iter() {
+        let index = event_index(event, width, height)?;
+        let channel_offset = if event.polarity { 0 } else { plane_len };
+        counts[channel_offset + index] += 1;
+    }
+
+    Ok((width, height, counts))
 }
 
 fn normalize_u8(counts: Vec<u64>) -> Vec<u8> {

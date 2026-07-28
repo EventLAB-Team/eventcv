@@ -203,6 +203,75 @@ class LoadTests(unittest.TestCase):
         self.assertTrue(callable(count.view))
         self.assertTrue(callable(atsurf.view))
 
+    def test_generates_countmask(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        countmask = stream.countmask()
+
+        self.assertEqual(
+            (countmask.kind, countmask.shape), ("countmask", (3, 480, 640))
+        )
+        self.assertEqual(
+            countmask.channel_names, ("positive", "activity", "negative")
+        )
+        self.assertEqual(countmask.numpy().dtype, np.uint8)
+        self.assertTrue(callable(countmask.view))
+
+        # The activity mask is full-scale wherever either count plane fired, so green covers at
+        # least as many pixels as red or blue and is far brighter. A dark green plane means the
+        # background got inverted.
+        red, green, blue = countmask.numpy()
+        np.testing.assert_array_equal(green > 0, (red > 0) | (blue > 0))
+        self.assertEqual(set(np.unique(green).tolist()), {0, 255})
+        self.assertGreater(green.mean(), 2 * max(red.mean(), blue.mean()))
+
+        # white_frame flips the encoding before the 8-bit cast, so it is not a plain `255 - x` on
+        # the counts (both 0.5 and 1 - 0.5 truncate to 127). It is exact on the binary mask, and
+        # pixels that saw no event go from black to white.
+        inverted = stream.countmask(white_frame=True).numpy()
+        np.testing.assert_array_equal(inverted[1], 255 - green)
+        idle = green == 0
+        self.assertTrue((inverted[:, idle] == 255).all())
+
+    def test_countmask_matches_reference_renderer(self):
+        # 40 pseudo-random events on a 6x8 sensor, from the reference renderer's
+        # np.random.default_rng(12345) fixture. Here the pooled 99th percentile is 2, so a count
+        # of 1 must truncate to 127 rather than round to 128.
+        x = [5, 1, 6, 2, 1, 6, 5, 5, 7, 3, 6, 2, 4, 4, 1, 1, 1, 5, 4, 7,
+             5, 1, 7, 7, 5, 5, 1, 0, 2, 3, 0, 7, 3, 5, 1, 2, 0, 5, 6, 1]
+        y = [4, 0, 2, 0, 4, 2, 2, 2, 2, 1, 3, 4, 2, 1, 0, 0, 0, 0, 0, 3,
+             4, 5, 3, 3, 1, 5, 3, 4, 4, 5, 4, 5, 3, 3, 1, 5, 3, 2, 1, 1]
+        p = [1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0,
+             0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1]
+        events = np.stack([x, y, np.arange(40), p], axis=1)
+        stream = eventcv.from_numpy(events, sensor_size=(8, 6), time_unit="us")
+
+        expected = np.array(
+            [
+                [[0, 255, 0, 0, 0, 127, 0, 0],
+                 [0, 127, 0, 0, 0, 0, 127, 0],
+                 [0, 0, 0, 0, 127, 255, 0, 127],
+                 [0, 0, 0, 0, 0, 0, 127, 127],
+                 [255, 127, 127, 0, 0, 127, 0, 0],
+                 [0, 127, 0, 0, 0, 127, 0, 127]],
+                [[0, 255, 255, 0, 255, 255, 0, 0],
+                 [0, 255, 0, 255, 255, 255, 255, 0],
+                 [0, 0, 0, 0, 255, 255, 255, 255],
+                 [255, 255, 0, 255, 0, 255, 255, 255],
+                 [255, 255, 255, 0, 0, 255, 0, 0],
+                 [0, 255, 255, 255, 0, 255, 0, 255]],
+                [[0, 255, 127, 0, 127, 0, 0, 0],
+                 [0, 127, 0, 127, 127, 127, 0, 0],
+                 [0, 0, 0, 0, 0, 127, 255, 0],
+                 [127, 127, 0, 127, 0, 127, 0, 255],
+                 [0, 0, 127, 0, 0, 127, 0, 0],
+                 [0, 0, 127, 127, 0, 0, 0, 0]],
+            ],
+            dtype=np.uint8,
+        )
+
+        np.testing.assert_array_equal(stream.countmask().numpy(), expected)
+
     def test_validates_representation_parameters(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
@@ -213,6 +282,8 @@ class LoadTests(unittest.TestCase):
             lambda: stream.atsurf(tau_ms=0),
             lambda: stream.tencode(window_ms=float("inf")),
             lambda: stream.mcts(max_window_ms=0.5),
+            lambda: stream.countmask(pct=100.5),
+            lambda: stream.countmask(pct=-1),
         ):
             with self.subTest(generate=generate):
                 with self.assertRaises(ValueError):
@@ -230,6 +301,7 @@ class LoadTests(unittest.TestCase):
             self.assertEqual(stream.tsurf().shape, (2, 480, 640))
             self.assertEqual(stream.atsurf().shape, (2, 480, 640))
             self.assertEqual(stream.tencode().shape, (3, 480, 640))
+            self.assertEqual(stream.countmask().shape, (3, 480, 640))
             self.assertEqual(stream.mcts().shape, (10, 480, 640))
             self.assertEqual(stream.pset().shape, (0, 4))
 

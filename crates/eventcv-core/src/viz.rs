@@ -1,8 +1,9 @@
 //! Frame → pixels rendering: the shared 2-D visualisation path used by PNG export and the
 //! interactive viewer's image representations. Most [`EventFrame`]s reduce to a per-pixel
 //! scalar field (signed for polarity/voxel/time-surface reprs, unsigned for count/binary),
-//! which a [`Colormap`] turns into RGB. Two kinds have their own RGB path: Tencode (already an RGB
-//! encoding) and Flow (Middlebury colour coding — direction → hue, speed → saturation).
+//! which a [`Colormap`] turns into RGB. Some kinds have their own RGB path: Tencode and CountMask
+//! (already RGB encodings) and Flow (Middlebury colour coding — direction → hue, speed →
+//! saturation).
 
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
 use crate::EventStream;
@@ -42,16 +43,19 @@ impl Colormap {
 /// Renders `frame` to an RGB image. `normalize` stretches the field to its own data range
 /// (auto-contrast); when `false`, values are read at their natural scale (`f32` reprs in
 /// `[0, 1]` / `[-1, 1]`, integer counts divided by 255). Diverging kinds ignore `colormap`
-/// and use `RedBlue`; Tencode ignores it entirely (it is already an RGB encoding).
+/// and use `RedBlue`; Tencode and CountMask ignore it entirely (already RGB encodings).
 pub fn render_frame(frame: &EventFrame, colormap: Colormap, normalize: bool) -> Rgb8Image {
     let (_, height, width) = frame.shape();
     let plane_len = width * height;
 
-    if frame.kind() == RepresentationKind::Tencode {
+    if matches!(
+        frame.kind(),
+        RepresentationKind::Tencode | RepresentationKind::CountMask
+    ) {
         return Rgb8Image {
             width,
             height,
-            pixels: render_tencode(frame, plane_len, normalize),
+            pixels: render_rgb8_planes(frame, plane_len, normalize),
         };
     }
     // Flow has its own RGB path: Middlebury colour coding (direction → hue, speed → saturation).
@@ -131,8 +135,10 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
                 .collect(),
             true,
         ),
-        // Tencode is handled before this call.
-        RepresentationKind::Tencode => (vec![0.0; plane_len], false),
+        // Tencode and CountMask are handled before this call (both are already RGB).
+        RepresentationKind::Tencode | RepresentationKind::CountMask => {
+            (vec![0.0; plane_len], false)
+        }
     }
 }
 
@@ -250,7 +256,10 @@ fn flow_color_wheel() -> Vec<[f64; 3]> {
     wheel
 }
 
-fn render_tencode(frame: &EventFrame, plane_len: usize, normalize: bool) -> Vec<u8> {
+/// Interleaves a frame whose three planes *are* the R, G and B channels (Tencode, CountMask) into
+/// packed pixels. `normalize` stretches to the brightest channel value; otherwise the planes pass
+/// through at their stored 8-bit scale.
+fn render_rgb8_planes(frame: &EventFrame, plane_len: usize, normalize: bool) -> Vec<u8> {
     let data = frame.data();
     let scale = if normalize {
         let max = (0..plane_len * 3)

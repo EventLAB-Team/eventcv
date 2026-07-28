@@ -57,6 +57,7 @@ pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> R
         RepresentationKind::Polarity
         | RepresentationKind::Binary
         | RepresentationKind::Count
+        | RepresentationKind::CountMask
         | RepresentationKind::Flow
         | RepresentationKind::Labels
         | RepresentationKind::Tencode => Scene::Image(render_frame(frame, colormap, normalize)),
@@ -227,8 +228,8 @@ fn checked_plane_len(width: usize, height: usize) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use eventcv_core::representation::{
-        AveragedTimeSurface, Binary, EventCount, Mcts, PointSet, Polarity, Representation, Tencode,
-        TimeSurface, VoxelGrid,
+        AveragedTimeSurface, Binary, CountMask, EventCount, Mcts, PointSet, Polarity,
+        Representation, Tencode, TimeSurface, VoxelGrid,
     };
     use eventcv_core::viz::Colormap;
 
@@ -238,7 +239,7 @@ mod tests {
         // Mirrors `view` without opening a window: image vs cloud dispatch.
         use eventcv_core::representation::RepresentationKind::*;
         match frame.kind() {
-            Polarity | Binary | Count | Flow | Labels | Tencode => Scene::Image(
+            Polarity | Binary | Count | CountMask | Flow | Labels | Tencode => Scene::Image(
                 eventcv_core::viz::render_frame(frame, Colormap::Viridis, true),
             ),
             Voxel => Scene::Cloud {
@@ -268,6 +269,7 @@ mod tests {
             EventCount::new(true).generate(&stream).unwrap(),
             Polarity::default().generate(&stream).unwrap(),
             Tencode::default().generate(&stream).unwrap(),
+            CountMask::default().generate(&stream).unwrap(),
         ] {
             assert!(matches!(scene_of(&frame), Scene::Image(_)));
         }
