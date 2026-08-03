@@ -6,6 +6,7 @@ Rust-defined methods and the generated functional API — so the reference never
 from the code. Build locally with ``pip install -r docs/requirements.txt`` (plus an
 editable ``maturin develop``) then ``sphinx-build -b html docs docs/_build/html``.
 """
+import os 
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -61,3 +62,9 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 # --- HTML ----------------------------------------------------------------------
 html_theme = "furo"
 html_title = f"EventCV {release}"
+
+# Read the Docs sets this to the canonical domain and version.
+html_baseurl = os.environ.get(
+    "READTHEDOCS_CANONICAL_URL",
+    "https://docs.eventcv.net/en/latest/",
+)
