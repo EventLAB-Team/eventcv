@@ -8,6 +8,7 @@ use eventcv_core::representation::{EventFrame, EventFrameData, EventPointSet, Re
 use eventcv_core::viz::{render_frame, Colormap, Rgb8Image};
 
 mod gpu;
+pub(crate) mod roi;
 
 // Polarity colours shared by every cloud (positive = warm, negative = cool).
 const POSITIVE: u32 = 0xff496c;
@@ -48,6 +49,23 @@ where
     P: FnMut() -> Result<Option<Rgb8Image>, String>,
 {
     gpu::run_live(producer, width, height, title)
+}
+
+/// Opens the ROI editor over the frames `producer` hands back, and returns the mask the user drew
+/// (`None` if they closed or cancelled the window). A live camera passes its usual frame producer;
+/// a still image passes one that yields the image once and `None` after.
+pub(crate) fn draw_mask<P>(
+    producer: P,
+    width: usize,
+    height: usize,
+    title: String,
+) -> Result<Option<Vec<bool>>, String>
+where
+    P: FnMut() -> Result<Option<Rgb8Image>, String>,
+{
+    let mut editor = roi::MaskEditor::new(width, height);
+    gpu::run_draw(producer, width as u32, height as u32, title, &mut editor)?;
+    Ok(editor.into_mask())
 }
 
 /// Renders `frame`: image kinds are colour-mapped (`colormap`, auto-contrast via `normalize`),

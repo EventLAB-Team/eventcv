@@ -14,7 +14,7 @@ EventCV is "OpenCV" for event-based data and computer vision applications.
 
 ## Resources
 - **Website** - https://eventcv.net
-- **Documentation** - https://eventcv.readthedocs.io
+- **Documentation** - https://docs.eventcv.net
 - **Rust core API** - https://docs.rs/eventcv-core
 
 ## Installation

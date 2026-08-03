@@ -152,12 +152,14 @@ impl PyEventStream {
         self.wrap(py.detach(|| self.inner.undistort(&camera)))
     }
 
-    /// Keeps events where the `(H, W)` boolean mask is `True`.
-    fn mask(&self, py: Python<'_>, mask: PyReadonlyArray2<bool>) -> PyEventStream {
-        let view = mask.as_array();
-        let (h, w) = (view.shape()[0], view.shape()[1]);
-        let flat: Vec<bool> = view.iter().copied().collect();
-        self.wrap(py.detach(|| self.inner.mask(&flat, w, h)))
+    /// Keeps events inside the region of interest: a `(H, W)` boolean mask (or 8-bit map, where
+    /// non-zero keeps the pixel) covering this stream's sensor. Build one with
+    /// `eventcv.circle_mask` / `ellipse_mask` / `rect_mask` / `polygon_mask`, draw one with
+    /// `draw_mask()`, or load one with `eventcv.load_mask`.
+    fn mask(&self, py: Python<'_>, mask: &Bound<'_, PyAny>) -> PyResult<PyEventStream> {
+        let (width, height) = self.inner.sensor_size();
+        let flat = parse_mask(mask, (width, height))?;
+        Ok(self.wrap(py.detach(|| self.inner.mask(&flat, width, height))))
     }
 
     /// Keeps events whose timestamp lies in the half-open window `[t0, t1)` (microseconds).
@@ -367,6 +369,28 @@ impl PyEventStream {
         };
         // Rendering always auto-contrasts unless the caller opts out explicitly.
         frame.view(py, colormap, normalize.unwrap_or(true))
+    }
+
+    /// Draws a region of interest over this stream and returns it as an `(H, W)` boolean mask —
+    /// the interactive way to build the argument `mask()` takes. Shows the same view `view()`
+    /// would (pass a representation name to choose another), then: drag to keep an area,
+    /// shift+drag to drop one, `e`/`r`/`f` to switch between ellipse, rectangle, and freehand,
+    /// `a`/`c` to select all or clear, `z` to undo. Whatever stays bright is what the mask keeps.
+    ///
+    /// `Enter` accepts and returns the mask; closing the window or pressing `Esc` returns `None`.
+    #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=None))]
+    fn draw_mask<'py>(
+        &self,
+        py: Python<'py>,
+        representation: Option<&Bound<'_, PyAny>>,
+        colormap: &str,
+        normalize: Option<bool>,
+    ) -> PyResult<Option<Bound<'py, PyArray2<bool>>>> {
+        let frame = match representation {
+            Some(representation) => self.generate(py, representation, normalize)?,
+            None => self.default_frame(py, normalize)?,
+        };
+        frame.draw_mask(py, colormap, normalize.unwrap_or(true))
     }
 }
 
@@ -585,6 +609,28 @@ impl PyEventFrame {
         py.detach(|| viewer::view(&self.inner, colormap, normalize))
             .map_err(PyRuntimeError::new_err)
     }
+
+    /// Draws a region of interest over this frame and returns it as an `(H, W)` boolean mask.
+    /// See `EventStream.draw_mask` for the controls; `Esc` (or closing the window) returns `None`.
+    #[pyo3(signature = (*, colormap="viridis", normalize=true))]
+    fn draw_mask<'py>(
+        &self,
+        py: Python<'py>,
+        colormap: &str,
+        normalize: bool,
+    ) -> PyResult<Option<Bound<'py, PyArray2<bool>>>> {
+        let colormap = parse_colormap(colormap)?;
+        let image = eventcv_core::viz::render_frame(&self.inner, colormap, normalize);
+        let (width, height) = (image.width, image.height);
+        let title = self.inner.kind().as_str().to_owned();
+        // A still background is a producer that hands over its one frame and then has nothing new.
+        let mut once = Some(image);
+        let mask = py
+            .detach(|| viewer::draw_mask(move || Ok(once.take()), width, height, title))
+            .map_err(PyRuntimeError::new_err)?;
+        mask.map(|mask| mask_to_py(py, mask, width, height))
+            .transpose()
+    }
 }
 
 #[pyclass(name = "EventPointSet", frozen)]
@@ -627,6 +673,61 @@ fn parse_sensor_size(sensor_size: Option<(i64, i64)>) -> PyResult<Option<(usize,
             ))
         })
         .transpose()
+}
+
+/// Reads an ROI mask array as `(mask, width, height)`, row-major with `true` = keep.
+///
+/// Accepts a `(H, W)` boolean array or an 8-bit map where **any non-zero value keeps the pixel**,
+/// so a mask binarised in another tool (or loaded from a PNG) is passed straight in. Any layout
+/// works — the array is read through its strides, not its buffer.
+fn mask_array(mask: &Bound<'_, PyAny>) -> PyResult<(Vec<bool>, usize, usize)> {
+    if let Ok(array) = mask.extract::<PyReadonlyArray2<bool>>() {
+        let view = array.as_array();
+        Ok((view.iter().copied().collect(), view.shape()[1], view.shape()[0]))
+    } else if let Ok(array) = mask.extract::<PyReadonlyArray2<u8>>() {
+        let view = array.as_array();
+        Ok((
+            view.iter().map(|&value| value != 0).collect(),
+            view.shape()[1],
+            view.shape()[0],
+        ))
+    } else {
+        Err(PyTypeError::new_err(
+            "mask must be a (H, W) numpy array of bool or uint8 (non-zero keeps the pixel); \
+             for any other dtype pass `mask > 0`",
+        ))
+    }
+}
+
+/// As [`mask_array`], but rejects a mask that isn't the size of the `(width, height)` sensor it is
+/// about to be applied to — silently dropping every event is a far worse failure than raising.
+fn parse_mask(mask: &Bound<'_, PyAny>, sensor: (usize, usize)) -> PyResult<Vec<bool>> {
+    let (flat, width, height) = mask_array(mask)?;
+    check_mask_sensor((width, height), sensor)?;
+    Ok(flat)
+}
+
+fn check_mask_sensor(mask: (usize, usize), sensor: (usize, usize)) -> PyResult<()> {
+    if mask != sensor {
+        return Err(PyValueError::new_err(format!(
+            "mask is for a {}x{} sensor but this one is {}x{} — build it for this sensor, e.g. \
+             eventcv.circle_mask(({}, {}), …)",
+            mask.0, mask.1, sensor.0, sensor.1, sensor.0, sensor.1,
+        )));
+    }
+    Ok(())
+}
+
+/// Hands a row-major mask back to Python as an `(H, W)` boolean array.
+fn mask_to_py(
+    py: Python<'_>,
+    mask: Vec<bool>,
+    width: usize,
+    height: usize,
+) -> PyResult<Bound<'_, PyArray2<bool>>> {
+    Array2::from_shape_vec((height, width), mask)
+        .map(|array| array.into_pyarray(py))
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// `None` or `"auto"` means infer the unit from the data; anything else is explicit.
@@ -1254,12 +1355,13 @@ impl PyEventReader {
         self.with_slice_op(Arc::new(move |s: EventStream| s.undistort(&camera)))
     }
 
-    /// Keeps events where the `(H, W)` boolean mask is `True`, per slice.
-    fn mask(&self, mask: PyReadonlyArray2<bool>) -> PyEventReader {
-        let view = mask.as_array();
-        let (h, w) = (view.shape()[0], view.shape()[1]);
-        let flat: Vec<bool> = view.iter().copied().collect();
-        self.with_slice_op(Arc::new(move |s: EventStream| s.mask(&flat, w, h)))
+    /// Keeps each slice's events inside the region of interest — a `(H, W)` boolean mask (or 8-bit
+    /// map, where non-zero keeps the pixel) covering this recording's sensor. Applied lazily to
+    /// every slice, so `open(...).mask(roi)` reads a whole recording through the ROI.
+    fn mask(&self, mask: &Bound<'_, PyAny>) -> PyResult<PyEventReader> {
+        let (width, height) = self.sensor_size();
+        let flat = parse_mask(mask, (width, height))?;
+        Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.mask(&flat, width, height))))
     }
 
     /// Keeps each slice's events whose timestamp lies in `[t0, t1)` (microseconds).
@@ -1679,6 +1781,88 @@ fn load_frame(py: Python<'_>, path: &str) -> PyResult<PyEventFrame> {
     py.detach(|| eventcv_core::io::load_frame(path))
         .map(|inner| PyEventFrame { inner })
         .map_err(map_io_error)
+}
+
+/// The `(width, height)` sensor an ROI mask is built for — the same `sensor_size` order the rest
+/// of eventcv uses, even though the mask itself comes back as `(H, W)` to match NumPy.
+fn parse_mask_size(sensor_size: (i64, i64)) -> PyResult<(usize, usize)> {
+    match parse_sensor_size(Some(sensor_size))? {
+        Some((width, height)) if width > 0 && height > 0 => Ok((width, height)),
+        _ => Err(PyValueError::new_err(
+            "sensor_size must be (width, height), both positive",
+        )),
+    }
+}
+
+/// Builds the ROI mask keeping the `width`×`height` rectangle at `(x0, y0)`.
+#[pyfunction]
+fn rect_mask(
+    py: Python<'_>,
+    sensor_size: (i64, i64),
+    x0: f64,
+    y0: f64,
+    width: f64,
+    height: f64,
+) -> PyResult<Bound<'_, PyArray2<bool>>> {
+    let (w, h) = parse_mask_size(sensor_size)?;
+    mask_to_py(py, eventcv_core::mask::rect(w, h, x0, y0, width, height), w, h)
+}
+
+/// Builds the ROI mask keeping the ellipse centred on `(cx, cy)` with semi-axes `rx`, `ry`.
+#[pyfunction]
+fn ellipse_mask(
+    py: Python<'_>,
+    sensor_size: (i64, i64),
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+) -> PyResult<Bound<'_, PyArray2<bool>>> {
+    let (w, h) = parse_mask_size(sensor_size)?;
+    mask_to_py(py, eventcv_core::mask::ellipse(w, h, cx, cy, rx, ry), w, h)
+}
+
+/// Builds the ROI mask keeping the circle of radius `r` centred on `(cx, cy)`.
+#[pyfunction]
+fn circle_mask(
+    py: Python<'_>,
+    sensor_size: (i64, i64),
+    cx: f64,
+    cy: f64,
+    r: f64,
+) -> PyResult<Bound<'_, PyArray2<bool>>> {
+    let (w, h) = parse_mask_size(sensor_size)?;
+    mask_to_py(py, eventcv_core::mask::ellipse(w, h, cx, cy, r, r), w, h)
+}
+
+/// Builds the ROI mask keeping the interior of the closed polygon through `points`
+/// (`[(x, y), …]`, by the even-odd rule).
+#[pyfunction]
+fn polygon_mask(
+    py: Python<'_>,
+    sensor_size: (i64, i64),
+    points: Vec<(f64, f64)>,
+) -> PyResult<Bound<'_, PyArray2<bool>>> {
+    let (w, h) = parse_mask_size(sensor_size)?;
+    mask_to_py(py, eventcv_core::mask::polygon(w, h, &points), w, h)
+}
+
+/// Writes an ROI mask to an 8-bit greyscale `.png` (white keeps, black drops).
+#[pyfunction]
+fn save_mask(py: Python<'_>, mask: &Bound<'_, PyAny>, path: &str) -> PyResult<()> {
+    let (flat, width, height) = mask_array(mask)?;
+    py.detach(|| eventcv_core::io::write_mask(path, &flat, width, height))
+        .map_err(map_io_error)
+}
+
+/// Reads an ROI mask from a `.png` as an `(H, W)` boolean array — a pixel is kept where the image
+/// is non-black and not fully transparent, so a mask binarised in any tool loads as-is.
+#[pyfunction]
+fn load_mask<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let (mask, width, height) = py
+        .detach(|| eventcv_core::io::read_mask(path))
+        .map_err(map_io_error)?;
+    mask_to_py(py, mask, width, height)
 }
 
 /// Streams `EventFrame`s into one extendable `[N, C, H, W]` HDF5 dataset — for writing a
@@ -2191,6 +2375,15 @@ const LIVE_RENDER_INTERVAL_MS: u64 = 16;
 #[cfg(all(feature = "camera", feature = "hdf5"))]
 const RECORD_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// What the live viewer is opened for: watching the stream (`show`) or drawing an ROI over it
+/// (`draw_mask`). Both run the same capture thread and renderer.
+#[cfg(feature = "camera")]
+#[derive(Clone, Copy)]
+enum LiveMode {
+    Show,
+    Draw,
+}
+
 /// How the live event stream is turned into frames for the interactive viewer.
 #[cfg(feature = "camera")]
 enum LiveRenderer {
@@ -2303,7 +2496,11 @@ fn run_live_threaded(
     width: u32,
     height: u32,
     title: String,
-) -> (Option<eventcv_core::device::Capture>, Result<(), String>) {
+    mode: LiveMode,
+) -> (
+    Option<eventcv_core::device::Capture>,
+    Result<Option<Vec<bool>>, String>,
+) {
     use std::sync::atomic::Ordering;
 
     let shared = Arc::new(LiveShared {
@@ -2356,7 +2553,12 @@ fn run_live_threaded(
         Ok(producer_shared.image.lock().unwrap().take())
     };
 
-    let result = viewer::run_live(producer, width, height, title);
+    let result = match mode {
+        LiveMode::Show => viewer::run_live(producer, width, height, title).map(|()| None),
+        LiveMode::Draw => {
+            viewer::draw_mask(producer, width as usize, height as usize, title)
+        }
+    };
 
     // Stop the drain thread and reclaim the capture.
     shared.stop.store(true, Ordering::Release);
@@ -2487,6 +2689,8 @@ struct PyEventCamera {
     name: String,
     serial: String,
     sensor_size: (usize, usize),
+    // The ROI mask the capture is filtering through, mirrored here for the same reason.
+    mask: Option<Vec<bool>>,
     // Skips and overflows from pumps already stopped, so the counters survive a `show()` round trip.
     skipped: usize,
     overflows: usize,
@@ -2539,6 +2743,32 @@ impl PyEventCamera {
     #[getter]
     fn n_overflows(&self) -> usize {
         self.overflows + self.pump().map_or(0, capture::Pump::n_overflows)
+    }
+
+    /// The region-of-interest mask events are filtered through — an `(H, W)` boolean array, or
+    /// `None` when the whole sensor is in use.
+    ///
+    /// Assign one to change it mid-session (`camera.mask = eventcv.circle_mask(...)`, or `None` to
+    /// clear it); `stream(mask=…)` sets it at open. Masked events are dropped **as they are
+    /// decoded**, so they never reach a `record=` file, the windows a loop reads, or `show()` —
+    /// and they cost nothing downstream. Unlike `stream(roi=…)`, which blocks pixels on-chip on
+    /// Prophesee sensors only, this is enforced on the host, so it works on any camera and takes
+    /// any shape.
+    #[getter]
+    fn mask<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<bool>>>> {
+        let (width, height) = self.sensor_size;
+        self.mask
+            .clone()
+            .map(|mask| mask_to_py(py, mask, width, height))
+            .transpose()
+    }
+
+    #[setter]
+    fn set_mask(&mut self, mask: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let mask = mask
+            .map(|mask| parse_mask(mask, self.sensor_size))
+            .transpose()?;
+        self.apply_mask(mask)
     }
 
     /// Events written so far by `stream(record=…)` (`0` when the camera isn't recording).
@@ -2656,55 +2886,40 @@ impl PyEventCamera {
         colormap: &str,
         normalize: bool,
     ) -> PyResult<()> {
-        let default_decay = self.decay_ms;
-        let stored_repr = self.repr;
-        let colormap_value = parse_colormap(colormap)?;
-        // Take ownership so the capture can move onto the viewer's own drain thread; it is restored
-        // into `self` when the viewer closes, so the camera stays usable afterwards.
-        self.park();
-        let (capture, recorder) = match std::mem::replace(&mut self.state, CameraState::Closed) {
-            CameraState::Idle { capture, recorder } => (capture, recorder),
-            _ => return Err(PyRuntimeError::new_err("camera is closed")),
-        };
-        let (width, height) = (capture.width() as u32, capture.height() as u32);
-        let title = capture.name().to_owned();
+        self.live(py, representation, decay_ms, colormap, normalize, LiveMode::Show)?;
+        Ok(())
+    }
 
-        let raw = |decay: Option<f64>| {
-            LiveRenderer::Raw(eventcv_core::viz::RawSurface::new(
-                width as usize,
-                height as usize,
-                decay.unwrap_or(default_decay),
-            ))
+    /// Draws a region of interest over the **live** view and returns it as an `(H, W)` boolean
+    /// mask, applying it to this camera as well — so the next `read()`, loop, or `record=` window
+    /// is already filtered. Everything `show()` takes applies here too (the view you draw over).
+    ///
+    /// Drag to keep an area, shift+drag to drop one, `e`/`r`/`f` to switch between ellipse,
+    /// rectangle, and freehand, `a`/`c` to select all or clear, `z` to undo. Whatever stays bright
+    /// is what the mask keeps. `Enter` accepts; closing the window or `Esc` returns `None` and
+    /// leaves the camera's current mask alone.
+    #[pyo3(signature = (representation=None, *, decay_ms=None, colormap="viridis", normalize=true))]
+    fn draw_mask<'py>(
+        &mut self,
+        py: Python<'py>,
+        representation: Option<String>,
+        decay_ms: Option<f64>,
+        colormap: &str,
+        normalize: bool,
+    ) -> PyResult<Option<Bound<'py, PyArray2<bool>>>> {
+        // Draw over the whole sensor rather than through whatever ROI is already set — otherwise
+        // the view hides the very events you are deciding about. Restored if the drawing is
+        // cancelled, replaced if it isn't.
+        let previous = self.mask.clone();
+        self.apply_mask(None)?;
+        let drawn = self.live(py, representation, decay_ms, colormap, normalize, LiveMode::Draw)?;
+        let Some(mask) = drawn else {
+            self.apply_mask(previous)?;
+            return Ok(None);
         };
-        let repr = |spec: ReprSpec| LiveRenderer::Repr {
-            spec,
-            colormap: colormap_value,
-            normalize,
-            width: width as usize,
-            height: height as usize,
-            window: std::time::Duration::from_millis(LIVE_REPR_WINDOW_MS),
-            builder: EventStreamBuilder::new(width as usize, height as usize, 0.001),
-            last_render: std::time::Instant::now(),
-        };
-        let renderer = match representation.as_deref() {
-            Some("raw") => raw(decay_ms),
-            Some(name) => repr(ReprSpec::named(name, Some(normalize))?),
-            None => match stored_repr {
-                Some(spec) => repr(spec),
-                None => raw(decay_ms),
-            },
-        };
-
-        // Draining runs on a dedicated thread that owns the capture, decoupled from the GPU thread's
-        // vsync-bound present loop (see `run_live_threaded`). The camera is reclaimed and restored
-        // into `self` on close so it stays usable.
-        let (capture, result) =
-            py.detach(move || run_live_threaded(capture, renderer, width, height, title));
-        self.state = match capture {
-            Some(capture) => CameraState::Idle { capture, recorder },
-            None => CameraState::Closed,
-        };
-        result.map_err(PyRuntimeError::new_err)
+        self.apply_mask(Some(mask.clone()))?;
+        let (width, height) = self.sensor_size;
+        mask_to_py(py, mask, width, height).map(Some)
     }
 
     /// Records the live stream to `path` (format by extension, like `eventcv.save`). Blocks until
@@ -2933,6 +3148,78 @@ impl PyEventCamera {
                 None => CameraState::Closed,
             };
         }
+    }
+
+    /// Shared body of `show` and `draw_mask`: builds the live renderer and runs the viewer,
+    /// returning the drawn mask in [`LiveMode::Draw`].
+    fn live(
+        &mut self,
+        py: Python<'_>,
+        representation: Option<String>,
+        decay_ms: Option<f64>,
+        colormap: &str,
+        normalize: bool,
+        mode: LiveMode,
+    ) -> PyResult<Option<Vec<bool>>> {
+        let default_decay = self.decay_ms;
+        let stored_repr = self.repr;
+        let colormap_value = parse_colormap(colormap)?;
+        // Take ownership so the capture can move onto the viewer's own drain thread; it is restored
+        // into `self` when the viewer closes, so the camera stays usable afterwards.
+        self.park();
+        let (capture, recorder) = match std::mem::replace(&mut self.state, CameraState::Closed) {
+            CameraState::Idle { capture, recorder } => (capture, recorder),
+            _ => return Err(PyRuntimeError::new_err("camera is closed")),
+        };
+        let (width, height) = (capture.width() as u32, capture.height() as u32);
+        let title = capture.name().to_owned();
+
+        let raw = |decay: Option<f64>| {
+            LiveRenderer::Raw(eventcv_core::viz::RawSurface::new(
+                width as usize,
+                height as usize,
+                decay.unwrap_or(default_decay),
+            ))
+        };
+        let repr = |spec: ReprSpec| LiveRenderer::Repr {
+            spec,
+            colormap: colormap_value,
+            normalize,
+            width: width as usize,
+            height: height as usize,
+            window: std::time::Duration::from_millis(LIVE_REPR_WINDOW_MS),
+            builder: EventStreamBuilder::new(width as usize, height as usize, 0.001),
+            last_render: std::time::Instant::now(),
+        };
+        let renderer = match representation.as_deref() {
+            Some("raw") => raw(decay_ms),
+            Some(name) => repr(ReprSpec::named(name, Some(normalize))?),
+            None => match stored_repr {
+                Some(spec) => repr(spec),
+                None => raw(decay_ms),
+            },
+        };
+
+        // Draining runs on a dedicated thread that owns the capture, decoupled from the GPU thread's
+        // vsync-bound present loop (see `run_live_threaded`). The camera is reclaimed and restored
+        // into `self` on close so it stays usable.
+        let (capture, result) =
+            py.detach(move || run_live_threaded(capture, renderer, width, height, title, mode));
+        self.state = match capture {
+            Some(capture) => CameraState::Idle { capture, recorder },
+            None => CameraState::Closed,
+        };
+        result.map_err(PyRuntimeError::new_err)
+    }
+
+    /// Puts `mask` on the capture — parking the pump, which owns it, first — and mirrors it here so
+    /// the getter keeps working once decoding restarts.
+    fn apply_mask(&mut self, mask: Option<Vec<bool>>) -> PyResult<()> {
+        self.parked_capture()?
+            .set_mask(mask.clone())
+            .map_err(PyRuntimeError::new_err)?;
+        self.mask = mask;
+        Ok(())
     }
 
     /// Parks the pump and borrows the capture for the direct-drive paths.
@@ -3242,7 +3529,7 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     serial=None, *, dt_ms=None, max_events=None, repr=None, bins=None, window_ms=None, tau_ms=None,
     max_window_ms=None, window=None, normalize=None, pct=None, white_frame=None, record=None,
     compression=None, latest=false,
-    max_event_rate=None, roi=None, adaptive_bias=None, decay_ms=30.0
+    max_event_rate=None, roi=None, mask=None, adaptive_bias=None, decay_ms=30.0
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stream(
@@ -3264,6 +3551,7 @@ fn stream(
     latest: bool,
     max_event_rate: Option<f64>,
     roi: Option<(i64, i64, i64, i64)>,
+    mask: Option<&Bound<'_, PyAny>>,
     adaptive_bias: Option<&Bound<'_, PyAny>>,
     decay_ms: f64,
 ) -> PyResult<PyEventCamera> {
@@ -3312,9 +3600,22 @@ fn stream(
     }
     let limits = parse_limits(max_event_rate, roi)?;
     let bias = parse_adaptive_bias(adaptive_bias)?;
-    let capture = py
+    // Read the mask before the device is touched, so a bad array raises the same way with or
+    // without hardware; it can only be *sized* against the sensor once the camera is open.
+    let mask = mask.map(mask_array).transpose()?;
+    let mut capture = py
         .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing, limits, bias))
         .map_err(PyRuntimeError::new_err)?;
+    let mask = match mask {
+        Some((flat, width, height)) => {
+            check_mask_sensor((width, height), (capture.width(), capture.height()))?;
+            capture
+                .set_mask(Some(flat.clone()))
+                .map_err(PyRuntimeError::new_err)?;
+            Some(flat)
+        }
+        None => None,
+    };
     // Created only now, so a failed camera open never leaves an empty recording behind.
     #[cfg(feature = "hdf5")]
     let recorder = record
@@ -3327,6 +3628,7 @@ fn stream(
         name: capture.name().to_owned(),
         serial: capture.serial().to_owned(),
         sensor_size: (capture.width(), capture.height()),
+        mask,
         state: CameraState::Idle { capture, recorder },
         repr,
         decay_ms,
@@ -3355,6 +3657,12 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(load_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(rect_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(ellipse_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(circle_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(polygon_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(save_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(load_mask, m)?)?;
     #[cfg(feature = "hdf5")]
     {
         m.add_class::<PyFrameSink>()?;

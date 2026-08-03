@@ -22,6 +22,49 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: collate
 ```
 
+(roi-masking)=
+## Region-of-interest masking
+
+A mask is a plain `(H, W)` boolean NumPy array — `True` where events are **kept** — so it composes
+with NumPy's own operators (`|`, `&`, `~`) and can be built, drawn, or loaded. Pass one to
+{meth}`~eventcv.EventStream.mask`, to {meth}`~eventcv.EventReader.mask` (deferred onto every
+slice), or to `ecv.stream(mask=…)`, where events outside it are dropped as they are decoded — so
+they never reach a `record=` file or the windows a loop reads.
+
+```python
+import eventcv as ecv
+
+aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)   # a circular sensor aperture
+aperture &= ~ecv.rect_mask((640, 480), 0, 0, 64, 64)            # minus a hot corner
+ecv.save_mask(aperture, "aperture.png")                         # reuse it next session
+
+ecv.open("rec.h5", dt_ms=30).mask(aperture)                     # every slice, lazily
+ecv.stream(dt_ms=50, mask=aperture, record="session.h5")        # live, before the recorder
+```
+
+`sensor_size` is `(width, height)` — the same order as everywhere else in eventcv — while the array
+you get back is `(H, W)`, like any other NumPy image. Coordinates are continuous rather than pixel
+indices: a pixel is kept when its centre falls inside the shape, and geometry off the sensor is
+clamped. An 8-bit map works anywhere a boolean one does (any non-zero value keeps the pixel), so a
+mask binarised elsewhere is passed straight in. A mask that isn't the size of the sensor raises,
+rather than silently dropping every event.
+
+To draw one instead, {meth}`~eventcv.EventStream.draw_mask` (or
+{meth}`~eventcv.EventFrame.draw_mask`) opens the viewer on a still frame, and
+{meth}`~eventcv.EventCamera.draw_mask` draws over the live camera and applies the result. Drag to
+keep an area, shift+drag to drop one, `e`/`r`/`f` to switch between ellipse, rectangle, and
+freehand, `a`/`c` to select all or clear, `z` to undo; whatever stays bright is what the mask
+keeps. `Enter` accepts, `Esc` returns `None`.
+
+```{eval-rst}
+.. autofunction:: circle_mask
+.. autofunction:: ellipse_mask
+.. autofunction:: rect_mask
+.. autofunction:: polygon_mask
+.. autofunction:: save_mask
+.. autofunction:: load_mask
+```
+
 ## Core types
 
 ```{eval-rst}
@@ -97,8 +140,9 @@ with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
 ```
 
 Windowing mirrors `open` (`dt_ms` or `max_events`), `repr=` and its options render each window,
-`record=` archives the raw events, `latest=True` keeps a slow loop on live data, and
-`max_event_rate` / `roi` cap what the sensor emits in hardware. See the
+`record=` archives the raw events, `latest=True` keeps a slow loop on live data,
+`max_event_rate` / `roi` cap what the sensor emits in hardware, and `mask=` restricts it to an
+arbitrarily shaped {ref}`region of interest <roi-masking>` on the host. See the
 [streaming guide](streaming.md) for the full picture — recording, staying live under load, source
 caps, and troubleshooting. These functions are built into wheels that include camera support; on
 Linux the camera needs udev rules for non-root USB access.

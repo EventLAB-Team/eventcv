@@ -169,11 +169,46 @@ Where the knee falls depends on your host: the decode pipeline costs about 16 ns
 (~6 ns parsing the sensor's wire format, ~10 ns accumulating events into a window), i.e. a ceiling
 near 62 Mev/s on one core. Caps below that keep up; caps above it leave a backlog.
 
+### Masking a region of interest
+
+`roi=` is a rectangle, and it exists only on Prophesee sensors. When the region you care about is
+some other shape — a circular aperture, a window frame, a lens vignette — pass `mask=` instead: an
+`(H, W)` boolean array covering the sensor, enforced on the host, so it works on **any** camera.
+Events outside it are dropped as they are decoded, before windowing, so they never reach a
+`record=` file, the windows your loop reads, or `show()`:
+
+```python
+aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
+
+with ecv.stream(dt_ms=50, mask=aperture, record="session.h5") as cam:
+    for events in cam:          # already masked — and so is the recording
+        track(events)
+```
+
+Easiest is to draw it over the live view. {meth}`~eventcv.EventCamera.draw_mask` opens the viewer,
+lets you drag shapes, and applies what you drew to the camera:
+
+```python
+cam = ecv.stream(dt_ms=50)
+cam.draw_mask()                 # drag an ellipse over the aperture, press Enter
+ecv.save_mask(cam.mask, "aperture.png")     # reuse it next session with mask=ecv.load_mask(...)
+```
+
+Drag to keep an area, shift+drag to drop one, `e`/`r`/`f` to switch between ellipse, rectangle, and
+freehand, `a`/`c` to select all or clear, `z` to undo. Whatever stays bright is what the mask keeps;
+`Enter` accepts and `Esc` cancels. Assign {attr}`~eventcv.EventCamera.mask` to change it mid-session
+(`None` clears it). Unlike `roi=`, a host-side mask does not reduce what crosses the USB cable — on
+a Prophesee sensor, combine the two: `roi=` for the bounding box, `mask=` for the shape inside it.
+
+See {ref}`ROI masking <roi-masking>` for building masks without a camera and for applying them to
+recordings.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Frame rate below `1000 / dt_ms`, `backlog` climbing | The camera outruns decoding | Cap with `max_event_rate`, or narrow the field with `roi` |
+| Noise outside the useful part of the sensor | The scene doesn't fill the sensor (a circular aperture, a vignette) | `mask=` an ROI of any shape, or draw one with `cam.draw_mask()` |
 | `n_overflows` rising | The driver dropped events before EventCV saw them | Same — cap the source; a busy scene on a large sensor can exceed any host |
 | Frames arrive but are stale | In-order delivery behind a slow loop | `latest=True` (and check `n_skipped`) |
 | `n_skipped` rising fast | Per-window work slower than the camera | Expected with `latest=True`; `record=` still archives everything |

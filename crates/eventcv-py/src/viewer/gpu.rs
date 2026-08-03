@@ -8,7 +8,6 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
-#[cfg(feature = "camera")]
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
@@ -21,6 +20,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowId};
 
+use super::roi::MaskEditor;
 use super::{CloudPoint, Scene};
 
 const BACKGROUND: wgpu::Color = wgpu::Color {
@@ -40,7 +40,6 @@ const MIN_DISTANCE: f32 = 1.3;
 const MAX_DISTANCE: f32 = 12.0;
 const DEFAULT_PITCH: f32 = -0.55;
 /// Live viewer refresh cadence (~60 FPS).
-#[cfg(feature = "camera")]
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 thread_local! {
@@ -49,21 +48,7 @@ thread_local! {
 
 /// Opens a window and renders `scene` until the user closes it (Esc / window close).
 pub(crate) fn run(scene: Scene) -> Result<(), String> {
-    EVENT_LOOP.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(EventLoop::new().map_err(|error| error.to_string())?);
-        }
-        let event_loop = slot.as_mut().expect("event loop just initialised");
-        let mut app = App::new(scene);
-        event_loop
-            .run_app_on_demand(&mut app)
-            .map_err(|error| error.to_string())?;
-        match app.error.take() {
-            Some(message) => Err(message),
-            None => Ok(()),
-        }
-    })
+    run_app(App::new(scene))
 }
 
 /// Opens a window and displays a live stream, pulling a fresh frame from `producer` every
@@ -82,27 +67,52 @@ pub(crate) fn run_live<P>(
 where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
+    run_app(LiveApp::new(producer, width, height, title, None))
+}
+
+/// Like [`run_live`], but `editor` draws an ROI over the displayed frames: pointer drags become
+/// shapes and the excluded region is dimmed in place. Returns once the window closes; whether the
+/// drawing was accepted is read back from the editor. A `producer` that yields one frame and then
+/// `Ok(None)` makes this a still-image editor, which is how a file-derived frame is drawn on.
+pub(crate) fn run_draw<P>(
+    producer: P,
+    width: u32,
+    height: u32,
+    title: String,
+    editor: &mut MaskEditor,
+) -> Result<(), String>
+where
+    P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
+{
+    run_app(LiveApp::new(producer, width, height, title, Some(editor)))
+}
+
+/// Runs an app to completion on the process-global event loop, surfacing whatever error ended it.
+fn run_app(mut app: impl ApplicationHandler + Failable) -> Result<(), String> {
     EVENT_LOOP.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
             *slot = Some(EventLoop::new().map_err(|error| error.to_string())?);
         }
         let event_loop = slot.as_mut().expect("event loop just initialised");
-        let mut app = LiveApp::new(producer, width, height, title);
         event_loop
             .run_app_on_demand(&mut app)
             .map_err(|error| error.to_string())?;
-        match app.error.take() {
+        match app.take_error() {
             Some(message) => Err(message),
             None => Ok(()),
         }
     })
 }
 
+/// An app that can end on a fatal error, so [`run_app`] can report it.
+trait Failable {
+    fn take_error(&mut self) -> Option<String>;
+}
+
 /// The live counterpart to [`App`]: instead of one static [`Scene`] it pulls a frame from `producer`
 /// each ~[`FRAME_INTERVAL`] and re-uploads the image texture in place.
-#[cfg(feature = "camera")]
-struct LiveApp<P> {
+struct LiveApp<'a, P> {
     producer: P,
     width: u32,
     height: u32,
@@ -110,14 +120,29 @@ struct LiveApp<P> {
     window: Option<Arc<Window>>,
     render: Option<Render>,
     error: Option<String>,
+    /// ROI drawing, when the window was opened by `draw_mask()`. It repaints every displayed frame,
+    /// so the newest frame is kept here to composite onto even when the producer has nothing new.
+    editor: Option<&'a mut MaskEditor>,
+    frame: Option<super::Rgb8Image>,
 }
 
-#[cfg(feature = "camera")]
-impl<P> LiveApp<P>
+impl<P> Failable for LiveApp<'_, P> {
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+}
+
+impl<'a, P> LiveApp<'a, P>
 where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
-    fn new(producer: P, width: u32, height: u32, title: String) -> Self {
+    fn new(
+        producer: P,
+        width: u32,
+        height: u32,
+        title: String,
+        editor: Option<&'a mut MaskEditor>,
+    ) -> Self {
         Self {
             producer,
             width,
@@ -126,7 +151,72 @@ where
             window: None,
             render: None,
             error: None,
+            editor,
+            frame: None,
         }
+    }
+
+    /// Pushes the newest frame to the GPU, with the ROI overlay painted on when drawing.
+    fn present(&mut self) {
+        let (Some(render), Some(frame)) = (&mut self.render, &self.frame) else {
+            return;
+        };
+        match &self.editor {
+            Some(editor) => {
+                let mut overlaid = frame.clone();
+                editor.paint(&mut overlaid);
+                render.update_image(&overlaid);
+            }
+            None => render.update_image(frame),
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Routes a window event to the editor. Returns whether it accepted the drawing (`Enter`).
+    fn edit(&mut self, event: &WindowEvent) -> bool {
+        let size = self.window.as_ref().map(|window| window.inner_size());
+        let Some(editor) = &mut self.editor else {
+            return false;
+        };
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let size = size.unwrap_or(PhysicalSize::new(1, 1));
+                editor.cursor_moved(
+                    position.x / size.width.max(1) as f64,
+                    position.y / size.height.max(1) as f64,
+                );
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                editor.shift_held(modifiers.state().shift_key())
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => editor.press(),
+                ElementState::Released => editor.release(),
+            },
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                return match &event.logical_key {
+                    Key::Named(NamedKey::Enter) => editor.key('\r'),
+                    Key::Character(text) => text
+                        .chars()
+                        .next()
+                        .is_some_and(|key| editor.key(key.to_ascii_lowercase())),
+                    _ => false,
+                };
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Sleeps until the next display frame is due.
+    fn wait(&self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
     }
 
     fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
@@ -142,8 +232,7 @@ where
     }
 }
 
-#[cfg(feature = "camera")]
-impl<P> ApplicationHandler for LiveApp<P>
+impl<P> ApplicationHandler for LiveApp<'_, P>
 where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
@@ -154,8 +243,12 @@ where
         // Upscale small sensors so the window is comfortably visible; the texture stays at sensor
         // resolution (nearest sampling) so the events aren't blurred.
         let factor = ((480 + self.height - 1) / self.height.max(1)).clamp(1, 4);
+        let title = match self.editor {
+            Some(_) => format!("eventcv - {} - {}", self.title, super::roi::LEGEND),
+            None => format!("eventcv - {}", self.title),
+        };
         let attributes = Window::default_attributes()
-            .with_title(format!("eventcv - {}", self.title))
+            .with_title(title)
             .with_inner_size(LogicalSize::new(self.width * factor, self.height * factor));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
@@ -178,6 +271,11 @@ where
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Drawing consumes pointer and character input; Esc and close still end the window (as a
+        // cancel), and everything below keeps working unchanged when no editor is attached.
+        if self.edit(&event) {
+            return self.shutdown(event_loop);
+        }
         match event {
             WindowEvent::CloseRequested => self.shutdown(event_loop),
             WindowEvent::KeyboardInput { event, .. }
@@ -208,18 +306,14 @@ where
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         match (self.producer)() {
-            Ok(Some(image)) => {
-                if let Some(render) = &mut self.render {
-                    render.update_image(&image);
-                }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
+            Ok(Some(image)) => self.frame = Some(image),
+            // Nothing new from the producer, but a drag may have moved: an editor still repaints.
+            Ok(None) if self.editor.is_none() => return self.wait(event_loop),
             Ok(None) => {}
             Err(message) => return self.fail(event_loop, message),
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+        self.present();
+        self.wait(event_loop);
     }
 }
 
@@ -235,6 +329,12 @@ struct App {
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
     error: Option<String>,
+}
+
+impl Failable for App {
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
 }
 
 impl App {
@@ -403,12 +503,10 @@ enum Content {
     Image {
         pipeline: wgpu::RenderPipeline,
         bind_group: wgpu::BindGroup,
-        // Kept so the live viewer can re-upload frames in place (the sensor size is fixed).
-        #[cfg(feature = "camera")]
+        // Kept so the live viewer and the ROI editor can re-upload frames in place (the sensor
+        // size is fixed).
         texture: wgpu::Texture,
-        #[cfg(feature = "camera")]
         width: u32,
-        #[cfg(feature = "camera")]
         height: u32,
     },
 }
@@ -515,7 +613,6 @@ impl Render {
 
     /// Re-uploads a live frame into the image texture in place. Frames whose size differs from the
     /// texture (fixed at the sensor resolution) are ignored, as is a non-image content.
-    #[cfg(feature = "camera")]
     fn update_image(&mut self, image: &super::Rgb8Image) {
         let Content::Image {
             texture,
@@ -928,11 +1025,8 @@ fn build_image(
     Content::Image {
         pipeline,
         bind_group,
-        #[cfg(feature = "camera")]
         texture,
-        #[cfg(feature = "camera")]
         width: image.width as u32,
-        #[cfg(feature = "camera")]
         height: image.height as u32,
     }
 }

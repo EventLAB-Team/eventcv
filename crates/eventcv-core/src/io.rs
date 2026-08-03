@@ -498,10 +498,86 @@ fn write_png_frame(path: &Path, frame: &EventFrame, options: &SaveOptions) -> Re
     encoder
         .write_header()
         .and_then(|mut writer| writer.write_image_data(&image.pixels))
-        .map_err(|error| match error {
-            png::EncodingError::IoError(error) => IoError::Io(error),
-            other => IoError::Format(other.to_string()),
-        })
+        .map_err(png_encoding_error)
+}
+
+fn png_encoding_error(error: png::EncodingError) -> IoError {
+    match error {
+        png::EncodingError::IoError(error) => IoError::Io(error),
+        other => IoError::Format(other.to_string()),
+    }
+}
+
+/// Writes an ROI mask (row-major `width·height`, `true` = keep) as an 8-bit greyscale `.png`:
+/// white where events are kept, black where they are dropped. Lets an ROI drawn or computed once
+/// be reused across sessions, and inspected in any image viewer. Read it back with [`read_mask`].
+pub fn write_mask(
+    path: impl AsRef<Path>,
+    mask: &[bool],
+    width: usize,
+    height: usize,
+) -> Result<(), IoError> {
+    let path = path.as_ref();
+    if !matches!(detect_format(path)?, Format::Png) {
+        return Err(IoError::Unsupported("masks are saved as .png".to_owned()));
+    }
+    if width == 0 || height == 0 {
+        return Err(IoError::InvalidSensorSize);
+    }
+    if mask.len() != width * height {
+        return Err(IoError::Format(format!(
+            "mask has {} pixels, expected {} for a {width}x{height} grid",
+            mask.len(),
+            width * height
+        )));
+    }
+    let pixels: Vec<u8> = mask.iter().map(|&keep| if keep { 255 } else { 0 }).collect();
+    let writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(&pixels))
+        .map_err(png_encoding_error)
+}
+
+/// Reads an ROI mask from a `.png`, returning it as `(mask, width, height)` (row-major, `true` =
+/// keep). Any 8-bit-normalisable PNG works — greyscale, palette, or colour, with or without alpha —
+/// so a mask binarised in another tool loads as-is: a pixel is **kept where it is non-black and not
+/// fully transparent**. The counterpart of [`write_mask`].
+pub fn read_mask(path: impl AsRef<Path>) -> Result<(Vec<bool>, usize, usize), IoError> {
+    let path = path.as_ref();
+    if !matches!(detect_format(path)?, Format::Png) {
+        return Err(IoError::Unsupported("masks are loaded from .png".to_owned()));
+    }
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
+    // Expands palette and sub-byte images and strips 16-bit samples, so everything below is 8-bit.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(png_decoding_error)?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).map_err(png_decoding_error)?;
+    let (width, height) = (info.width as usize, info.height as usize);
+    let samples = info.color_type.samples();
+    let alpha = matches!(
+        info.color_type,
+        png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
+    );
+    let mut mask = Vec::with_capacity(width * height);
+    for row in buffer.chunks_exact(info.line_size).take(height) {
+        for pixel in row[..width * samples].chunks_exact(samples) {
+            let (colour, opacity) = pixel.split_at(samples - usize::from(alpha));
+            mask.push(colour.iter().any(|&value| value != 0) && opacity.first() != Some(&0));
+        }
+    }
+    Ok((mask, width, height))
+}
+
+fn png_decoding_error(error: png::DecodingError) -> IoError {
+    match error {
+        png::DecodingError::IoError(error) => IoError::Io(error),
+        other => IoError::Format(other.to_string()),
+    }
 }
 
 /// Reads an [`EventFrame`] previously written by [`save_frame`], reconstructing its dtype,
@@ -568,7 +644,9 @@ impl From<io::Error> for IoError {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, open, IoError, LoadOptions, MemorySliceSource, SliceSource};
+    use super::{
+        load, open, read_mask, write_mask, IoError, LoadOptions, MemorySliceSource, SliceSource,
+    };
     use crate::EventStreamBuilder;
 
     #[test]
@@ -657,5 +735,27 @@ mod tests {
             Err(other) => panic!("expected unsupported error, got {other:?}"),
             Ok(_) => panic!("expected an error for an unknown extension"),
         }
+    }
+
+    #[test]
+    fn mask_png_round_trips_and_validates() {
+        let path = std::env::temp_dir().join(format!("eventcv_mask_{}.png", std::process::id()));
+        let mask = crate::mask::ellipse(16, 12, 8.0, 6.0, 5.0, 4.0);
+
+        write_mask(&path, &mask, 16, 12).unwrap();
+        let (loaded, width, height) = read_mask(&path).unwrap();
+        assert_eq!((width, height), (16, 12));
+        assert_eq!(loaded, mask);
+        std::fs::remove_file(&path).ok();
+
+        // A mask that doesn't match the grid it claims, and a non-PNG target, both report why.
+        assert!(matches!(
+            write_mask(&path, &mask, 16, 11),
+            Err(IoError::Format(_))
+        ));
+        assert!(matches!(
+            write_mask("mask.npz", &mask, 16, 12),
+            Err(IoError::Unsupported(_))
+        ));
     }
 }

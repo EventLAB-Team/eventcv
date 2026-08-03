@@ -269,6 +269,7 @@ def stream(
     latest: bool = False,
     max_event_rate: float | None = None,
     roi: tuple[int, int, int, int] | None = None,
+    mask=None,
     adaptive_bias: bool | dict | None = None,
     decay_ms: float = 30.0,
 ) -> EventCamera:
@@ -318,6 +319,23 @@ def stream(
 
         ecv.stream(dt_ms=50, max_event_rate=40_000_000)     # 40 Mev/s ceiling, enforced on-chip
         ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))      # centre quarter only
+
+    **Region of interest.** ``mask`` takes an arbitrarily shaped ROI — an ``(H, W)`` boolean array
+    (or 8-bit map, where non-zero keeps the pixel) covering the sensor. Events outside it are
+    dropped **as they are decoded**, so they never reach a ``record=`` file, the windows your loop
+    reads, or :meth:`EventCamera.show`, and they cost nothing downstream. Where ``roi=`` is a
+    rectangle blocked on-chip (Prophesee only), ``mask`` is any shape enforced on the host, so it
+    works on every camera — including sensors whose useful data is a circle::
+
+        aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
+        with ecv.stream(dt_ms=50, mask=aperture, record="session.h5") as cam:
+            for events in cam:              # masked already, as is the recording
+                track(events)
+
+    Set :attr:`EventCamera.mask` to change it mid-session (``None`` clears it), or draw one over the
+    live view with :meth:`EventCamera.draw_mask`. Build masks with :func:`circle_mask`,
+    :func:`ellipse_mask`, :func:`rect_mask`, :func:`polygon_mask`, or load one with
+    :func:`load_mask`.
 
     **Adaptive biasing.** A camera left on fixed biases produces wildly different event rates as the
     light changes — the same scene can starve at dusk and saturate in sun, and anything downstream
@@ -447,6 +465,7 @@ def stream(
         latest=latest,
         max_event_rate=max_event_rate,
         roi=roi,
+        mask=mask,
         adaptive_bias=adaptive_bias,
         decay_ms=decay_ms,
     )
@@ -506,6 +525,83 @@ def load_frame(path: str) -> EventFrame:
     Restores the representation's shape, dtype, ``kind``, and ``channel_names``.
     """
     return _rust.load_frame(path)
+
+
+def circle_mask(sensor_size: tuple[int, int], cx: float, cy: float, r: float):
+    """Build a circular ROI mask of radius ``r`` centred on ``(cx, cy)``.
+
+    Returns an ``(H, W)`` boolean NumPy array — ``True`` where events are **kept** — ready for
+    :meth:`EventStream.mask`, :meth:`EventReader.mask`, or ``ecv.stream(mask=…)``. Note the two
+    orders: ``sensor_size`` is ``(width, height)`` like everywhere else in eventcv, while the array
+    that comes back is ``(H, W)`` like every other NumPy image.
+
+    Masks are plain arrays, so they compose with NumPy's own operators — ``|`` unions, ``&``
+    intersects, ``~`` inverts::
+
+        aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
+        aperture &= ~ecv.rect_mask((640, 480), 0, 0, 64, 64)   # minus a corner
+        ecv.load("rec.npz").mask(aperture)
+
+    Coordinates are continuous, not pixel indices: a pixel is kept when its centre falls inside the
+    shape, and geometry reaching off the sensor is clamped. See also :func:`ellipse_mask`,
+    :func:`rect_mask`, :func:`polygon_mask`, :func:`load_mask`, and — to draw one by hand —
+    :meth:`EventStream.draw_mask` / :meth:`EventCamera.draw_mask`.
+    """
+    return _rust.circle_mask(sensor_size, cx, cy, r)
+
+
+def ellipse_mask(
+    sensor_size: tuple[int, int], cx: float, cy: float, rx: float, ry: float
+):
+    """Build an elliptical ROI mask centred on ``(cx, cy)`` with semi-axes ``rx``, ``ry``.
+
+    The axis-independent form of :func:`circle_mask`; see it for the conventions.
+    """
+    return _rust.ellipse_mask(sensor_size, cx, cy, rx, ry)
+
+
+def rect_mask(
+    sensor_size: tuple[int, int], x0: float, y0: float, width: float, height: float
+):
+    """Build a rectangular ROI mask keeping the ``width``×``height`` box at ``(x0, y0)``.
+
+    Unlike :meth:`EventStream.crop`, which shrinks the sensor grid, a mask keeps the coordinates
+    (and the sensor size) unchanged and only drops events. See :func:`circle_mask` for the
+    conventions.
+    """
+    return _rust.rect_mask(sensor_size, x0, y0, width, height)
+
+
+def polygon_mask(sensor_size: tuple[int, int], points):
+    """Build an ROI mask keeping the interior of the closed polygon through ``points``.
+
+    ``points`` is a sequence of ``(x, y)`` vertices; the last joins back to the first. Filled by
+    the even-odd rule, so a self-intersecting outline leaves holes. See :func:`circle_mask` for the
+    conventions.
+    """
+    return _rust.polygon_mask(sensor_size, [tuple(point) for point in points])
+
+
+def save_mask(mask, path: str) -> None:
+    """Write an ROI mask to an 8-bit greyscale ``.png`` — white keeps, black drops.
+
+    Lets an ROI drawn or computed once be reused across sessions (and checked in any image viewer).
+    Read it back with :func:`load_mask`.
+    """
+    return _rust.save_mask(mask, path)
+
+
+def load_mask(path: str):
+    """Read an ROI mask from a ``.png`` as an ``(H, W)`` boolean array.
+
+    A pixel is kept where the image is **non-black and not fully transparent**, so a mask binarised
+    in any other tool loads as-is — greyscale, palette, or colour, with or without alpha::
+
+        ecv.stream(dt_ms=50, mask=ecv.load_mask("aperture.png"))
+
+    The counterpart of :func:`save_mask`.
+    """
+    return _rust.load_mask(path)
 
 
 def export_png(
@@ -580,15 +676,21 @@ __all__ = [
     "FEAST",
     "FrameSink",
     "Polarity",
+    "circle_mask",
     "collate",
+    "ellipse_mask",
     "export_png",
     "from_numpy",
     "list_cameras",
     "load",
     "load_feast",
     "load_frame",
+    "load_mask",
     "open",
+    "polygon_mask",
+    "rect_mask",
     "save",
+    "save_mask",
     "stream",
 ]
 

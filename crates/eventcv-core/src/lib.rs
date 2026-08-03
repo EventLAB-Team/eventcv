@@ -17,6 +17,7 @@
 //! - [`features`], [`flow`], [`cluster`] — corner detection, optical flow, connected components.
 //! - [`feast`] — unsupervised online feature learning (FEAST adaptive-threshold clustering).
 //! - [`filter`], [`image`], [`viz`] — hot-pixel filtering, frame-domain resize, colormapped export.
+//! - [`mask`] — region-of-interest shapes (rectangle, ellipse, polygon) for [`EventStream::mask`].
 //! - [`bias`] — the adaptive-biasing control law that holds a live camera's event rate steady.
 //! - `device` — live USB event-camera capture into [`EventStream`] windows (`camera` feature).
 //!
@@ -37,6 +38,7 @@ pub mod filter;
 pub mod flow;
 pub mod image;
 pub mod io;
+pub mod mask;
 pub mod representation;
 pub mod transform;
 pub mod viz;

@@ -325,6 +325,9 @@ pub struct Capture {
     windower: Windower,
     /// Closed-loop bias control, when `stream(adaptive_bias=…)` asked for it.
     bias: Option<AdaptiveBias>,
+    /// Region-of-interest mask (row-major `width·height`, `true` = keep), applied as events are
+    /// decoded. `None` keeps everything. See [`set_mask`](Self::set_mask).
+    mask: Option<Vec<bool>>,
     width: usize,
     height: usize,
     name: String,
@@ -373,6 +376,7 @@ impl Capture {
             flag,
             windower: Windower::new(width, height, window),
             bias,
+            mask: None,
             width,
             height,
             name,
@@ -458,6 +462,34 @@ impl Capture {
         self.device.backlog()
     }
 
+    /// The region-of-interest mask events are filtered through, if any.
+    pub fn mask(&self) -> Option<&[bool]> {
+        self.mask.as_deref()
+    }
+
+    /// Sets (or clears, with `None`) the region-of-interest mask: a row-major `width·height` grid
+    /// where `true` keeps the pixel. Events outside it are dropped **as they are decoded**, before
+    /// windowing, so one mask covers everything the camera feeds — the windows a loop reads, the
+    /// file a recording writes, and the live view — and the masked pixels cost nothing downstream.
+    ///
+    /// Unlike [`Limits::roi`] this is enforced on the host, so it works on any camera and takes any
+    /// shape. A mask that doesn't match the sensor grid is rejected.
+    pub fn set_mask(&mut self, mask: Option<Vec<bool>>) -> Result<(), String> {
+        if let Some(mask) = &mask {
+            if mask.len() != self.width * self.height {
+                return Err(format!(
+                    "mask has {} pixels, expected {} for this {}x{} sensor",
+                    mask.len(),
+                    self.width * self.height,
+                    self.width,
+                    self.height
+                ));
+            }
+        }
+        self.mask = mask;
+        Ok(())
+    }
+
     /// Polls the camera for up to a few milliseconds, decodes whatever arrived, and returns the next
     /// completed window if one is ready (or was already buffered).
     ///
@@ -480,10 +512,16 @@ impl Capture {
             // Disjoint field borrows: `slice` borrows `self.device`, the closure borrows
             // `self.windower`, and `convert_buffer` borrows `self.adapter`.
             let windower = &mut self.windower;
-            convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
-                events += 1;
-                windower.push(x, y, t, polarity)
-            });
+            convert_buffer(
+                &mut self.adapter,
+                slice,
+                self.mask.as_deref(),
+                self.width,
+                |x, y, t, polarity| {
+                    events += 1;
+                    windower.push(x, y, t, polarity)
+                },
+            );
             // Flush the current window if its boundary has passed, so a mid-window pause doesn't
             // stall delivery. `current_t` advances with the device clock even during quiet periods.
             let current_t = self.adapter.current_t() as i64;
@@ -514,10 +552,16 @@ impl Capture {
             }
             let slice = view.slice;
             let windower = &mut self.windower;
-            convert_buffer(&mut self.adapter, slice, |x, y, t, polarity| {
-                events += 1;
-                windower.push(x, y, t, polarity)
-            });
+            convert_buffer(
+                &mut self.adapter,
+                slice,
+                self.mask.as_deref(),
+                self.width,
+                |x, y, t, polarity| {
+                    events += 1;
+                    windower.push(x, y, t, polarity)
+                },
+            );
             true
         } else {
             false
@@ -561,10 +605,16 @@ impl Capture {
             if view.first_after_overflow {
                 overflow = true;
             }
-            convert_buffer(&mut self.adapter, view.slice, |x, y, t, polarity| {
-                events += 1;
-                on_event(x, y, t, polarity)
-            });
+            convert_buffer(
+                &mut self.adapter,
+                view.slice,
+                self.mask.as_deref(),
+                self.width,
+                |x, y, t, polarity| {
+                    events += 1;
+                    on_event(x, y, t, polarity)
+                },
+            );
         }
         self.tick_bias(events, false);
         Ok(overflow)
@@ -603,10 +653,16 @@ impl Capture {
                 dropped = true;
                 continue;
             }
-            convert_buffer(&mut self.adapter, view.slice, |x, y, t, polarity| {
-                events += 1;
-                on_event(x, y, t, polarity)
-            });
+            convert_buffer(
+                &mut self.adapter,
+                view.slice,
+                self.mask.as_deref(),
+                self.width,
+                |x, y, t, polarity| {
+                    events += 1;
+                    on_event(x, y, t, polarity)
+                },
+            );
             if start.elapsed() >= budget {
                 decoding = false;
             }
@@ -822,12 +878,23 @@ fn evk4_with_biases(
 /// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity
 /// event as `(x, y, t_us, positive)` and discarding the IMU/trigger/APS streams. The single place
 /// the per-device adapter variants are matched, shared by every decode path above.
+///
+/// Events outside `mask` (row-major `width`-wide, `true` = keep) are dropped here rather than
+/// downstream, so the one filter covers windowing, recording, and the live view — and the callers'
+/// event counters, which pace the bias controller, track the events actually kept.
 fn convert_buffer(
     adapter: &mut Adapter,
     slice: &[u8],
+    mask: Option<&[bool]>,
+    width: usize,
     mut on_event: impl FnMut(u16, u16, i64, bool),
 ) {
     let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
+        if let Some(mask) = mask {
+            if mask.get(event.y as usize * width + event.x as usize) != Some(&true) {
+                return;
+            }
+        }
         on_event(
             event.x,
             event.y,
