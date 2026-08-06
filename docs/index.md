@@ -4,7 +4,7 @@
 a NumPy-friendly Python API for loading, transforming, and representing event-camera data.
 
 - **Read** any common format — `.npz`, `.txt`/`.csv`, ROS `.bag`, `.hdf5`, `.aedat`
-  (AEDAT 2.0), and Prophesee `.dat` — through one {func}`eventcv.load`.
+  (AEDAT 2.0), and Prophesee `.dat` / EVT3 `.raw` — through one {func}`eventcv.load`.
 - **Stream** multi-gigabyte recordings without loading them whole via
   {func}`eventcv.open`, with on-disk indexed slicing.
 - **Capture live** from a USB event camera with {func}`eventcv.stream` — representations

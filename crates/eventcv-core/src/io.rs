@@ -8,6 +8,7 @@ mod bag;
 mod h5;
 mod npz;
 mod prophesee;
+mod prophesee_raw;
 mod text;
 
 pub use aedat::read_aedat;
@@ -19,6 +20,7 @@ pub use h5::{
 };
 pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream};
 pub use prophesee::read_dat;
+pub use prophesee_raw::{open_raw_slice, read_raw};
 pub use text::{
     load_rows, open_text_slice, read_text, write_text_stream, ColumnOrder, RawRow, TextOptions,
     TextReader, TimeUnit,
@@ -273,9 +275,7 @@ fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoErro
                 .to_owned(),
         )),
         Format::PropheseeDat => prophesee::read_dat(path, options),
-        Format::PropheseeRaw => Err(IoError::Unsupported(
-            "Prophesee .raw (EVT2/EVT3) reading is not implemented yet".to_owned(),
-        )),
+        Format::PropheseeRaw => prophesee_raw::read_raw(path, options),
         Format::Png => Err(IoError::Unsupported(
             "PNG is a frame export format, not an event stream; use save_frame".to_owned(),
         )),
@@ -409,6 +409,7 @@ pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoEr
         }
         Format::Text => Ok(Box::new(text::open_text_slice(path, &options)?)),
         Format::Rosbag => Ok(Box::new(bag::open_bag_slice(path, &options)?)),
+        Format::PropheseeRaw => Ok(Box::new(prophesee_raw::open_raw_slice(path, &options)?)),
         _ => Ok(Box::new(MemorySliceSource::new(load(path, options)?))),
     }
 }
@@ -690,14 +691,15 @@ mod tests {
     }
 
     #[test]
-    fn aedat4_and_prophesee_raw_are_unsupported() {
-        // These extensions are recognised but their formats are not implemented yet.
-        for path in ["recording.aedat4", "recording.raw"] {
-            match load(path, LoadOptions::default()) {
-                Err(IoError::Unsupported(_)) => {}
-                other => panic!("expected unsupported for {path}, got {other:?}"),
-            }
+    fn aedat4_is_unsupported_and_raw_dispatches() {
+        match load("recording.aedat4", LoadOptions::default()) {
+            Err(IoError::Unsupported(_)) => {}
+            other => panic!("expected unsupported for recording.aedat4, got {other:?}"),
         }
+        assert!(matches!(
+            load("recording.raw", LoadOptions::default()),
+            Err(IoError::Io(_))
+        ));
     }
 
     fn sample_source() -> MemorySliceSource {

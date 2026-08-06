@@ -5,7 +5,7 @@
 //!
 //! Implemented from the published `.dat` layout (used by Prophesee/Metavision and Tonic).
 //! It has not yet been checked against a real `.dat` file — the unit tests cover the byte
-//! layout exactly. The EVT2/EVT3 `.raw` encodings are a separate, unimplemented format.
+//! layout exactly. EVT3 `.raw` recordings are handled by the sibling `prophesee_raw` module.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind};

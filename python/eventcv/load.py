@@ -26,7 +26,8 @@ def load(
 
     Supported today: ``.npz`` (N-ImageNet), ``.txt``/``.csv`` (e.g. EV-IMO
     ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), ``.hdf5``/``.h5``,
-    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), and ``.dat`` (Prophesee CD events).
+    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), ``.dat`` (Prophesee CD events), and
+    Prophesee EVT3 ``.raw`` recordings.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted and only act
     as overrides: rosbags carry both in the message; HDF5/text infer the time unit
@@ -120,10 +121,10 @@ def open(
 
     Where :func:`load` is OpenCV's ``imread`` (read the entire stream eagerly),
     ``open`` is its ``VideoCapture``: it returns an :class:`EventReader` that points
-    at the original file and fetches a slice on demand. For HDF5 this binary-searches
-    the on-disk timestamps, so a slice of a multi-gigabyte recording costs a handful
-    of reads — the file is never fully materialised. Other formats are loaded once and
-    sliced in memory.
+    at the original file and fetches a slice on demand. HDF5 binary-searches the on-disk
+    timestamps; Prophesee EVT3 ``.raw`` uses a sparse byte/time index. In both cases a
+    slice of a multi-gigabyte recording is decoded on demand and the file is never fully
+    materialised. Other formats are loaded once and sliced in memory.
 
     Pass ``dt_ms`` to treat the recording as a sequence of fixed-duration frames: the
     reader reports ``n_slices`` and ``reader.slice(n)`` returns the ``n``-th frame
