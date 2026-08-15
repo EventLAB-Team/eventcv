@@ -42,14 +42,18 @@ pub enum TimeUnit {
 }
 
 impl TimeUnit {
+    /// How many microseconds one unit is worth — the factor every conversion goes through.
+    pub fn scale_us(self) -> f64 {
+        match self {
+            Self::Seconds => 1e6,
+            Self::Milliseconds => 1e3,
+            Self::Microseconds => 1.0,
+            Self::Nanoseconds => 1e-3,
+        }
+    }
+
     fn to_microseconds(self, value: f64) -> i64 {
-        let microseconds = match self {
-            Self::Seconds => value * 1e6,
-            Self::Milliseconds => value * 1e3,
-            Self::Microseconds => value,
-            Self::Nanoseconds => value / 1e3,
-        };
-        microseconds.round() as i64
+        (value * self.scale_us()).round() as i64
     }
 
     /// Maps a stored `timestamp_scale_ms` (milliseconds per raw unit) back to the matching
@@ -100,6 +104,38 @@ impl TimeUnit {
             Self::Nanoseconds => value / 1_000,
         };
         microseconds.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+}
+
+impl std::fmt::Display for TimeUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Seconds => "s",
+            Self::Milliseconds => "ms",
+            Self::Microseconds => "us",
+            Self::Nanoseconds => "ns",
+        })
+    }
+}
+
+impl std::str::FromStr for TimeUnit {
+    type Err = String;
+
+    /// Parses a unit name, case-insensitively: `s`/`sec`/`seconds`, `ms`/`msec`/`milliseconds`,
+    /// `us`/`µs`/`μs`/`usec`/`microseconds`, `ns`/`nsec`/`nanoseconds` (singular or plural). This
+    /// is the one place unit names are spelled, so every API that takes one accepts the same set.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "s" | "sec" | "secs" | "second" | "seconds" => Ok(Self::Seconds),
+            "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => Ok(Self::Milliseconds),
+            "us" | "µs" | "μs" | "usec" | "usecs" | "microsecond" | "microseconds" => {
+                Ok(Self::Microseconds)
+            }
+            "ns" | "nsec" | "nsecs" | "nanosecond" | "nanoseconds" => Ok(Self::Nanoseconds),
+            _ => Err(format!(
+                "unsupported time unit: {name} (expected s, ms, us, or ns)"
+            )),
+        }
     }
 }
 
@@ -720,6 +756,47 @@ mod tests {
 
     fn read(data: &str, options: TextOptions) -> Result<EventStream, IoError> {
         read_all(TextReader::new(Cursor::new(data), options).unwrap())
+    }
+
+    #[test]
+    fn time_units_parse_from_their_names() {
+        use std::str::FromStr;
+
+        for (name, expected) in [
+            ("s", TimeUnit::Seconds),
+            ("SECONDS", TimeUnit::Seconds),
+            (" sec ", TimeUnit::Seconds),
+            ("ms", TimeUnit::Milliseconds),
+            ("msec", TimeUnit::Milliseconds),
+            ("Milliseconds", TimeUnit::Milliseconds),
+            ("us", TimeUnit::Microseconds),
+            ("µs", TimeUnit::Microseconds),
+            ("microseconds", TimeUnit::Microseconds),
+            ("ns", TimeUnit::Nanoseconds),
+            ("nanosecond", TimeUnit::Nanoseconds),
+        ] {
+            assert_eq!(TimeUnit::from_str(name), Ok(expected), "parsing {name:?}");
+        }
+        for name in ["", "minutes", "millis", "m"] {
+            assert!(TimeUnit::from_str(name).is_err(), "{name:?} must not parse");
+        }
+        // Every unit round-trips through its own name.
+        for unit in [
+            TimeUnit::Seconds,
+            TimeUnit::Milliseconds,
+            TimeUnit::Microseconds,
+            TimeUnit::Nanoseconds,
+        ] {
+            assert_eq!(TimeUnit::from_str(&unit.to_string()), Ok(unit));
+        }
+    }
+
+    #[test]
+    fn time_unit_scales_are_microseconds_per_unit() {
+        assert_eq!(TimeUnit::Seconds.scale_us(), 1e6);
+        assert_eq!(TimeUnit::Milliseconds.scale_us(), 1e3);
+        assert_eq!(TimeUnit::Microseconds.scale_us(), 1.0);
+        assert_eq!(TimeUnit::Nanoseconds.scale_us(), 1e-3);
     }
 
     #[test]

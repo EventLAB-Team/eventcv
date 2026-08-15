@@ -15,9 +15,25 @@ ecv.stream().show()         # live raw view; Ctrl+C or close the window to stop
 Supported: Prophesee EVK4 / EVK3-HD, iniVation DVXplorer / DAVIS346, CenturyArks VGA. Camera support
 is compiled into the published wheels; on Linux the device needs udev rules for non-root USB access.
 
-Always keep the returned camera in a variable or a `with` block. A camera allows exactly one open
-handle, so a throwaway `ecv.stream()` in a REPL holds the device until it is garbage collected and
-the next call fails.
+## Closing the camera
+
+A camera allows exactly one open handle, so the device — and any `record=` file — must be released
+before the next `stream()` can use it. Closing does that, and it happens in one of three ways:
+
+```python
+with ecv.stream(dt_ms=50) as cam:   # closed on the way out, even on an exception
+    ...
+
+cam = ecv.stream(dt_ms=50)
+cam.close()                         # or explicitly
+
+ecv.record("session.h5", seconds=10)  # opened, recorded, and closed in one call
+```
+
+Dropping the camera closes it too, but only whenever Python happens to collect the object — so a
+throwaway `ecv.stream()` in a REPL can hold the device well past the line that created it. Prefer
+one of the three forms above; for a script that only wants a file, {func}`~eventcv.record` is the
+shortest and leaves nothing open.
 
 ## Reading windows in a loop
 
@@ -75,12 +91,17 @@ optional gzip level (`0..=9`); omit it for the fastest writes. {attr}`~eventcv.E
 counts events written, and the `with` block (or `close()`) finishes the file.
 
 Only windows that are actually **read** are recorded, since `show()` doesn't poll them. To record
-without a loop, use {meth}`~eventcv.EventCamera.record`:
+without a loop, use {func}`~eventcv.record`, which opens the camera, captures, and closes it:
 
 ```python
-ecv.stream().record("session.h5", seconds=10)     # blocks 10 s (or Ctrl+C); returns the event count
-ecv.stream().record("session.npz")                # npz/txt/bag buffer in memory, write at the end
+ecv.record("session.h5", seconds=10)     # blocks 10 s (or Ctrl+C); returns the event count
+ecv.record("session.npz")                # npz/txt/bag buffer in memory, write at the end
+ecv.open("session.h5")                   # safe straight after: nothing is still writing
 ```
+
+{meth}`~eventcv.EventCamera.record` is the same thing on a camera you already hold open — use it
+when the session continues afterwards. A camera opened with `record=` is already archiving every
+window, so calling `record()` on it as well is refused rather than splitting the recording in two.
 
 For full control, drive the writer yourself with an {class}`~eventcv.EventSink` — the event-level
 twin of {class}`~eventcv.FrameSink`, which appends windows to an extendable HDF5 file:
@@ -145,8 +166,17 @@ ecv.stream(dt_ms=50, max_event_rate=40_000_000)   # 40 Mev/s ceiling, enforced o
 ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))    # centre quarter only
 ```
 
-These are Prophesee features (EVK4, EVK3-HD); on other cameras they raise rather than silently doing
-nothing.
+Both are on-chip on the sensors built around Prophesee's pipeline — the EVK4, the EVK3-HD, and the
+CenturyArks VGA. The iniVation cameras (DVXplorer, DAVIS346) have neither, so there `roi=` falls back
+to a host-side mask: the same events are dropped, but only after crossing the cable and being
+decoded, and a `RuntimeWarning` says so. `max_event_rate` still raises there, because capping the
+rate on the host would save none of the work the setting exists to avoid.
+{attr}`~eventcv.EventCamera.roi` reports which happened:
+
+```python
+cam = ecv.stream(roi=(320, 180, 640, 360))
+cam.roi     # {'rect': (320, 180, 640, 360), 'applied': 'hardware'}
+```
 
 A saturating scene on a 1280×720 sensor can emit far more than one core can decode, and capping the
 source is the only remedy that keeps the events you *do* receive contiguous rather than riddled with
@@ -171,11 +201,11 @@ near 62 Mev/s on one core. Caps below that keep up; caps above it leave a backlo
 
 ### Masking a region of interest
 
-`roi=` is a rectangle, and it exists only on Prophesee sensors. When the region you care about is
-some other shape — a circular aperture, a window frame, a lens vignette — pass `mask=` instead: an
-`(H, W)` boolean array covering the sensor, enforced on the host, so it works on **any** camera.
-Events outside it are dropped as they are decoded, before windowing, so they never reach a
-`record=` file, the windows your loop reads, or `show()`:
+`roi=` is a rectangle, fixed when the camera opens. When the region you care about is some other
+shape — a circular aperture, a window frame, a lens vignette — or when you need to change it while
+the camera runs, pass `mask=` instead: an `(H, W)` boolean array covering the sensor, always enforced
+on the host. Events outside it are dropped as they are decoded, before windowing, so they never reach
+a `record=` file, the windows your loop reads, or `show()`:
 
 ```python
 aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
@@ -214,6 +244,7 @@ recordings.
 | `n_skipped` rising fast | Per-window work slower than the camera | Expected with `latest=True`; `record=` still archives everything |
 | "no event camera found" with a camera attached | Another handle holds the device, or udev rules are missing | Close the other handle (`with ecv.stream() as cam:`), or install udev rules |
 | `record=` raises on a `.npz` path | `record=` appends window-by-window, which needs HDF5 | Use `.h5`/`.hdf5`, or `cam.record("out.npz")` to buffer and write once |
+| A panic from `usb.rs` ("callback called for a transfer marked as complete") aborting the process, usually on Windows and usually right after a camera is released | A race in the USB teardown inside `neuromorphic-drivers`, the driver crate underneath EventCV: a cancelled transfer's completion callback can arrive after its slot was retired. It is an abort, not a Python exception, so it cannot be caught | Open the camera **once** and keep it for the session rather than opening and closing one per recording. `ecv.record(...)` and `with ecv.stream(...) as cam:` both close deterministically, which keeps the teardown off unpredictable GC timing |
 
 ## Live viewer
 

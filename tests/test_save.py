@@ -235,5 +235,80 @@ class EventSinkTests(unittest.TestCase):
         self.assertIn("EventSink", eventcv.__all__)
 
 
+class E2vidExportTests(unittest.TestCase):
+    """E2VID's interchange: a `width height` header, then `t x y p` with t in float seconds."""
+
+    def setUp(self):
+        self.stream = _make_stream()
+
+    def _read(self, path):
+        """The text E2VID would see, whether the target was a .txt or a .zip."""
+        if path.endswith(".zip"):
+            import zipfile
+
+            with zipfile.ZipFile(path) as archive:
+                names = archive.namelist()
+                # One entry, named after the archive — what E2VID's reader expects to find.
+                self.assertEqual(names, [Path(path).stem + ".txt"])
+                return archive.read(names[0]).decode()
+        return Path(path).read_text()
+
+    def _assert_matches_stream(self, text):
+        lines = text.splitlines()
+        self.assertEqual(lines[0], f"{SENSOR[0]} {SENSOR[1]}", "header is `width height`")
+        rows = np.array([[float(field) for field in line.split()] for line in lines[1:]])
+        events = self.stream.numpy()  # x, y, t(us), p
+        self.assertEqual(len(rows), len(events))
+        np.testing.assert_allclose(rows[:, 0], events[:, 2] / 1e6, atol=1e-9)  # seconds
+        np.testing.assert_array_equal(rows[:, 1], events[:, 0])
+        np.testing.assert_array_equal(rows[:, 2], events[:, 1])
+        np.testing.assert_array_equal(rows[:, 3], events[:, 3])
+        self.assertTrue(np.all(np.diff(rows[:, 0]) >= 0), "E2VID needs ascending timestamps")
+
+    def test_zip_target_writes_the_e2vid_layout(self):
+        path = _tmp("events.zip")
+        eventcv.save(self.stream, path)
+        self._assert_matches_stream(self._read(path))
+
+    def test_format_override_writes_e2vid_to_a_txt(self):
+        path = _tmp("events.txt")
+        eventcv.save(self.stream, path, format="e2vid")
+        self._assert_matches_stream(self._read(path))
+        # Without the override the same extension is eventcv's own raw-microsecond text.
+        native = _tmp("native.txt")
+        eventcv.save(self.stream, native)
+        self.assertNotEqual(Path(native).read_text().splitlines()[0], f"{SENSOR[0]} {SENSOR[1]}")
+
+    def test_a_reader_converts_without_loading_the_file(self):
+        source = _tmp("source.h5")
+        self.stream.save(source)
+        path = _tmp("from_reader.zip")
+        eventcv.save(eventcv.open(source), path)
+        self._assert_matches_stream(self._read(path))
+
+    def test_a_readers_deferred_ops_apply_to_the_export(self):
+        source = _tmp("source_ops.h5")
+        self.stream.save(source)
+        path = _tmp("cropped.zip")
+        reader = eventcv.open(source).filter_polarity(1)
+        eventcv.save(reader, path)
+        rows = self._read(path).splitlines()[1:]
+        self.assertTrue(all(line.endswith(" 1") for line in rows), "ON events only")
+        self.assertEqual(len(rows), int((self.stream.numpy()[:, 3] == 1).sum()))
+
+    def test_a_reader_cannot_stream_to_a_round_tripping_format(self):
+        source = _tmp("source_err.h5")
+        self.stream.save(source)
+        with self.assertRaises(ValueError) as caught:
+            eventcv.save(eventcv.open(source), _tmp("out.npz"))
+        self.assertIn("slice", str(caught.exception), "the error points at the way that works")
+
+    def test_e2vid_files_are_write_only(self):
+        path = _tmp("events.zip")
+        eventcv.save(self.stream, path)
+        with self.assertRaises(ValueError):
+            eventcv.load(path)
+
+
 if __name__ == "__main__":
     unittest.main()

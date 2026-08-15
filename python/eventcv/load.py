@@ -20,6 +20,10 @@ def load(
     topic: str | None = None,
     max_events: int | None = None,
     offset: float | None = None,
+    offset_s: float | None = None,
+    offset_ms: float | None = None,
+    offset_us: float | None = None,
+    offset_ns: float | None = None,
     keys: dict[str, str] | None = None,
 ) -> EventStream:
     """Load events from any supported file, detected by its extension.
@@ -35,12 +39,13 @@ def load(
     from the coordinate range. Passing ``sensor_size`` for HDF5 also skips that scan.
     ``time_unit`` is ``seconds``/``milliseconds``/``microseconds``/``nanoseconds`` (or
     ``auto``); ``order`` (``txyp``/``xytp``) applies to headerless text. ``topic`` selects the
-    rosbag topic (default ``/davis/left/events``). ``offset`` is an **absolute timestamp
-    in milliseconds** (the file's own time base — the same base as ``stream.numpy()[:, 2]``
-    scaled to ms): events before it are skipped, and ``max_events`` then caps how many are
-    kept *after* it — together they read a window, handy for previewing a slice of a very
-    large file. For a recording whose timestamps are epoch-based, pass the epoch time in ms
-    (e.g. ``offset=1_587_540_271_650``); ``<= 0`` reads from the start.
+    rosbag topic (default ``/davis/left/events``). ``offset`` is an **absolute timestamp**
+    in the file's own time base — the same base as ``stream.numpy()[:, 2]``: events before it
+    are skipped, and ``max_events`` then caps how many are kept *after* it — together they read
+    a window, handy for previewing a slice of a very large file. For a recording whose
+    timestamps are epoch-based, pass the epoch time (e.g. ``offset=1_587_540_271_650``); ``<= 0``
+    reads from the start. The bare ``offset`` is milliseconds; ``offset_s``, ``offset_ms``,
+    ``offset_us``, and ``offset_ns`` say which unit you mean, and passing two of them raises.
 
     **The x/y/t/p columns are found automatically**, whatever they're named or nested:
     an HDF5 file's datasets are searched recursively and matched by synonym (``x``,
@@ -62,6 +67,10 @@ def load(
         topic=topic,
         max_events=max_events,
         offset=offset,
+        offset_s=offset_s,
+        offset_ms=offset_ms,
+        offset_us=offset_us,
+        offset_ns=offset_ns,
         keys=keys,
     )
 
@@ -106,8 +115,15 @@ def open(
     path: str,
     *,
     dt_ms: float | None = None,
+    dt_s: float | None = None,
+    dt_us: float | None = None,
+    dt_ns: float | None = None,
     max_events: int | None = None,
     offset: float | None = None,
+    offset_s: float | None = None,
+    offset_ms: float | None = None,
+    offset_us: float | None = None,
+    offset_ns: float | None = None,
     repr: str | None = None,
     sensor_size: tuple[int, int] | None = None,
     time_unit: str | None = None,
@@ -136,13 +152,24 @@ def open(
     one or the other, not both. Without either, slice by explicit time/count window
     instead.
 
-    ``offset`` is an **absolute timestamp in milliseconds** (the file's own time base —
-    exactly what ``slice(t0_ms=…)`` takes) that moves the framing origin: ``slice(0)``,
-    ``windows()``, and ``n_slices`` all begin at that time, and events before it fall
-    outside every indexed frame. It is clamped up to ``t_min``, so an offset before the
-    recording is a no-op, and one past the end yields zero frames. For an epoch-based
-    recording pass the epoch time in ms (e.g. ``offset=1_587_540_271_650``). It composes
-    with either ``dt_ms`` or ``max_events``.
+    **Any timescale works.** Every time argument comes in four units — ``dt_s``, ``dt_ms``,
+    ``dt_us``, ``dt_ns`` — and they mean the same thing, so ``dt_us=500`` and ``dt_ms=0.5`` open
+    the same reader. Passing two units for the same quantity raises rather than picking one. The
+    same applies to ``offset_*`` here, to ``t0_*``/``t1_*`` on :meth:`EventReader.slice`, and to
+    ``step_*``/``span_*`` on :meth:`EventReader.windows`. Timestamps are stored in microseconds,
+    so a ``_ns`` value is rounded to the nearest microsecond, and a duration below half a
+    microsecond raises rather than being silently rounded up::
+
+        ecv.open("rec.h5", dt_us=500)                  # 500 us frames
+        ecv.open("rec.h5", dt_s=0.03).slice(t0_us=1e6, t1_us=2e6)
+
+    ``offset`` is an **absolute timestamp** in the file's own time base — exactly what
+    ``slice(t0_ms=…)`` takes — that moves the framing origin: ``slice(0)``, ``windows()``, and
+    ``n_slices`` all begin at that time, and events before it fall outside every indexed frame.
+    It is clamped up to ``t_min``, so an offset before the recording is a no-op, and one past the
+    end yields zero frames. For an epoch-based recording pass the epoch time (e.g.
+    ``offset=1_587_540_271_650``). It composes with either ``dt_ms`` or ``max_events``. The bare
+    ``offset`` is milliseconds; ``offset_s``/``offset_ms``/``offset_us``/``offset_ns`` are explicit.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted (see
     :func:`load`); ``order``/``topic`` match :func:`load`. For a multi-GB HDF5, pass
@@ -208,8 +235,15 @@ def open(
     return _rust.open(
         path,
         dt_ms=dt_ms,
+        dt_s=dt_s,
+        dt_us=dt_us,
+        dt_ns=dt_ns,
         max_events=max_events,
         offset=offset,
+        offset_s=offset_s,
+        offset_ms=offset_ms,
+        offset_us=offset_us,
+        offset_ns=offset_ns,
         repr=repr,
         sensor_size=sensor_size,
         time_unit=time_unit,
@@ -257,14 +291,28 @@ def stream(
     serial: str | None = None,
     *,
     dt_ms: float | None = None,
+    dt_s: float | None = None,
+    dt_us: float | None = None,
+    dt_ns: float | None = None,
     max_events: int | None = None,
     repr: str | None = None,
     bins: int | None = None,
     window_ms: float | None = None,
+    window_s: float | None = None,
+    window_us: float | None = None,
+    window_ns: float | None = None,
     tau_ms: float | None = None,
+    tau_s: float | None = None,
+    tau_us: float | None = None,
+    tau_ns: float | None = None,
     max_window_ms: float | None = None,
+    max_window_s: float | None = None,
+    max_window_us: float | None = None,
+    max_window_ns: float | None = None,
     window: int | None = None,
     normalize: bool | None = None,
+    pct: float | None = None,
+    white_frame: bool | None = None,
     record: str | None = None,
     compression: int | None = None,
     latest: bool = False,
@@ -272,7 +320,10 @@ def stream(
     roi: tuple[int, int, int, int] | None = None,
     mask=None,
     adaptive_bias: bool | dict | None = None,
-    decay_ms: float = 30.0,
+    decay_ms: float | None = None,
+    decay_s: float | None = None,
+    decay_us: float | None = None,
+    decay_ns: float | None = None,
 ) -> EventCamera:
     """Open a live USB event camera — the streaming twin of :func:`open`.
 
@@ -290,8 +341,17 @@ def stream(
     iteration (and :meth:`EventCamera.read`) yield rendered :class:`EventFrame` s instead of raw
     streams, mirroring ``open(repr=…)``. The per-representation options are the same ones
     :meth:`EventReader.with_repr` takes — ``bins``, ``window_ms``, ``tau_ms``, ``max_window_ms``,
-    ``window`` (for ``"flow"``), and ``normalize``. ``decay_ms`` sets the fade time constant of the
-    raw :meth:`EventCamera.show` view.
+    ``window`` (for ``"flow"``), ``normalize``, ``pct``, and ``white_frame``. ``decay_ms`` sets the
+    fade time constant of the raw :meth:`EventCamera.show` view.
+
+    **Close the camera when you are done with it.** The device and any ``record=`` file are released
+    when the camera is closed — by :meth:`EventCamera.close`, by leaving a ``with`` block, or, if you
+    do neither, whenever Python happens to collect the object. Prefer the first two, and prefer
+    :func:`record` over ``stream(...).record(...)`` when a script only wants a file::
+
+        with ecv.stream(dt_ms=50) as cam:    # closed on the way out
+            ...
+        ecv.record("session.h5", seconds=10)  # opened, recorded, and closed in one call
 
     **Time spans follow the capture window.** An unset ``window_ms`` / ``tau_ms`` /
     ``max_window_ms`` defaults to ``dt_ms``, so a live representation covers exactly the events it
@@ -313,20 +373,26 @@ def stream(
     **Capping the source.** Every event costs time to decode, window, and render, so the cheapest
     event is one the camera never sends. ``max_event_rate`` (events per second) enables the sensor's
     on-chip event-rate controller, and ``roi=(x0, y0, width, height)`` masks every pixel outside that
-    rectangle, so neither costs the host anything. Both are Prophesee features (EVK4, EVK3 HD); on
-    other cameras they raise rather than silently doing nothing. A saturating scene on a 1280×720
-    sensor can emit far more than one core can decode, and capping the source is the only fix that
-    keeps the events you *do* get contiguous rather than punched full of dropout holes::
+    rectangle, so neither costs the host anything. A saturating scene on a 1280×720 sensor can emit
+    far more than one core can decode, and capping the source is the only fix that keeps the events
+    you *do* get contiguous rather than punched full of dropout holes::
 
         ecv.stream(dt_ms=50, max_event_rate=40_000_000)     # 40 Mev/s ceiling, enforced on-chip
         ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))      # centre quarter only
+
+    Both are on-chip on the sensors built around Prophesee's pipeline — the EVK4, the EVK3 HD, and
+    the CenturyArks VGA. The iniVation cameras (DVXplorer, DAVIS346) have neither, so there ``roi=``
+    falls back to a host-side mask (the same events are dropped, but only after crossing the cable
+    and being decoded) and warns that it did; ``max_event_rate`` still raises, since capping the rate
+    on the host would save none of the work it exists to avoid. :attr:`EventCamera.roi` reports the
+    rectangle and whether it was ``"hardware"`` or ``"host"``.
 
     **Region of interest.** ``mask`` takes an arbitrarily shaped ROI — an ``(H, W)`` boolean array
     (or 8-bit map, where non-zero keeps the pixel) covering the sensor. Events outside it are
     dropped **as they are decoded**, so they never reach a ``record=`` file, the windows your loop
     reads, or :meth:`EventCamera.show`, and they cost nothing downstream. Where ``roi=`` is a
-    rectangle blocked on-chip (Prophesee only), ``mask`` is any shape enforced on the host, so it
-    works on every camera — including sensors whose useful data is a circle::
+    rectangle fixed at open, ``mask`` is any shape and can be changed while the camera runs — so it
+    suits sensors whose useful data is a circle::
 
         aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
         with ecv.stream(dt_ms=50, mask=aperture, record="session.h5") as cam:
@@ -437,8 +503,9 @@ def stream(
             print(cam.n_skipped, "windows skipped,", cam.n_recorded, "events recorded")
 
         # Record continuously, straight to disk (HDF5 streams window-by-window, never buffering
-        # the whole session), stopping after 10 s or on Ctrl+C:
-        eventcv.stream().record("session.h5", seconds=10)
+        # the whole session), stopping after 10 s or on Ctrl+C. `eventcv.record` is the one-shot
+        # form of this and closes the camera for you:
+        eventcv.record("session.h5", seconds=10)
 
         # Or drive the recorder yourself with an EventSink, mixing capture and processing:
         with eventcv.stream(dt_ms=50) as cam, eventcv.EventSink("session.h5") as sink:
@@ -453,14 +520,28 @@ def stream(
     return _rust.stream(
         serial,
         dt_ms=dt_ms,
+        dt_s=dt_s,
+        dt_us=dt_us,
+        dt_ns=dt_ns,
         max_events=max_events,
         repr=repr,
         bins=bins,
         window_ms=window_ms,
+        window_s=window_s,
+        window_us=window_us,
+        window_ns=window_ns,
         tau_ms=tau_ms,
+        tau_s=tau_s,
+        tau_us=tau_us,
+        tau_ns=tau_ns,
         max_window_ms=max_window_ms,
+        max_window_s=max_window_s,
+        max_window_us=max_window_us,
+        max_window_ns=max_window_ns,
         window=window,
         normalize=normalize,
+        pct=pct,
+        white_frame=white_frame,
         record=record,
         compression=compression,
         latest=latest,
@@ -469,11 +550,71 @@ def stream(
         mask=mask,
         adaptive_bias=adaptive_bias,
         decay_ms=decay_ms,
+        decay_s=decay_s,
+        decay_us=decay_us,
+        decay_ns=decay_ns,
     )
 
 
-def save(obj, path: str, *, topic: str | None = None) -> None:
-    """Save an :class:`EventStream`, :class:`EventFrame`, or :class:`FEAST` model to ``path``.
+def record(
+    path: str,
+    *,
+    seconds: float | None = None,
+    serial: str | None = None,
+    dt_ms: float | None = None,
+    dt_s: float | None = None,
+    dt_us: float | None = None,
+    dt_ns: float | None = None,
+    max_events: int | None = None,
+    compression: int | None = None,
+    max_event_rate: float | None = None,
+    roi: tuple[int, int, int, int] | None = None,
+    mask=None,
+    adaptive_bias: bool | dict | None = None,
+) -> int:
+    """Record a camera to ``path`` in one call, and return the number of events saved.
+
+    The one-shot form of ``stream(...).record(...)``, and the one to reach for when a script only
+    wants a file: the camera is opened, captured from for ``seconds`` (or until ``Ctrl+C``), and
+    **closed before this returns** — so the recording is complete and the device is free by the time
+    the next line runs::
+
+        ecv.record("session.h5", seconds=10)
+        reader = ecv.open("session.h5", dt_ms=50)      # safe: nothing is still writing
+
+    The format follows the extension, as in :func:`save`. ``.h5``/``.hdf5`` targets are written
+    continuously, window-by-window (``compression`` is an optional gzip level ``0..=9``); npz, txt,
+    and bag buffer the whole session in memory and write once at the end.
+
+    Everything :func:`stream` takes about *what the sensor sends* applies — ``serial``, ``dt_ms`` /
+    ``max_events``, ``roi``, ``mask``, ``max_event_rate``, ``adaptive_bias``. The representation and
+    viewer options do not, since nothing is displayed. Open a camera with :func:`stream` instead when
+    you want to process windows as they arrive.
+    """
+    if not hasattr(_rust, "record"):
+        raise RuntimeError(_NO_CAMERA)
+    return _rust.record(
+        path,
+        seconds=seconds,
+        serial=serial,
+        dt_ms=dt_ms,
+        dt_s=dt_s,
+        dt_us=dt_us,
+        dt_ns=dt_ns,
+        max_events=max_events,
+        compression=compression,
+        max_event_rate=max_event_rate,
+        roi=roi,
+        mask=mask,
+        adaptive_bias=adaptive_bias,
+    )
+
+
+def save(
+    obj, path: str, *, topic: str | None = None, format: str | None = None
+) -> None:
+    """Save an :class:`EventStream`, :class:`EventFrame`, :class:`EventReader`, or :class:`FEAST`
+    model to ``path``.
 
     The mirror of :func:`load`: the format is chosen by the file extension. Streams go to
     ``.npz``/``.txt``/``.h5``/``.bag`` (npz, HDF5, and rosbag round-trip exactly; txt stores
@@ -482,6 +623,19 @@ def save(obj, path: str, *, topic: str | None = None) -> None:
     and ``channel_names``. A trained :class:`FEAST` model is written to ``.npz`` (its learned
     features, thresholds, and parameters) and reloaded with :func:`load_feast`. ``topic`` names
     the rosbag connection. Equivalent to ``obj.save(path)`` for streams/frames.
+
+    **E2VID export.** A ``.zip`` target (or ``format="e2vid"`` on a ``.txt``) writes the layout
+    `E2VID <https://github.com/uzh-rpg/rpg_e2vid>`_ reads — a ``width height`` header, then
+    ``t x y p`` per event with ``t`` in float seconds — so a recording goes straight into
+    event-to-video reconstruction without a conversion script::
+
+        ecv.save(ecv.open("rec.h5"), "events.zip")
+        # python run_reconstruction.py --input_file events.zip --fixed_duration -T 33
+
+    Passing an :class:`EventReader` converts it **window by window**, so a recording far larger
+    than memory re-exports without being loaded, and any deferred ops on the reader (``crop``,
+    ``mask``, ``hot_pixel_filter``, …) apply to what is written. eventcv does not read the E2VID
+    layout back — keep an ``.npz``/``.h5`` if you need the recording itself.
     """
     if isinstance(obj, FEAST):
         import numpy as np
@@ -493,7 +647,7 @@ def save(obj, path: str, *, topic: str | None = None) -> None:
             **obj.get_params(),
         )
         return
-    return _rust.save(obj, path, topic=topic)
+    return _rust.save(obj, path, topic=topic, format=format)
 
 
 def load_feast(path: str) -> FEAST:
@@ -689,6 +843,7 @@ __all__ = [
     "load_mask",
     "open",
     "polygon_mask",
+    "record",
     "rect_mask",
     "save",
     "save_mask",

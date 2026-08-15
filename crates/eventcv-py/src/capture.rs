@@ -100,7 +100,23 @@ impl Pump {
             overflows: AtomicUsize::new(0),
         });
         let worker = Arc::clone(&shared);
-        let handle = std::thread::spawn(move || run(capture, recorder, &worker, mode));
+        // The camera and the open recording are owned *outside* the unwind boundary so a panic in
+        // the decode loop still hands them back: the file gets flushed and closed, and the USB
+        // device released, instead of both being lost with the thread.
+        let handle = std::thread::spawn(move || {
+            let mut capture = capture;
+            let mut recorder = recorder;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&mut capture, &mut recorder, &worker, mode)
+            }));
+            if let Err(panic) = outcome {
+                fail(
+                    &worker,
+                    format!("capture thread panicked: {}", panic_message(&panic)),
+                );
+            }
+            (capture, recorder)
+        });
         Self {
             shared,
             handle: Some(handle),
@@ -146,8 +162,9 @@ impl Pump {
         self.shared.queue.lock().unwrap().skipped
     }
 
-    /// Stops the thread and hands back the camera (and the open recording, if any). Returns `None`
-    /// for the capture only if the thread panicked.
+    /// Stops the thread and hands back the camera (and the open recording, if any). A panic inside
+    /// the decode loop is caught and republished as an error, so both still come back; `None` means
+    /// the thread died in a way even that could not recover from.
     pub(crate) fn stop(&mut self) -> (Option<Capture>, Option<Recorder>) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.signal.notify_all();
@@ -169,13 +186,24 @@ impl Drop for Pump {
     }
 }
 
+/// The panic payload's message, for the two shapes `panic!` produces.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    match panic.downcast_ref::<&'static str>() {
+        Some(message) => message,
+        None => match panic.downcast_ref::<String>() {
+            Some(message) => message.as_str(),
+            None => "unknown panic",
+        },
+    }
+}
+
 /// The pump thread: drain the ring into windows, archive them, hand them on — until asked to stop.
 fn run(
-    mut capture: Capture,
-    mut recorder: Option<Recorder>,
+    capture: &mut Capture,
+    recorder: &mut Option<Recorder>,
     shared: &Shared,
     mode: Backpressure,
-) -> (Capture, Option<Recorder>) {
+) {
     'pump: while !shared.stop.load(Ordering::Acquire) {
         // One buffer per pass, its windows handed on before the next: `offer` is what throttles
         // decoding when the consumer stalls, so the backlog waits in the driver's ring rather than
@@ -214,7 +242,6 @@ fn run(
             std::thread::park_timeout(IDLE_NAP);
         }
     }
-    (capture, recorder)
 }
 
 /// Queues one finished window under the chosen policy. Returns `false` when the pump should stop.
@@ -247,4 +274,19 @@ fn fail(shared: &Shared, message: String) {
     let mut queue = shared.queue.lock().unwrap();
     queue.error = Some(message);
     shared.signal.notify_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_message;
+
+    #[test]
+    fn panic_message_reads_both_payload_shapes() {
+        let literal = std::panic::catch_unwind(|| panic!("static message")).unwrap_err();
+        assert_eq!(panic_message(&literal), "static message");
+        let formatted = std::panic::catch_unwind(|| panic!("formatted {}", 1 + 1)).unwrap_err();
+        assert_eq!(panic_message(&formatted), "formatted 2");
+        let payload: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+        assert_eq!(panic_message(&payload), "unknown panic");
+    }
 }

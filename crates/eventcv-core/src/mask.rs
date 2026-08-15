@@ -28,7 +28,8 @@ pub fn rect(width: usize, height: usize, x0: f64, y0: f64, w: f64, h: f64) -> Ve
 /// value for both to get a circle.
 pub fn ellipse(width: usize, height: usize, cx: f64, cy: f64, rx: f64, ry: f64) -> Vec<bool> {
     let mut mask = vec![false; width * height];
-    if !(rx > 0.0) || !(ry > 0.0) {
+    // Negated so a NaN radius (which compares false either way) also keeps nothing.
+    if !(rx > 0.0 && ry > 0.0) {
         return mask;
     }
     for y in span(cy - ry, cy + ry, height) {

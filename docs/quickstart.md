@@ -73,6 +73,22 @@ clean = ecv.hot_pixel_filter(reader).flip_x()   # still lazy — nothing read ye
 frame = clean.slice(50).voxel()                 # 50th frame, hot pixels dropped + flipped
 ```
 
+**Any timescale works.** Every time argument comes in four units, and they name the same
+quantity — so `dt_us=500` and `dt_ms=0.5` open the same reader. Passing two units for one
+quantity raises rather than quietly picking a winner:
+
+```python
+ecv.open("huge.hdf5", dt_us=500)                      # 500 µs frames
+ecv.open("huge.hdf5", dt_s=0.03).slice(t0_us=1e6, t1_us=2e6)
+reader.windows(step_ns=5e5, span_us=800)
+reader.dt("us"), reader.duration("s"), reader.time_span("ns")
+```
+
+The same `_s`/`_ms`/`_us`/`_ns` suffixes apply to `offset`, to `slice`'s `t0`/`t1`, to
+`windows`' `step`/`span`, to `stream`'s `dt` and `decay`, and to the representation spans
+(`window`, `tau`, `max_window`). Timestamps are stored in microseconds, so a `_ns` value is
+rounded to the nearest microsecond and a duration below half a microsecond raises.
+
 Slice by a fixed **event count** instead of a fixed duration with `max_events` — each
 slice holds exactly that many consecutive events (the last may be shorter), which keeps
 the number of events per frame constant rather than the time span. It is mutually
@@ -149,6 +165,16 @@ for batch in loader:                   # batch is a list[EventStream]
 ```python
 ecv.save(clipped, "out.npz")        # streams: .npz / .txt / .h5 / .bag
 ecv.save(voxel, "voxel.h5")         # frames: .npz / .h5
+```
+
+A `.zip` target writes [E2VID](https://github.com/uzh-rpg/rpg_e2vid)'s interchange instead — a
+`width height` header, then `t x y p` with `t` in float seconds — so a recording goes straight
+into event-to-video reconstruction. Handing it an `EventReader` converts window by window, so the
+file never has to fit in memory:
+
+```python
+ecv.save(ecv.open("huge.hdf5"), "events.zip")
+# python run_reconstruction.py --input_file events.zip --fixed_duration -T 33
 ```
 
 See the [Representations](representations.md) page for every available representation

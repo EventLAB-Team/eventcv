@@ -121,6 +121,11 @@ class CameraApiTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"{kwargs} must be rejected"):
                 eventcv.stream(**kwargs)
 
+    def test_camera_reports_where_its_roi_is_enforced(self):
+        # `roi=` is on-chip where the sensor has region masks and a host-side mask where it does
+        # not, so the placement has to be inspectable rather than assumed.
+        self.assertTrue(hasattr(eventcv.EventCamera, "roi"))
+
     def test_stream_accepts_the_adaptive_bias_option(self):
         import inspect
 
@@ -180,8 +185,48 @@ class CameraApiTests(unittest.TestCase):
             self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertIs(parameters["latest"].default, False)
 
+    def test_stream_forwards_every_representation_option(self):
+        # The Python wrapper hand-lists `stream`'s kwargs, so an option the Rust binding accepts but
+        # the wrapper forgets is a TypeError raised before the call ever reaches Rust — which is how
+        # `pct`/`white_frame` made `repr="countmask"` unreachable from Python.
+        import inspect
+
+        parameters = inspect.signature(eventcv.stream).parameters
+        for name in ("pct", "white_frame"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+        if eventcv.list_cameras():
+            self.skipTest("a camera is attached")
+        # Reaches *open* and fails there — the point being that it is not a TypeError.
+        with self.assertRaises(RuntimeError):
+            eventcv.stream(repr="countmask", pct=95, white_frame=True)
+
+    def test_record_is_a_one_shot_function(self):
+        # `record(path, ...)` opens, captures, and closes in one call — the safe form of
+        # `stream(...).record(...)`, which leaves the camera open until Python collects it.
+        import inspect
+
+        parameters = inspect.signature(eventcv.record).parameters
+        self.assertIs(
+            parameters["path"].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )
+        for name in ("seconds", "serial", "dt_ms", "roi", "mask", "max_event_rate"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+
+    def test_record_validates_before_the_device_is_opened(self):
+        # Windowing and source limits are parsed up front, so these raise with or without hardware.
+        for kwargs in (
+            {"dt_ms": 30, "max_events": 1000},
+            {"roi": (0, 0, 0, 10)},
+            {"max_event_rate": -1},
+        ):
+            with self.assertRaises(ValueError, msg=f"{kwargs} must be rejected"):
+                eventcv.record("session.h5", seconds=1, **kwargs)
+        self.assertFalse(os.path.exists("session.h5"), "rejected path must not be created")
+
     def test_public_api_is_exported(self):
-        for name in ("stream", "list_cameras", "EventCamera"):
+        for name in ("stream", "record", "list_cameras", "EventCamera"):
             self.assertIn(name, eventcv.__all__)
 
 

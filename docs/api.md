@@ -22,6 +22,25 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: collate
 ```
 
+### E2VID export
+
+A `.zip` target — or `format="e2vid"` on a `.txt` — writes the layout
+[E2VID](https://github.com/uzh-rpg/rpg_e2vid) reads: a `width height` header line, then one
+whitespace-separated `t x y p` row per event with `t` in float seconds and `p` as `0`/`1`,
+ascending in time. That removes the conversion script between an EventCV recording and
+event-to-video reconstruction.
+
+```python
+ecv.save(stream, "events.zip")                       # from a stream
+ecv.save(ecv.open("rec.h5"), "events.zip")           # or straight from a reader
+# python run_reconstruction.py --input_file events.zip --fixed_duration -T 33
+```
+
+Passing an {class}`~eventcv.EventReader` converts it **window by window**, so a recording far
+larger than memory re-exports without being loaded, and any deferred ops on the reader (`crop`,
+`mask`, `hot_pixel_filter`, …) apply to what gets written. The export is one-way — EventCV does
+not read the E2VID layout back, so keep an `.npz`/`.h5` if you need the recording itself.
+
 (roi-masking)=
 ## Region-of-interest masking
 
@@ -139,6 +158,15 @@ with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
         infer(cam.read().numpy())   # a representation per window; raw events archived as you go
 ```
 
+{func}`~eventcv.record` is the one-shot form for scripts that only want a file — it opens the
+camera, captures for `seconds`, and closes it before returning, so the recording is complete and the
+device free by the next line:
+
+```python
+ecv.record("session.h5", seconds=10)
+reader = ecv.open("session.h5", dt_ms=50)
+```
+
 Windowing mirrors `open` (`dt_ms` or `max_events`), `repr=` and its options render each window,
 `record=` archives the raw events, `latest=True` keeps a slow loop on live data,
 `max_event_rate` / `roi` cap what the sensor emits in hardware, and `mask=` restricts it to an
@@ -182,6 +210,7 @@ silently doing nothing.
 .. currentmodule:: eventcv
 
 .. autofunction:: stream
+.. autofunction:: record
 .. autofunction:: list_cameras
 ```
 

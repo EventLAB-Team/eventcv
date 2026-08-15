@@ -4,6 +4,7 @@ use crate::{EventStream, EventStreamBuilder};
 
 mod aedat;
 mod bag;
+mod e2vid;
 #[cfg(feature = "hdf5")]
 mod h5;
 mod npz;
@@ -13,6 +14,7 @@ mod text;
 
 pub use aedat::read_aedat;
 pub use bag::{open_bag_slice, read_bag, write_bag, BagSliceSource};
+pub use e2vid::{write_e2vid, E2vidWriter};
 #[cfg(feature = "hdf5")]
 pub use h5::{
     open_hdf5_slice, read_hdf5, read_hdf5_frame, write_hdf5_frame, write_hdf5_stream,
@@ -187,6 +189,8 @@ enum Format {
     PropheseeDat,
     PropheseeRaw,
     Png,
+    /// E2VID's `t x y p` text interchange (see [`e2vid`]) — write-only.
+    E2vid,
 }
 
 fn detect_format(path: &Path) -> Result<Format, IoError> {
@@ -204,6 +208,7 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
         Some("dat") => Ok(Format::PropheseeDat),
         Some("raw") => Ok(Format::PropheseeRaw),
         Some("png") => Ok(Format::Png),
+        Some("zip") => Ok(Format::E2vid),
         Some(other) => Err(IoError::Unsupported(format!(
             "unrecognised file extension: .{other}"
         ))),
@@ -218,6 +223,17 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
 /// fall back to buffering the whole recording in memory (then [`save_stream`]) when it can't.
 pub fn supports_event_append(path: impl AsRef<Path>) -> bool {
     matches!(detect_format(path.as_ref()), Ok(Format::Hdf5))
+}
+
+/// Whether `path` (with an optional explicit `format`) names an E2VID export — the target
+/// [`E2vidWriter`] streams into. Lets a caller that owns the read loop, like the Python
+/// `save(reader, …)`, pick the incremental path without duplicating extension rules.
+pub fn is_e2vid_target(path: impl AsRef<Path>, format: Option<&str>) -> bool {
+    let options = SaveOptions {
+        format: format.map(str::to_owned),
+        ..SaveOptions::default()
+    };
+    matches!(requested_format(path.as_ref(), &options), Ok(Format::E2vid))
 }
 
 /// Loads events from any supported file, detected by extension — the OpenCV-style
@@ -278,6 +294,11 @@ fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoErro
         Format::PropheseeRaw => prophesee_raw::read_raw(path, options),
         Format::Png => Err(IoError::Unsupported(
             "PNG is a frame export format, not an event stream; use save_frame".to_owned(),
+        )),
+        Format::E2vid => Err(IoError::Unsupported(
+            "E2VID's .zip is an export format for that reconstruction pipeline, not one eventcv \
+             reads back; save an npz/h5/bag alongside it to keep the recording"
+                .to_owned(),
         )),
     }
 }
@@ -425,20 +446,44 @@ pub struct SaveOptions {
     pub colormap: Colormap,
     /// PNG frame export only: auto-contrast the field to its data range. `None` = `true`.
     pub normalize: Option<bool>,
+    /// Overrides the format the extension implies. The one case that needs it is writing E2VID's
+    /// layout to a `.txt` (which otherwise means eventcv's own text format); `.zip` already
+    /// implies it. `None` follows the extension.
+    pub format: Option<String>,
+}
+
+/// The format `path` and `options` together ask for: an explicit `format` name, else the
+/// extension.
+fn requested_format(path: &Path, options: &SaveOptions) -> Result<Format, IoError> {
+    match options.format.as_deref() {
+        None => detect_format(path),
+        Some("e2vid") => Ok(Format::E2vid),
+        Some("npz") => Ok(Format::Npz),
+        Some("txt") | Some("csv") | Some("text") => Ok(Format::Text),
+        Some("h5") | Some("hdf5") => Ok(Format::Hdf5),
+        Some("bag") | Some("rosbag") => Ok(Format::Rosbag),
+        Some("png") => Ok(Format::Png),
+        Some(other) => Err(IoError::Unsupported(format!(
+            "unknown format: {other} (expected npz, txt, h5, bag, png, or e2vid)"
+        ))),
+    }
 }
 
 /// Persists an [`EventStream`] to `path`, the format chosen by extension — the symmetric
 /// counterpart of [`load`]. npz/HDF5/rosbag round-trip exactly (metadata stored); txt
 /// stores `t x y p` and recovers sensor size / time unit on load via inference or options.
+/// `.zip` (or `format: "e2vid"`) writes E2VID's interchange text instead, which eventcv does not
+/// read back.
 pub fn save_stream(
     path: impl AsRef<Path>,
     stream: &EventStream,
     options: &SaveOptions,
 ) -> Result<(), IoError> {
     let path = path.as_ref();
-    match detect_format(path)? {
+    match requested_format(path, options)? {
         Format::Npz => npz::write_npz_stream(path, stream),
         Format::Text => text::write_text_stream(path, stream),
+        Format::E2vid => e2vid::write_e2vid(path, stream),
         Format::Rosbag => bag::write_bag(path, stream, options.topic.as_deref()),
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]

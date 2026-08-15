@@ -55,7 +55,16 @@ pub struct CameraInfo {
 /// Enumerates every connected, supported event camera. The returned [`CameraInfo::serial`] can be
 /// passed to [`Capture::open`] to select a specific device when several are plugged in.
 pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
-    let listed = nd::list_devices().map_err(|error| error.to_string())?;
+    // Enumeration opens each candidate device to read its type and serial, so it fails as a whole
+    // when the host won't let us near one of them — the commonest cause by far, and one the raw
+    // libusb message ("Access denied") does not point at.
+    let listed = nd::list_devices().map_err(|error| {
+        format!(
+            "could not enumerate USB event cameras ({error}). On Linux this is usually missing \
+             udev rules for the device (see the neuromorphic-drivers README, then re-plug it); on \
+             Windows, a missing WinUSB driver for it"
+        )
+    })?;
     Ok(listed
         .into_iter()
         .map(|device| CameraInfo {
@@ -76,7 +85,9 @@ pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
 fn open_error(serial: Option<&str>, error: impl std::fmt::Display) -> String {
     let visible = list_cameras().unwrap_or_default();
     let matched = match serial {
-        Some(serial) => visible.iter().find(|camera| camera.serial.as_deref() == Some(serial)),
+        Some(serial) => visible
+            .iter()
+            .find(|camera| camera.serial.as_deref() == Some(serial)),
         None => visible.first(),
     };
     match matched {
@@ -132,6 +143,25 @@ impl Limits {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// Where a [`Limits::roi`] rectangle ended up being enforced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoiPlacement {
+    /// Blocked on-chip by the sensor's region masks — the pixels outside never produce an event, so
+    /// they cost no USB bandwidth, no decoding, and nothing downstream.
+    Hardware,
+    /// Filtered on the host as events are decoded, because this sensor has no region masks. The
+    /// events still cross the cable and are still decoded; only the saving downstream is real.
+    Host,
+}
+
+/// How a [`Limits`] request is carried out on one particular sensor: what to configure it with at
+/// open, and what has to be enforced on the host instead because the sensor cannot do it.
+#[derive(Default)]
+struct LimitsPlan {
+    configuration: Option<nd::Configuration>,
+    host_roi: Option<(usize, usize, usize, usize)>,
 }
 
 /// How the incoming event stream is cut into [`EventStream`] windows — the live twin of
@@ -328,6 +358,8 @@ pub struct Capture {
     /// Region-of-interest mask (row-major `width·height`, `true` = keep), applied as events are
     /// decoded. `None` keeps everything. See [`set_mask`](Self::set_mask).
     mask: Option<Vec<bool>>,
+    /// The [`Limits::roi`] rectangle this camera was opened with, and where it is enforced.
+    roi: Option<((usize, usize, usize, usize), RoiPlacement)>,
     width: usize,
     height: usize,
     name: String,
@@ -352,16 +384,36 @@ impl Capture {
         bias: Option<BiasOverrides>,
     ) -> Result<Self, String> {
         let (flag, event_loop) = nd::flag_and_event_loop().map_err(|error| error.to_string())?;
-        let selector = match serial {
-            Some(serial) => nd::SerialOrBusNumberAndAddress::Serial(serial),
-            None => nd::SerialOrBusNumberAndAddress::None,
+        // A limits request is device-specific, so the sensor has to be identified before it is
+        // opened. Having enumerated it, open *that* device by bus address rather than "the first
+        // one": with two cameras attached, the driver's own choice of first need not be ours, and a
+        // configuration written for one sensor must never land on another.
+        let (selector, plan) = if limits.is_empty() {
+            let selector = match serial {
+                Some(serial) => nd::SerialOrBusNumberAndAddress::Serial(serial),
+                None => nd::SerialOrBusNumberAndAddress::None,
+            };
+            (selector, LimitsPlan::default())
+        } else {
+            let listed = select_device(serial)?;
+            let plan = plan_limits(&listed, limits)?;
+            let address = (listed.bus_number, listed.address);
+            (
+                nd::SerialOrBusNumberAndAddress::BusNumberAndAddress(address),
+                plan,
+            )
         };
         // Applied as part of the opening handshake: the driver writes the rate controller and the
         // region masks while configuring the sensor, and only re-writes the masks afterwards, so a
         // rate cap set after open would be silently ignored.
-        let configuration = limits_configuration(serial, limits)?;
-        let device = nd::open(selector, configuration, None, event_loop.clone(), flag.clone())
-            .map_err(|error| open_error(serial, error))?;
+        let device = nd::open(
+            selector,
+            plan.configuration,
+            None,
+            event_loop.clone(),
+            flag.clone(),
+        )
+        .map_err(|error| open_error(serial, error))?;
         let (width, height) = device_dimensions(&device);
         let name = device.name().to_owned();
         let serial = device.serial();
@@ -369,7 +421,7 @@ impl Capture {
         let bias = bias
             .map(|overrides| AdaptiveBias::new(overrides, &device))
             .transpose()?;
-        Ok(Self {
+        let mut capture = Self {
             device,
             adapter,
             _event_loop: event_loop,
@@ -377,11 +429,32 @@ impl Capture {
             windower: Windower::new(width, height, window),
             bias,
             mask: None,
+            roi: limits.roi.map(|rect| {
+                let placement = match plan.host_roi {
+                    Some(_) => RoiPlacement::Host,
+                    None => RoiPlacement::Hardware,
+                };
+                (rect, placement)
+            }),
             width,
             height,
             name,
             serial,
-        })
+        };
+        // A sensor without region masks gets the same rectangle as a host-side mask, so `roi=`
+        // means the same thing everywhere — it just stops costing less than the whole sensor.
+        if let Some((x0, y0, w, h)) = plan.host_roi {
+            let rect = crate::mask::rect(width, height, x0 as f64, y0 as f64, w as f64, h as f64);
+            capture.set_mask(Some(rect))?;
+        }
+        Ok(capture)
+    }
+
+    /// The `(x0, y0, width, height)` region the camera was opened with, and whether the sensor is
+    /// enforcing it on-chip or eventcv is filtering it on the host. `None` when the whole sensor is
+    /// in use.
+    pub fn roi(&self) -> Option<((usize, usize, usize, usize), RoiPlacement)> {
+        self.roi
     }
 
     /// A snapshot of the adaptive-bias controller, or `None` when the camera was opened without it.
@@ -674,33 +747,36 @@ impl Capture {
     }
 }
 
-/// Builds the device configuration that carries [`Limits`] into the opening handshake, or `None`
-/// when nothing is limited (the device then keeps its stock configuration).
-///
-/// The variant has to match the device being opened, so the camera is identified by enumeration
-/// first. Only the Prophesee sensors have an on-chip rate controller and region masks; asking for
-/// limits on another camera is an error rather than a silent no-op, since the caller would
-/// otherwise believe the source was capped when it isn't.
-fn limits_configuration(
-    serial: Option<&str>,
-    limits: Limits,
-) -> Result<Option<nd::Configuration>, String> {
-    if limits.is_empty() {
-        return Ok(None);
-    }
+/// Picks the device a [`Limits`] request is being planned for: the one matching `serial`, or the
+/// first camera found. Enumeration is the only way to learn a device's type before opening it, and
+/// the configuration variant has to match that type.
+fn select_device(serial: Option<&str>) -> Result<nd::devices::ListedDevice, String> {
     let listed = nd::list_devices().map_err(|error| error.to_string())?;
-    let device = match serial {
+    match serial {
         Some(serial) => listed
-            .iter()
+            .into_iter()
             .find(|device| device.serial.as_deref().ok() == Some(serial))
-            .ok_or_else(|| format!("no camera with serial {serial} found"))?,
+            .ok_or_else(|| format!("no camera with serial {serial} found")),
         None => listed
-            .first()
-            .ok_or_else(|| "no event camera found".to_owned())?,
-    };
-    macro_rules! prophesee {
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no event camera found".to_owned()),
+    }
+}
+
+/// Works out how `limits` can be met on `device`: what to open the sensor with, and what eventcv
+/// has to do itself.
+///
+/// Gated on what the sensor *can do*, not on which model it is. The rate controller and the region
+/// masks are separate capabilities — the three sensors built on Prophesee's pipeline (EVK4, EVK3
+/// HD, CenturyArks VGA) have both; the iniVation cameras have neither. A region of interest they
+/// can't block on-chip is still worth honouring on the host, so it comes back as `host_roi` rather
+/// than an error. A rate cap has no host equivalent — dropping events after they were decoded saves
+/// nothing, and pretending otherwise would misrepresent the source — so that stays an error.
+fn plan_limits(device: &nd::devices::ListedDevice, limits: Limits) -> Result<LimitsPlan, String> {
+    macro_rules! regions {
         ($module:ident, $variant:ident) => {{
-            use nd::devices::$module::{DEFAULT_CONFIGURATION, PROPERTIES, RateLimiter};
+            use nd::devices::$module::{RateLimiter, DEFAULT_CONFIGURATION, PROPERTIES};
             let mut configuration = DEFAULT_CONFIGURATION;
             configuration.rate_limiter = rate_limiter(limits.max_event_rate).map(
                 |(reference_period_us, maximum_events_per_period)| RateLimiter {
@@ -715,20 +791,32 @@ fn limits_configuration(
                 configuration.y_mask = y_mask;
                 configuration.mask_intersection_only = false;
             }
-            nd::Configuration::$variant(configuration)
+            LimitsPlan {
+                configuration: Some(nd::Configuration::$variant(configuration)),
+                host_roi: None,
+            }
         }};
     }
-    Ok(Some(match device.device_type {
-        nd::Type::PropheseeEvk4 => prophesee!(prophesee_evk4, PropheseeEvk4),
-        nd::Type::PropheseeEvk3Hd => prophesee!(prophesee_evk3_hd, PropheseeEvk3Hd),
+    Ok(match device.device_type {
+        nd::Type::PropheseeEvk4 => regions!(prophesee_evk4, PropheseeEvk4),
+        nd::Type::PropheseeEvk3Hd => regions!(prophesee_evk3_hd, PropheseeEvk3Hd),
+        nd::Type::CenturyarksVga => regions!(centuryarks_vga, CenturyarksVga),
         other => {
-            return Err(format!(
-                "{} has no on-chip event-rate controller or region masks — max_event_rate and roi \
-                 are supported on Prophesee sensors (EVK4, EVK3 HD) only",
-                other.name(),
-            ))
+            if limits.max_event_rate.is_some() {
+                return Err(format!(
+                    "{} has no on-chip event-rate controller — max_event_rate is a sensor feature, \
+                     and capping the rate on the host would not save any of the work it exists to \
+                     avoid. It is supported on the Prophesee EVK4 and EVK3 HD and the CenturyArks \
+                     VGA",
+                    other.name(),
+                ));
+            }
+            LimitsPlan {
+                configuration: None,
+                host_roi: limits.roi,
+            }
         }
-    }))
+    })
 }
 
 /// Converts an events-per-second ceiling into the rate controller's `(reference period, events
@@ -751,11 +839,14 @@ fn rate_limiter(max_event_rate: Option<u64>) -> Option<(u16, u32)> {
 /// is row `height - 1 - i`. Verified on an EVK4, where a top-left `(0, 0, 200, 200)` region built
 /// row-major came back as rows 520..719, the exact mirror. A vertically symmetric rectangle looks
 /// correct either way, so this is easy to miss.
-fn region_masks(
+///
+/// The bitmap lengths are the driver's, and differ per sensor (20×12 words for the 1280×720
+/// Prophesee sensors, 10×8 for the 640×480 CenturyArks), so they come in as const parameters.
+fn region_masks<const NX: usize, const NY: usize>(
     roi: (usize, usize, usize, usize),
     sensor_width: usize,
     sensor_height: usize,
-) -> Result<([u64; 20], [u64; 12]), String> {
+) -> Result<([u64; NX], [u64; NY]), String> {
     let (x0, y0, width, height) = roi;
     if width == 0 || height == 0 {
         return Err("roi width and height must be at least 1".to_owned());
@@ -767,8 +858,8 @@ fn region_masks(
              {sensor_width}x{sensor_height} sensor"
         ));
     }
-    let mut x_mask = [0_u64; 20];
-    let mut y_mask = [0_u64; 12];
+    let mut x_mask = [0_u64; NX];
+    let mut y_mask = [0_u64; NY];
     for column in (0..sensor_width).filter(|column| !(x0..x1).contains(column)) {
         x_mask[column / 64] |= 1 << (column % 64);
     }
@@ -937,12 +1028,15 @@ mod tests {
         // Below one event per period the register still has to admit one.
         assert_eq!(rate_limiter(Some(100)), Some((1000, 1)));
         // Beyond the 22-bit budget the cap saturates rather than wrapping.
-        assert_eq!(rate_limiter(Some(u64::MAX / 1000)), Some((1000, (1 << 22) - 1)));
+        assert_eq!(
+            rate_limiter(Some(u64::MAX / 1000)),
+            Some((1000, (1 << 22) - 1))
+        );
     }
 
     #[test]
     fn region_masks_block_everything_outside_the_rectangle() {
-        let (x_mask, y_mask) = region_masks((100, 50, 200, 100), 1280, 720).unwrap();
+        let (x_mask, y_mask) = region_masks::<20, 12>((100, 50, 200, 100), 1280, 720).unwrap();
         let bit = |mask: &[u64], index: usize| mask[index / 64] & (1 << (index % 64)) != 0;
         // Columns map straight across; rows are stored bottom-up.
         let column_blocked = |column: usize| bit(&x_mask, column);
@@ -959,17 +1053,39 @@ mod tests {
     #[test]
     fn region_masks_store_rows_bottom_up() {
         // A top-left region: rows 0..199 kept. Stored bottom-up, the *kept* bits are the top ones.
-        let (_, y_mask) = region_masks((0, 0, 200, 200), 1280, 720).unwrap();
+        let (_, y_mask) = region_masks::<20, 12>((0, 0, 200, 200), 1280, 720).unwrap();
         let bit = |index: usize| y_mask[index / 64] & (1 << (index % 64)) != 0;
-        assert!(bit(0) && bit(519), "rows 200..719 must be blocked, low bits set");
-        assert!(!bit(520) && !bit(719), "rows 0..199 must be kept, high bits clear");
+        assert!(
+            bit(0) && bit(519),
+            "rows 200..719 must be blocked, low bits set"
+        );
+        assert!(
+            !bit(520) && !bit(719),
+            "rows 0..199 must be kept, high bits clear"
+        );
+    }
+
+    #[test]
+    fn region_masks_fit_the_centuryarks_bitmaps() {
+        // The CenturyArks VGA has the same on-chip region masks as the Prophesee sensors, but its
+        // bitmaps are 10x8 words for a 640x480 grid rather than 20x12 for 1280x720.
+        let (x_mask, y_mask) = region_masks::<10, 8>((320, 240, 320, 240), 640, 480).unwrap();
+        assert_eq!((x_mask.len(), y_mask.len()), (10, 8));
+        let bit = |mask: &[u64], index: usize| mask[index / 64] & (1 << (index % 64)) != 0;
+        assert!(bit(&x_mask, 319) && !bit(&x_mask, 320)); // columns left of the rectangle blocked
+        assert!(bit(&y_mask, 480 - 1 - 239) && !bit(&y_mask, 480 - 1 - 240)); // rows, bottom-up
+                                                                              // The row bitmap has spare bits past the sensor (8 words = 512 bits for 480 rows); they
+                                                                              // belong to no row, so they stay clear. The column bitmap is exactly 640 bits, with none.
+        assert!(!bit(&y_mask, 480));
     }
 
     #[test]
     fn region_masks_reject_a_rectangle_off_the_sensor() {
-        assert!(region_masks((0, 0, 1280, 720), 1280, 720).is_ok());
-        assert!(region_masks((1, 0, 1280, 720), 1280, 720).is_err());
-        assert!(region_masks((0, 0, 0, 100), 1280, 720).is_err());
+        assert!(region_masks::<20, 12>((0, 0, 1280, 720), 1280, 720).is_ok());
+        assert!(region_masks::<20, 12>((1, 0, 1280, 720), 1280, 720).is_err());
+        assert!(region_masks::<20, 12>((0, 0, 0, 100), 1280, 720).is_err());
+        // The same rectangle is off a 640x480 sensor, so the check is per sensor, not per model.
+        assert!(region_masks::<10, 8>((0, 0, 1280, 720), 640, 480).is_err());
     }
 
     #[test]

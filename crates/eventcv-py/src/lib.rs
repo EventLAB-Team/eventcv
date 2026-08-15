@@ -34,6 +34,15 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyTuple};
 
+/// Default time span for the representations that have one (`window_ms`, `tau_ms`,
+/// `max_window_ms`) when none of its unit forms is given.
+const DEFAULT_SPAN_MS: f64 = 30.0;
+
+/// Events read per pass when converting a whole `EventReader` to another format. Large enough
+/// that the per-chunk overhead disappears, small enough that the decoded columns stay well under
+/// a gigabyte on any sensor.
+const EXPORT_CHUNK: usize = 4_000_000;
+
 #[pyclass(name = "EventStream", frozen)]
 struct PyEventStream {
     inner: eventcv_core::EventStream,
@@ -80,13 +89,20 @@ impl PyEventStream {
         self.inner.to_array2().into_pyarray(py)
     }
 
-    /// Saves the stream to `path`, format chosen by extension (`.npz`/`.txt`/`.h5`/`.bag`) —
-    /// the counterpart of `eventcv.load`. npz/HDF5/rosbag round-trip exactly; `topic` names
-    /// the rosbag connection.
-    #[pyo3(signature = (path, *, topic=None))]
-    fn save(&self, py: Python<'_>, path: &str, topic: Option<String>) -> PyResult<()> {
+    /// Saves the stream to `path`, format chosen by extension (`.npz`/`.txt`/`.h5`/`.bag`, or
+    /// `.zip` for E2VID) — the counterpart of `eventcv.load`. npz/HDF5/rosbag round-trip exactly;
+    /// `topic` names the rosbag connection; `format` overrides the extension.
+    #[pyo3(signature = (path, *, topic=None, format=None))]
+    fn save(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        topic: Option<String>,
+        format: Option<String>,
+    ) -> PyResult<()> {
         let options = SaveOptions {
             topic,
+            format,
             ..SaveOptions::default()
         };
         py.detach(|| eventcv_core::io::save_stream(path, &self.inner, &options))
@@ -162,14 +178,44 @@ impl PyEventStream {
         Ok(self.wrap(py.detach(|| self.inner.mask(&flat, width, height))))
     }
 
-    /// Keeps events whose timestamp lies in the half-open window `[t0, t1)` (microseconds).
-    fn time_window(&self, py: Python<'_>, t0: i64, t1: i64) -> PyEventStream {
-        self.wrap(py.detach(|| self.inner.time_window(t0, t1)))
+    /// Keeps events whose timestamp lies in the half-open window `[t0, t1)`. Positional bounds are
+    /// microseconds (the unit timestamps are stored in); `t0_s`/`t0_ms`/`t0_us`/`t0_ns` and the
+    /// `t1` equivalents take any unit.
+    #[pyo3(signature = (t0=None, t1=None, *, t0_s=None, t0_ms=None, t0_us=None, t0_ns=None, t1_s=None, t1_ms=None, t1_us=None, t1_ns=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn time_window(
+        &self,
+        py: Python<'_>,
+        t0: Option<i64>,
+        t1: Option<i64>,
+        t0_s: Option<f64>,
+        t0_ms: Option<f64>,
+        t0_us: Option<f64>,
+        t0_ns: Option<f64>,
+        t1_s: Option<f64>,
+        t1_ms: Option<f64>,
+        t1_us: Option<f64>,
+        t1_ns: Option<f64>,
+    ) -> PyResult<PyEventStream> {
+        let t0 = resolve_bound("t0", t0, t0_s, t0_ms, t0_us, t0_ns)?.unwrap_or(i64::MIN);
+        let t1 = resolve_bound("t1", t1, t1_s, t1_ms, t1_us, t1_ns)?.unwrap_or(i64::MAX);
+        Ok(self.wrap(py.detach(|| self.inner.time_window(t0, t1))))
     }
 
-    /// Shifts every timestamp by `dt` microseconds.
-    fn time_shift(&self, py: Python<'_>, dt: i64) -> PyEventStream {
-        self.wrap(py.detach(|| self.inner.time_shift(dt)))
+    /// Shifts every timestamp by `dt`. The positional form is microseconds; `dt_s`/`dt_ms`/`dt_us`/
+    /// `dt_ns` take any unit, and unlike a window duration this one may be negative.
+    #[pyo3(signature = (dt=None, *, dt_s=None, dt_ms=None, dt_us=None, dt_ns=None))]
+    fn time_shift(
+        &self,
+        py: Python<'_>,
+        dt: Option<i64>,
+        dt_s: Option<f64>,
+        dt_ms: Option<f64>,
+        dt_us: Option<f64>,
+        dt_ns: Option<f64>,
+    ) -> PyResult<PyEventStream> {
+        let dt = resolve_bound("dt", dt, dt_s, dt_ms, dt_us, dt_ns)?.unwrap_or(0);
+        Ok(self.wrap(py.detach(|| self.inner.time_shift(dt))))
     }
 
     /// Scales every timestamp by `factor` (rounded).
@@ -284,17 +330,35 @@ impl PyEventStream {
         }
     }
 
-    #[pyo3(signature = (*, bins=9, window_ms=30.0))]
-    fn voxel(&self, py: Python<'_>, bins: i64, window_ms: f64) -> PyResult<PyEventFrame> {
+    #[pyo3(signature = (*, bins=9, window_ms=None, window_s=None, window_us=None, window_ns=None))]
+    fn voxel(
+        &self,
+        py: Python<'_>,
+        bins: i64,
+        window_ms: Option<f64>,
+        window_s: Option<f64>,
+        window_us: Option<f64>,
+        window_ns: Option<f64>,
+    ) -> PyResult<PyEventFrame> {
         let bins =
             usize::try_from(bins).map_err(|_| PyValueError::new_err("bins must be at least 1"))?;
+        let window_ms = resolve_ms("window", window_s, window_ms, window_us, window_ns)?
+            .unwrap_or(DEFAULT_SPAN_MS);
         py.detach(|| VoxelGrid::new(bins, window_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
 
-    #[pyo3(signature = (*, tau_ms=30.0))]
-    fn tsurf(&self, py: Python<'_>, tau_ms: f64) -> PyResult<PyEventFrame> {
+    #[pyo3(signature = (*, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None))]
+    fn tsurf(
+        &self,
+        py: Python<'_>,
+        tau_ms: Option<f64>,
+        tau_s: Option<f64>,
+        tau_us: Option<f64>,
+        tau_ns: Option<f64>,
+    ) -> PyResult<PyEventFrame> {
+        let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS);
         py.detach(|| TimeSurface::new(tau_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
@@ -302,8 +366,16 @@ impl PyEventStream {
 
     /// Averaged time surface — the per-pixel mean of `exp(-age/tau_ms)` over all events
     /// (two polarity channels, float32). Brighter where activity recurs; see `tsurf`.
-    #[pyo3(signature = (*, tau_ms=30.0))]
-    fn atsurf(&self, py: Python<'_>, tau_ms: f64) -> PyResult<PyEventFrame> {
+    #[pyo3(signature = (*, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None))]
+    fn atsurf(
+        &self,
+        py: Python<'_>,
+        tau_ms: Option<f64>,
+        tau_s: Option<f64>,
+        tau_us: Option<f64>,
+        tau_ns: Option<f64>,
+    ) -> PyResult<PyEventFrame> {
+        let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS);
         py.detach(|| AveragedTimeSurface::new(tau_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
@@ -324,8 +396,17 @@ impl PyEventStream {
             .map_err(map_representation_error)
     }
 
-    #[pyo3(signature = (*, window_ms=30.0))]
-    fn tencode(&self, py: Python<'_>, window_ms: f64) -> PyResult<PyEventFrame> {
+    #[pyo3(signature = (*, window_ms=None, window_s=None, window_us=None, window_ns=None))]
+    fn tencode(
+        &self,
+        py: Python<'_>,
+        window_ms: Option<f64>,
+        window_s: Option<f64>,
+        window_us: Option<f64>,
+        window_ns: Option<f64>,
+    ) -> PyResult<PyEventFrame> {
+        let window_ms = resolve_ms("window", window_s, window_ms, window_us, window_ns)?
+            .unwrap_or(DEFAULT_SPAN_MS);
         py.detach(|| Tencode::new(window_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
@@ -344,8 +425,23 @@ impl PyEventStream {
             .map_err(map_representation_error)
     }
 
-    #[pyo3(signature = (*, max_window_ms=30.0))]
-    fn mcts(&self, py: Python<'_>, max_window_ms: f64) -> PyResult<PyEventFrame> {
+    #[pyo3(signature = (*, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None))]
+    fn mcts(
+        &self,
+        py: Python<'_>,
+        max_window_ms: Option<f64>,
+        max_window_s: Option<f64>,
+        max_window_us: Option<f64>,
+        max_window_ns: Option<f64>,
+    ) -> PyResult<PyEventFrame> {
+        let max_window_ms = resolve_ms(
+            "max_window",
+            max_window_s,
+            max_window_ms,
+            max_window_us,
+            max_window_ns,
+        )?
+        .unwrap_or(DEFAULT_SPAN_MS);
         py.detach(|| Mcts::new(max_window_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
@@ -683,7 +779,11 @@ fn parse_sensor_size(sensor_size: Option<(i64, i64)>) -> PyResult<Option<(usize,
 fn mask_array(mask: &Bound<'_, PyAny>) -> PyResult<(Vec<bool>, usize, usize)> {
     if let Ok(array) = mask.extract::<PyReadonlyArray2<bool>>() {
         let view = array.as_array();
-        Ok((view.iter().copied().collect(), view.shape()[1], view.shape()[0]))
+        Ok((
+            view.iter().copied().collect(),
+            view.shape()[1],
+            view.shape()[0],
+        ))
     } else if let Ok(array) = mask.extract::<PyReadonlyArray2<u8>>() {
         let view = array.as_array();
         Ok((
@@ -732,18 +832,120 @@ fn mask_to_py(
 
 /// `None` or `"auto"` means infer the unit from the data; anything else is explicit.
 fn parse_time_unit(time_unit: Option<&str>) -> PyResult<Option<TimeUnit>> {
-    Ok(Some(match time_unit {
-        None | Some("auto") => return Ok(None),
-        Some("seconds") | Some("s") => TimeUnit::Seconds,
-        Some("milliseconds") | Some("ms") => TimeUnit::Milliseconds,
-        Some("microseconds") | Some("us") => TimeUnit::Microseconds,
-        Some("nanoseconds") | Some("ns") => TimeUnit::Nanoseconds,
-        Some(other) => {
-            return Err(PyValueError::new_err(format!(
-                "unsupported time_unit: {other}"
-            )))
+    match time_unit {
+        None | Some("auto") => Ok(None),
+        Some(name) => name.parse::<TimeUnit>().map(Some).map_err(|_| {
+            PyValueError::new_err(format!(
+                "unsupported time_unit: {name} (expected s, ms, us, ns, or auto)"
+            ))
+        }),
+    }
+}
+
+/// Microseconds per `unit`, for the getters that *report* a time (`dt`, `duration`, `time_span`)
+/// rather than take one. `"auto"` has no meaning here, so only real units are accepted.
+fn parse_unit_scale(unit: &str) -> PyResult<f64> {
+    unit.parse::<TimeUnit>()
+        .map(TimeUnit::scale_us)
+        .map_err(PyValueError::new_err)
+}
+
+/// Resolves one time argument given as a set of mutually-exclusive `<name>_{s,ms,us,ns}` siblings,
+/// returning microseconds — the unit every timestamp in eventcv is stored in.
+///
+/// Every time-valued argument in the Python API comes in these four forms, so `dt_us=500` and
+/// `dt_ms=0.5` are the same request. Passing two of them for the same quantity is an error rather
+/// than a precedence rule to remember.
+fn resolve_us(
+    name: &str,
+    seconds: Option<f64>,
+    milliseconds: Option<f64>,
+    microseconds: Option<f64>,
+    nanoseconds: Option<f64>,
+) -> PyResult<Option<f64>> {
+    let given: Vec<(TimeUnit, f64)> = [
+        (TimeUnit::Seconds, seconds),
+        (TimeUnit::Milliseconds, milliseconds),
+        (TimeUnit::Microseconds, microseconds),
+        (TimeUnit::Nanoseconds, nanoseconds),
+    ]
+    .into_iter()
+    .filter_map(|(unit, value)| value.map(|value| (unit, value)))
+    .collect();
+    if given.len() > 1 {
+        let names: Vec<String> = given
+            .iter()
+            .map(|(unit, _)| format!("{name}_{unit}"))
+            .collect();
+        return Err(PyValueError::new_err(format!(
+            "pass one of {name}_s / {name}_ms / {name}_us / {name}_ns, not {}",
+            names.join(" and "),
+        )));
+    }
+    match given.first() {
+        None => Ok(None),
+        Some((_, value)) if value.is_nan() => {
+            Err(PyValueError::new_err(format!("{name} must be a number")))
         }
-    }))
+        Some((unit, value)) => Ok(Some(value * unit.scale_us())),
+    }
+}
+
+/// [`resolve_us`] for a signed point or shift on the timestamp axis (`time_window`'s bounds,
+/// `time_shift`'s offset), which also accept a bare positional value in stored microseconds.
+fn resolve_bound(
+    name: &str,
+    raw_us: Option<i64>,
+    seconds: Option<f64>,
+    milliseconds: Option<f64>,
+    microseconds: Option<f64>,
+    nanoseconds: Option<f64>,
+) -> PyResult<Option<i64>> {
+    let resolved = resolve_us(name, seconds, milliseconds, microseconds, nanoseconds)?;
+    match (raw_us, resolved) {
+        (Some(_), Some(_)) => Err(PyValueError::new_err(format!(
+            "pass {name} positionally (microseconds) or as {name}_s/{name}_ms/{name}_us/{name}_ns, \
+             not both"
+        ))),
+        (Some(raw), None) => Ok(Some(raw)),
+        (None, resolved) => Ok(resolved.map(|us| us.round() as i64)),
+    }
+}
+
+/// [`resolve_us`] for the representation spans, which the core takes in milliseconds.
+fn resolve_ms(
+    name: &str,
+    seconds: Option<f64>,
+    milliseconds: Option<f64>,
+    microseconds: Option<f64>,
+    nanoseconds: Option<f64>,
+) -> PyResult<Option<f64>> {
+    Ok(resolve_us(name, seconds, milliseconds, microseconds, nanoseconds)?.map(|us| us / 1000.0))
+}
+
+/// [`resolve_us`] for a *duration* — something that has to be positive and land on the microsecond
+/// grid, like `dt` or a window `step`. A value below half a microsecond is rejected rather than
+/// rounded up to 1 µs, so `dt_ns=100` says so instead of silently becoming ten times itself.
+fn resolve_duration_us(
+    name: &str,
+    seconds: Option<f64>,
+    milliseconds: Option<f64>,
+    microseconds: Option<f64>,
+    nanoseconds: Option<f64>,
+) -> PyResult<Option<i64>> {
+    let Some(us) = resolve_us(name, seconds, milliseconds, microseconds, nanoseconds)? else {
+        return Ok(None);
+    };
+    if us <= 0.0 {
+        return Err(PyValueError::new_err(format!("{name} must be positive")));
+    }
+    let rounded = us.round() as i64;
+    if rounded < 1 {
+        return Err(PyValueError::new_err(format!(
+            "{name} of {us} us is below eventcv's one-microsecond timestamp resolution"
+        )));
+    }
+    Ok(Some(rounded))
 }
 
 fn parse_colormap(name: &str) -> PyResult<Colormap> {
@@ -784,27 +986,38 @@ fn parse_keys(keys: Option<HashMap<String, String>>) -> PyResult<Option<EventKey
     Ok(Some(parsed))
 }
 
-fn ms_to_us(ms: f64) -> i64 {
-    (ms * 1000.0).round() as i64
-}
-
 fn us_to_ms(us: i64) -> f64 {
     us as f64 / 1000.0
 }
 
-/// Converts an `offset` argument — an absolute timestamp in ms (the file's own time base) —
-/// into microseconds. `None` and non-positive values mean "read from the start".
-fn parse_offset(offset_ms: Option<f64>) -> PyResult<Option<i64>> {
-    match offset_ms {
+/// Converts an `offset` argument — an absolute timestamp in the file's own time base — into
+/// microseconds. `None` means "read from the start"; the bare `offset` is milliseconds.
+fn parse_offset(
+    offset: Option<f64>,
+    offset_s: Option<f64>,
+    offset_ms: Option<f64>,
+    offset_us: Option<f64>,
+    offset_ns: Option<f64>,
+) -> PyResult<Option<i64>> {
+    // `offset` predates the unit siblings and means milliseconds, so it is `offset_ms` by another
+    // name — accepted, but not alongside it.
+    let milliseconds = match (offset, offset_ms) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "pass offset or offset_ms, not both (they are the same argument)",
+            ))
+        }
+        (bare, suffixed) => bare.or(suffixed),
+    };
+    match resolve_us("offset", offset_s, milliseconds, offset_us, offset_ns)? {
         None => Ok(None),
-        Some(ms) if ms.is_nan() => Err(PyValueError::new_err("offset must be a number")),
-        Some(ms) if ms < 0.0 => Err(PyValueError::new_err("offset must be non-negative")),
-        Some(ms) => Ok(Some(ms_to_us(ms))),
+        Some(us) if us < 0.0 => Err(PyValueError::new_err("offset must be non-negative")),
+        Some(us) => Ok(Some(us.round() as i64)),
     }
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None, keys=None))]
+#[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, keys=None))]
 #[allow(clippy::too_many_arguments)]
 fn load(
     py: Python<'_>,
@@ -815,6 +1028,10 @@ fn load(
     topic: Option<String>,
     max_events: Option<i64>,
     offset: Option<f64>,
+    offset_s: Option<f64>,
+    offset_ms: Option<f64>,
+    offset_us: Option<f64>,
+    offset_ns: Option<f64>,
     keys: Option<HashMap<String, String>>,
 ) -> PyResult<PyEventStream> {
     let max_events = max_events
@@ -829,7 +1046,7 @@ fn load(
         order: parse_order(order)?,
         topic,
         max_events,
-        offset: parse_offset(offset)?,
+        offset: parse_offset(offset, offset_s, offset_ms, offset_us, offset_ns)?,
         keys: parse_keys(keys)?,
     };
     py.detach(|| eventcv_core::io::load(path, options))
@@ -913,25 +1130,31 @@ fn rows_from_view(view: &Array2<f64>, order: ColumnOrder) -> PyResult<Vec<RawRow
     Ok(rows)
 }
 
-fn parse_dt_ms(dt_ms: Option<f64>) -> PyResult<Option<i64>> {
-    match dt_ms {
-        None => Ok(None),
-        Some(ms) if ms.is_nan() || ms <= 0.0 => {
-            Err(PyValueError::new_err("dt_ms must be positive"))
-        }
-        Some(ms) => Ok(Some(ms_to_us(ms).max(1))),
-    }
+fn parse_dt(
+    dt_s: Option<f64>,
+    dt_ms: Option<f64>,
+    dt_us: Option<f64>,
+    dt_ns: Option<f64>,
+) -> PyResult<Option<i64>> {
+    resolve_duration_us("dt", dt_s, dt_ms, dt_us, dt_ns)
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, max_events=None, offset=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None))]
+#[pyo3(signature = (path, *, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
     path: &str,
     dt_ms: Option<f64>,
+    dt_s: Option<f64>,
+    dt_us: Option<f64>,
+    dt_ns: Option<f64>,
     max_events: Option<i64>,
     offset: Option<f64>,
+    offset_s: Option<f64>,
+    offset_ms: Option<f64>,
+    offset_us: Option<f64>,
+    offset_ns: Option<f64>,
     repr: Option<&str>,
     sensor_size: Option<(i64, i64)>,
     time_unit: Option<&str>,
@@ -941,12 +1164,10 @@ fn open(
     hot_pixel_std: f64,
     keys: Option<HashMap<String, String>>,
 ) -> PyResult<PyEventReader> {
-    let mode = match (parse_dt_ms(dt_ms)?, max_events) {
-        (Some(_), Some(_)) => {
-            return Err(PyValueError::new_err(
-                "pass either dt_ms (fixed-duration slices) or max_events (fixed-count slices), not both",
-            ))
-        }
+    let mode = match (parse_dt(dt_s, dt_ms, dt_us, dt_ns)?, max_events) {
+        (Some(_), Some(_)) => return Err(PyValueError::new_err(
+            "pass either dt (fixed-duration slices) or max_events (fixed-count slices), not both",
+        )),
         (Some(dt), None) => Some(SliceMode::Duration(dt)),
         (None, Some(len)) => Some(SliceMode::Count(
             usize::try_from(len)
@@ -956,7 +1177,7 @@ fn open(
         )),
         (None, None) => None,
     };
-    let offset_us = parse_offset(offset)?;
+    let origin_us = parse_offset(offset, offset_s, offset_ms, offset_us, offset_ns)?;
     let repr = repr.map(|name| ReprSpec::named(name, None)).transpose()?;
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
@@ -973,7 +1194,7 @@ fn open(
     // Translate the absolute offset timestamp into a base event index for fixed-count framing:
     // the events before it are the prefix `slice(0)` must skip. Duration framing needs no index
     // (its windows start at the origin timestamp), so this read only runs for count mode.
-    let base_index = match (offset_us, mode) {
+    let base_index = match (origin_us, mode) {
         (Some(origin), Some(SliceMode::Count(_))) => {
             let (lo, _) = reader.time_span();
             let origin = origin.max(lo);
@@ -1003,7 +1224,7 @@ fn open(
         mode,
         repr,
         slice_ops: no_slice_ops(),
-        offset_us,
+        offset_us: origin_us,
         base_index,
         hot_pixel_mask,
     })
@@ -1163,10 +1384,27 @@ impl PyEventReader {
         (us_to_ms(lo), us_to_ms(hi))
     }
 
+    /// The recording's `(first, last)` timestamp in `unit` — `"s"`, `"ms"` (the default), `"us"`,
+    /// or `"ns"`. The unit-flexible form of `time_span_ms`.
+    #[pyo3(signature = (unit="ms"))]
+    fn time_span(&self, unit: &str) -> PyResult<(f64, f64)> {
+        let scale = parse_unit_scale(unit)?;
+        let (lo, hi) = self.inner.lock().unwrap().time_span();
+        Ok((lo as f64 / scale, hi as f64 / scale))
+    }
+
     #[getter]
     fn duration_ms(&self) -> f64 {
         let (lo, hi) = self.inner.lock().unwrap().time_span();
         us_to_ms(hi - lo)
+    }
+
+    /// How long the recording runs, in `unit` (`"s"`, `"ms"`, `"us"`, `"ns"`).
+    #[pyo3(signature = (unit="ms"))]
+    fn duration(&self, unit: &str) -> PyResult<f64> {
+        let scale = parse_unit_scale(unit)?;
+        let (lo, hi) = self.inner.lock().unwrap().time_span();
+        Ok((hi - lo) as f64 / scale)
     }
 
     /// Number of fixed slices spanning the recording (requires `open(dt_ms=…)` or
@@ -1184,6 +1422,17 @@ impl PyEventReader {
             Some(SliceMode::Duration(dt)) => Some(us_to_ms(dt)),
             _ => None,
         }
+    }
+
+    /// The fixed slice duration set at `open`, in `unit` (`"s"`, `"ms"`, `"us"`, `"ns"`), or
+    /// `None` if the reader is in `max_events` mode.
+    #[pyo3(signature = (unit="ms"))]
+    fn dt(&self, unit: &str) -> PyResult<Option<f64>> {
+        let scale = parse_unit_scale(unit)?;
+        Ok(match self.mode {
+            Some(SliceMode::Duration(dt)) => Some(dt as f64 / scale),
+            _ => None,
+        })
     }
 
     /// The fixed events-per-slice set at `open(max_events=…)`, or `None` if it was not given.
@@ -1207,28 +1456,39 @@ impl PyEventReader {
     /// `[t_min + n·dt, t_min + (n+1)·dt)`, or the `max_events`-sized event chunk
     /// `[n·N, (n+1)·N)`; negative `n` counts from the end. Otherwise returns the half-open
     /// time window `[t0_ms, t1_ms)`, with omitted bounds extending to the recording's start /
-    /// end. When the reader carries a representation (`open(repr=…)` / `with_repr`) the slice
-    /// is rendered to that `EventFrame`; otherwise it is a raw `EventStream`.
-    #[pyo3(signature = (index=None, *, t0_ms=None, t1_ms=None))]
+    /// end. Bounds take any unit — `t0_s` / `t0_ms` / `t0_us` / `t0_ns`, and the same for `t1`.
+    /// When the reader carries a representation (`open(repr=…)` / `with_repr`) the slice is
+    /// rendered to that `EventFrame`; otherwise it is a raw `EventStream`.
+    #[pyo3(signature = (index=None, *, t0_ms=None, t0_s=None, t0_us=None, t0_ns=None, t1_ms=None, t1_s=None, t1_us=None, t1_ns=None))]
+    #[allow(clippy::too_many_arguments)]
     fn slice(
         &self,
         py: Python<'_>,
         index: Option<i64>,
         t0_ms: Option<f64>,
+        t0_s: Option<f64>,
+        t0_us: Option<f64>,
+        t0_ns: Option<f64>,
         t1_ms: Option<f64>,
+        t1_s: Option<f64>,
+        t1_us: Option<f64>,
+        t1_ns: Option<f64>,
     ) -> PyResult<Py<PyAny>> {
+        let t0 = resolve_us("t0", t0_s, t0_ms, t0_us, t0_ns)?;
+        let t1 = resolve_us("t1", t1_s, t1_ms, t1_us, t1_ns)?;
         let window = if let Some(index) = index {
-            if t0_ms.is_some() || t1_ms.is_some() {
+            if t0.is_some() || t1.is_some() {
                 return Err(PyValueError::new_err(
-                    "pass either a slice index or t0_ms/t1_ms, not both",
+                    "pass either a slice index or t0/t1 bounds, not both",
                 ));
             }
             self.window_for_index(index)?
         } else {
             let (lo, hi) = self.inner.lock().unwrap().time_span();
             SliceWindow::Time(
-                t0_ms.map_or(lo, ms_to_us),
-                t1_ms.map_or(hi.saturating_add(1), ms_to_us), // +1 keeps the last event
+                t0.map_or(lo, |us| us.round() as i64),
+                // +1 keeps the last event
+                t1.map_or(hi.saturating_add(1), |us| us.round() as i64),
             )
         };
         self.fetch_slice(py, window)
@@ -1255,15 +1515,24 @@ impl PyEventReader {
     /// Returns a new reader over the same file that renders each slice with `repr` (unset
     /// params take their method defaults). The dataset-mode counterpart of `open(repr=…)`,
     /// but with per-representation options: e.g. `reader.with_repr("voxel", bins=5)`.
-    #[pyo3(signature = (repr, *, bins=None, window_ms=None, tau_ms=None, max_window_ms=None, window=None, normalize=None, pct=None, white_frame=None))]
+    #[pyo3(signature = (repr, *, bins=None, window_ms=None, window_s=None, window_us=None, window_ns=None, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None, window=None, normalize=None, pct=None, white_frame=None))]
     #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
         repr: &str,
         bins: Option<i64>,
         window_ms: Option<f64>,
+        window_s: Option<f64>,
+        window_us: Option<f64>,
+        window_ns: Option<f64>,
         tau_ms: Option<f64>,
+        tau_s: Option<f64>,
+        tau_us: Option<f64>,
+        tau_ns: Option<f64>,
         max_window_ms: Option<f64>,
+        max_window_s: Option<f64>,
+        max_window_us: Option<f64>,
+        max_window_ns: Option<f64>,
         window: Option<i64>,
         normalize: Option<bool>,
         pct: Option<f64>,
@@ -1272,9 +1541,15 @@ impl PyEventReader {
         let spec = ReprSpec::new(
             repr,
             bins,
-            window_ms,
-            tau_ms,
-            max_window_ms,
+            resolve_ms("window", window_s, window_ms, window_us, window_ns)?,
+            resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?,
+            resolve_ms(
+                "max_window",
+                max_window_s,
+                max_window_ms,
+                max_window_us,
+                max_window_ns,
+            )?,
             window,
             normalize,
             pct,
@@ -1364,14 +1639,41 @@ impl PyEventReader {
         Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.mask(&flat, width, height))))
     }
 
-    /// Keeps each slice's events whose timestamp lies in `[t0, t1)` (microseconds).
-    fn time_window(&self, t0: i64, t1: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.time_window(t0, t1)))
+    /// Keeps each slice's events whose timestamp lies in `[t0, t1)` — positionally in
+    /// microseconds, or in any unit via `t0_s`/`t0_ms`/`t0_us`/`t0_ns` and the `t1` equivalents.
+    #[pyo3(signature = (t0=None, t1=None, *, t0_s=None, t0_ms=None, t0_us=None, t0_ns=None, t1_s=None, t1_ms=None, t1_us=None, t1_ns=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn time_window(
+        &self,
+        t0: Option<i64>,
+        t1: Option<i64>,
+        t0_s: Option<f64>,
+        t0_ms: Option<f64>,
+        t0_us: Option<f64>,
+        t0_ns: Option<f64>,
+        t1_s: Option<f64>,
+        t1_ms: Option<f64>,
+        t1_us: Option<f64>,
+        t1_ns: Option<f64>,
+    ) -> PyResult<PyEventReader> {
+        let t0 = resolve_bound("t0", t0, t0_s, t0_ms, t0_us, t0_ns)?.unwrap_or(i64::MIN);
+        let t1 = resolve_bound("t1", t1, t1_s, t1_ms, t1_us, t1_ns)?.unwrap_or(i64::MAX);
+        Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.time_window(t0, t1))))
     }
 
-    /// Shifts each slice's timestamps by `dt` microseconds.
-    fn time_shift(&self, dt: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.time_shift(dt)))
+    /// Shifts each slice's timestamps by `dt` — positionally in microseconds, or in any unit via
+    /// `dt_s`/`dt_ms`/`dt_us`/`dt_ns`.
+    #[pyo3(signature = (dt=None, *, dt_s=None, dt_ms=None, dt_us=None, dt_ns=None))]
+    fn time_shift(
+        &self,
+        dt: Option<i64>,
+        dt_s: Option<f64>,
+        dt_ms: Option<f64>,
+        dt_us: Option<f64>,
+        dt_ns: Option<f64>,
+    ) -> PyResult<PyEventReader> {
+        let dt = resolve_bound("dt", dt, dt_s, dt_ms, dt_us, dt_ns)?.unwrap_or(0);
+        Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.time_shift(dt))))
     }
 
     /// Scales each slice's timestamps by `factor`.
@@ -1475,6 +1777,17 @@ impl PyEventReader {
         stack_frames(py, &frames, template)
     }
 
+    /// Converts the whole recording to `path` without loading it — slices are read in order and
+    /// appended as they go, with any deferred ops (`crop`, `mask`, `hot_pixel_filter`, …) applied.
+    ///
+    /// Targets E2VID's interchange (`.zip`, or `format="e2vid"` for a `.txt`), which is what a
+    /// multi-gigabyte recording usually needs converting *to*. Saving to a round-tripping format
+    /// works from a slice: `eventcv.save(reader.slice(0), "frame.npz")`.
+    #[pyo3(signature = (path, *, format=None))]
+    fn save(&self, py: Python<'_>, path: &str, format: Option<String>) -> PyResult<()> {
+        self.save_streaming(py, path, format.as_deref())
+    }
+
     /// Events whose index lies in `[i0, i1)` (clamped to the file). Rendered to the reader's
     /// `EventFrame` when a representation is set (`open(repr=…)` / `with_repr`), else a raw
     /// `EventStream`.
@@ -1494,40 +1807,44 @@ impl PyEventReader {
     /// the fixed-count slices instead. Streams a multi-GB file window-by-window without
     /// loading it. Each item is a rendered `EventFrame` when the reader carries a
     /// representation (`open(repr=…)` / `with_repr`), else a raw `EventStream`.
-    #[pyo3(signature = (*, step_ms=None, span_ms=None))]
-    fn windows(&self, step_ms: Option<f64>, span_ms: Option<f64>) -> PyResult<PyWindowIterator> {
+    #[pyo3(signature = (*, step_ms=None, step_s=None, step_us=None, step_ns=None, span_ms=None, span_s=None, span_us=None, span_ns=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn windows(
+        &self,
+        step_ms: Option<f64>,
+        step_s: Option<f64>,
+        step_us: Option<f64>,
+        step_ns: Option<f64>,
+        span_ms: Option<f64>,
+        span_s: Option<f64>,
+        span_us: Option<f64>,
+        span_ns: Option<f64>,
+    ) -> PyResult<PyWindowIterator> {
+        let step = resolve_duration_us("step", step_s, step_ms, step_us, step_ns)?;
+        let span = resolve_duration_us("span", span_s, span_ms, span_us, span_ns)?;
         let guard = self.inner.lock().unwrap();
         let (lo, hi) = guard.time_span();
         let n_events = guard.n_events();
         drop(guard);
-        if let (None, None, Some(SliceMode::Count(len))) = (step_ms, span_ms, self.mode) {
+        if let (None, None, Some(SliceMode::Count(len))) = (step, span, self.mode) {
             return Ok(self.window_iterator(WindowCursor::Index {
                 next: self.base_index,
                 len,
                 total: n_events,
             }));
         }
-        let step_us = match step_ms {
-            Some(ms) if ms.is_nan() || ms <= 0.0 => {
-                return Err(PyValueError::new_err("step_ms must be positive"))
-            }
-            Some(ms) => ms_to_us(ms).max(1),
+        let step_us = match step {
+            Some(step) => step,
             None => match self.mode {
                 Some(SliceMode::Duration(dt)) => dt,
                 _ => {
                     return Err(PyValueError::new_err(
-                        "windows() needs step_ms, or open the file with dt_ms",
+                        "windows() needs a step, or open the file with dt_ms",
                     ))
                 }
             },
         };
-        let span_us = match span_ms {
-            Some(ms) if ms.is_nan() || ms <= 0.0 => {
-                return Err(PyValueError::new_err("span_ms must be positive"))
-            }
-            Some(ms) => ms_to_us(ms).max(1),
-            None => step_us,
-        };
+        let span_us = span.unwrap_or(step_us);
         Ok(self.window_iterator(WindowCursor::Time {
             next: self.origin(lo),
             step_us,
@@ -1538,6 +1855,38 @@ impl PyEventReader {
 }
 
 impl PyEventReader {
+    /// Converts the whole recording to `path` without materialising it: events are read in
+    /// index chunks and appended as they arrive, with the reader's deferred ops and hot-pixel
+    /// mask applied to each chunk exactly as `slice` would.
+    ///
+    /// Only the E2VID interchange streams today; the round-tripping formats are written from an
+    /// `EventStream`, so those say so rather than quietly loading a file that may not fit.
+    fn save_streaming(&self, py: Python<'_>, path: &str, format: Option<&str>) -> PyResult<()> {
+        if !eventcv_core::io::is_e2vid_target(path, format) {
+            return Err(PyValueError::new_err(format!(
+                "saving a whole EventReader streams only to E2VID (.zip, or format=\"e2vid\"); \
+                 for {path} save a slice — eventcv.save(reader.slice(0), {path:?})"
+            )));
+        }
+        let total = self.inner.lock().unwrap().n_events();
+        let mut writer = eventcv_core::io::E2vidWriter::create(path).map_err(map_io_error)?;
+        let mut start = self.base_index;
+        while start < total {
+            let end = (start + EXPORT_CHUNK).min(total);
+            let stream = fetch_window(
+                py,
+                &self.inner,
+                SliceWindow::Index(start, end),
+                self.slice_ops.clone(),
+                self.hot_pixel_mask.clone(),
+            )?;
+            py.detach(|| writer.append(&stream)).map_err(map_io_error)?;
+            start = end;
+            py.check_signals()?; // a multi-GB conversion has to stay interruptible
+        }
+        py.detach(|| writer.finish()).map_err(map_io_error)
+    }
+
     /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
     /// applying the per-slice op (e.g. `efast`) if one is set.
     fn fetch(&self, py: Python<'_>, window: SliceWindow) -> PyResult<PyEventStream> {
@@ -1735,11 +2084,15 @@ impl PyWindowIterator {
     }
 }
 
-/// Saves an `EventStream` or `EventFrame` to `path` (format by extension) — the OpenCV-style
-/// free-function form of `obj.save(path)`. `topic` names the rosbag connection; `colormap` /
-/// `normalize` apply only to `.png` frame export.
+/// Saves an `EventStream`, `EventFrame`, or `EventReader` to `path` (format by extension) — the
+/// OpenCV-style free-function form of `obj.save(path)`. `topic` names the rosbag connection;
+/// `colormap` / `normalize` apply only to `.png` frame export; `format` overrides the extension
+/// (`"e2vid"` writes E2VID's `t x y p` seconds layout to a `.txt`, which `.zip` already implies).
+///
+/// An `EventReader` is converted **window by window**, so a recording far larger than memory can
+/// be re-exported without loading it.
 #[pyfunction]
-#[pyo3(signature = (obj, path, *, topic=None, colormap="viridis", normalize=true))]
+#[pyo3(signature = (obj, path, *, topic=None, colormap="viridis", normalize=true, format=None))]
 fn save(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
@@ -1747,10 +2100,12 @@ fn save(
     topic: Option<String>,
     colormap: &str,
     normalize: bool,
+    format: Option<String>,
 ) -> PyResult<()> {
     if let Ok(stream) = obj.extract::<PyRef<PyEventStream>>() {
         let options = SaveOptions {
             topic,
+            format,
             ..SaveOptions::default()
         };
         let inner = &stream.inner; // capture a plain &EventStream, not the GIL-bound PyRef
@@ -1762,6 +2117,7 @@ fn save(
         let options = SaveOptions {
             colormap: parse_colormap(colormap)?,
             normalize: Some(normalize),
+            format,
             ..SaveOptions::default()
         };
         let inner = &frame.inner;
@@ -1769,8 +2125,11 @@ fn save(
             .detach(|| eventcv_core::io::save_frame(path, inner, &options))
             .map_err(map_io_error);
     }
+    if let Ok(reader) = obj.extract::<PyRef<PyEventReader>>() {
+        return reader.save_streaming(py, path, format.as_deref());
+    }
     Err(PyTypeError::new_err(
-        "save expects an EventStream or EventFrame",
+        "save expects an EventStream, EventFrame, or EventReader",
     ))
 }
 
@@ -1805,7 +2164,12 @@ fn rect_mask(
     height: f64,
 ) -> PyResult<Bound<'_, PyArray2<bool>>> {
     let (w, h) = parse_mask_size(sensor_size)?;
-    mask_to_py(py, eventcv_core::mask::rect(w, h, x0, y0, width, height), w, h)
+    mask_to_py(
+        py,
+        eventcv_core::mask::rect(w, h, x0, y0, width, height),
+        w,
+        h,
+    )
 }
 
 /// Builds the ROI mask keeping the ellipse centred on `(cx, cy)` with semi-axes `rx`, `ry`.
@@ -1927,10 +2291,13 @@ impl PyEventSink {
     fn new(path: &str, compression: Option<u8>) -> PyResult<Self> {
         if let Some(level) = compression {
             if level > 9 {
-                return Err(PyValueError::new_err("compression must be a gzip level in 0..=9"));
+                return Err(PyValueError::new_err(
+                    "compression must be a gzip level in 0..=9",
+                ));
             }
         }
-        let inner = eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
+        let inner =
+            eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
         Ok(Self { inner: Some(inner) })
     }
 
@@ -2124,23 +2491,23 @@ impl ReprSpec {
                     })
                     .transpose()?
                     .unwrap_or(9),
-                window_ms: window_ms.unwrap_or(30.0),
+                window_ms: window_ms.unwrap_or(DEFAULT_SPAN_MS),
             },
             "tsurf" => Self::TimeSurface {
-                tau_ms: tau_ms.unwrap_or(30.0),
+                tau_ms: tau_ms.unwrap_or(DEFAULT_SPAN_MS),
             },
             "atsurf" => Self::AveragedTimeSurface {
-                tau_ms: tau_ms.unwrap_or(30.0),
+                tau_ms: tau_ms.unwrap_or(DEFAULT_SPAN_MS),
             },
             "tencode" => Self::Tencode {
-                window_ms: window_ms.unwrap_or(30.0),
+                window_ms: window_ms.unwrap_or(DEFAULT_SPAN_MS),
             },
             "countmask" => Self::CountMask {
                 pct: pct.unwrap_or(99.0),
                 white_frame: white_frame.unwrap_or(false),
             },
             "mcts" => Self::Mcts {
-                max_window_ms: max_window_ms.unwrap_or(30.0),
+                max_window_ms: max_window_ms.unwrap_or(DEFAULT_SPAN_MS),
             },
             "flow" => Self::Flow {
                 window: window
@@ -2224,23 +2591,26 @@ struct PyFeast {
 #[pymethods]
 impl PyFeast {
     #[new]
-    #[pyo3(signature = (n_features=100, patch=11, tau_ms=30.0, eta=0.001, delta_i=0.001,
-        delta_e=0.003, per_polarity=true, seed=0))]
+    #[pyo3(signature = (n_features=100, patch=11, tau_ms=None, eta=0.001, delta_i=0.001,
+        delta_e=0.003, per_polarity=true, seed=0, *, tau_s=None, tau_us=None, tau_ns=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         n_features: usize,
         patch: usize,
-        tau_ms: f64,
+        tau_ms: Option<f64>,
         eta: f32,
         delta_i: f32,
         delta_e: f32,
         per_polarity: bool,
         seed: u64,
+        tau_s: Option<f64>,
+        tau_us: Option<f64>,
+        tau_ns: Option<f64>,
     ) -> PyResult<Self> {
         let config = FeastConfig {
             n_features,
             patch,
-            tau_ms,
+            tau_ms: resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS),
             eta,
             delta_i,
             delta_e,
@@ -2555,9 +2925,7 @@ fn run_live_threaded(
 
     let result = match mode {
         LiveMode::Show => viewer::run_live(producer, width, height, title).map(|()| None),
-        LiveMode::Draw => {
-            viewer::draw_mask(producer, width as usize, height as usize, title)
-        }
+        LiveMode::Draw => viewer::draw_mask(producer, width as usize, height as usize, title),
     };
 
     // Stop the drain thread and reclaim the capture.
@@ -2572,12 +2940,27 @@ fn run_live_threaded(
     (capture, result)
 }
 
-/// Warns (once per overflow edge) that the driver's ring buffer overflowed and dropped events.
+/// How often the overflow warning may repeat. A camera that outruns the host overflows on window
+/// after window, so warning per occurrence buries everything else the program prints; the count on
+/// `EventCamera.n_overflows` is the complete record.
+#[cfg(feature = "camera")]
+const OVERFLOW_WARNING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Warns that the driver's ring buffer overflowed and dropped events, at most once every
+/// [`OVERFLOW_WARNING_INTERVAL`].
 #[cfg(feature = "camera")]
 fn note_overflow() {
+    static LAST_WARNING: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut last = LAST_WARNING.lock().unwrap();
+    if last.is_some_and(|last| now.duration_since(last) < OVERFLOW_WARNING_INTERVAL) {
+        return;
+    }
+    *last = Some(now);
     eprintln!(
         "eventcv: camera ring buffer overflowed — some events were dropped \
-         (lower the event rate, increase dt_ms, or process each window faster)"
+         (lower the event rate, increase dt_ms, or process each window faster). \
+         Further overflows are counted in EventCamera.n_overflows rather than printed."
     );
 }
 
@@ -2616,7 +2999,9 @@ impl Recorder {
     /// camera is opened — and with the same error whether or not a device is attached.
     fn validate(path: &str, compression: Option<u8>) -> PyResult<()> {
         if compression.is_some_and(|level| level > 9) {
-            return Err(PyValueError::new_err("compression must be a gzip level in 0..=9"));
+            return Err(PyValueError::new_err(
+                "compression must be a gzip level in 0..=9",
+            ));
         }
         if !eventcv_core::io::supports_event_append(path) {
             return Err(PyValueError::new_err(format!(
@@ -2691,6 +3076,13 @@ struct PyEventCamera {
     sensor_size: (usize, usize),
     // The ROI mask the capture is filtering through, mirrored here for the same reason.
     mask: Option<Vec<bool>>,
+    // The `stream(roi=…)` rectangle and where it is enforced, cached for the same reason.
+    roi: Option<(
+        (usize, usize, usize, usize),
+        eventcv_core::device::RoiPlacement,
+    )>,
+    // The `stream(record=…)` file, kept so `record()` can refuse to split the recording in two.
+    record_path: Option<String>,
     // Skips and overflows from pumps already stopped, so the counters survive a `show()` round trip.
     skipped: usize,
     overflows: usize,
@@ -2751,9 +3143,9 @@ impl PyEventCamera {
     /// Assign one to change it mid-session (`camera.mask = eventcv.circle_mask(...)`, or `None` to
     /// clear it); `stream(mask=…)` sets it at open. Masked events are dropped **as they are
     /// decoded**, so they never reach a `record=` file, the windows a loop reads, or `show()` —
-    /// and they cost nothing downstream. Unlike `stream(roi=…)`, which blocks pixels on-chip on
-    /// Prophesee sensors only, this is enforced on the host, so it works on any camera and takes
-    /// any shape.
+    /// and they cost nothing downstream. Where `stream(roi=…)` is a rectangle, blocked on-chip
+    /// wherever the sensor can do it, this is any shape and always enforced on the host — so it can
+    /// be changed while the camera runs.
     #[getter]
     fn mask<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<bool>>>> {
         let (width, height) = self.sensor_size;
@@ -2771,14 +3163,37 @@ impl PyEventCamera {
         self.apply_mask(mask)
     }
 
+    /// The `stream(roi=…)` rectangle, as `{"rect": (x0, y0, width, height), "applied": …}` — or
+    /// `None` when the whole sensor is in use.
+    ///
+    /// `applied` is `"hardware"` when the sensor is blocking those pixels on-chip (they cost no USB
+    /// bandwidth, no decoding, and nothing downstream) or `"host"` when eventcv is filtering them as
+    /// they are decoded, because this sensor has no region masks. Both drop the same events; only
+    /// the saving differs. Unlike `mask`, this is fixed when the camera is opened — the sensor
+    /// writes its region masks during the opening handshake.
+    #[getter]
+    fn roi(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let Some((rect, placement)) = self.roi else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("rect", rect)?;
+        dict.set_item(
+            "applied",
+            match placement {
+                eventcv_core::device::RoiPlacement::Hardware => "hardware",
+                eventcv_core::device::RoiPlacement::Host => "host",
+            },
+        )?;
+        Ok(Some(dict.unbind()))
+    }
+
     /// Events written so far by `stream(record=…)` (`0` when the camera isn't recording).
     #[getter]
     fn n_recorded(&self) -> usize {
         match &self.state {
             CameraState::Pumping(pump) => pump.n_recorded(),
-            CameraState::Idle { recorder, .. } => {
-                recorder.as_ref().map_or(0, Recorder::n_events)
-            }
+            CameraState::Idle { recorder, .. } => recorder.as_ref().map_or(0, Recorder::n_events),
             CameraState::Closed => 0,
         }
     }
@@ -2886,7 +3301,14 @@ impl PyEventCamera {
         colormap: &str,
         normalize: bool,
     ) -> PyResult<()> {
-        self.live(py, representation, decay_ms, colormap, normalize, LiveMode::Show)?;
+        self.live(
+            py,
+            representation,
+            decay_ms,
+            colormap,
+            normalize,
+            LiveMode::Show,
+        )?;
         Ok(())
     }
 
@@ -2912,7 +3334,14 @@ impl PyEventCamera {
         // cancelled, replaced if it isn't.
         let previous = self.mask.clone();
         self.apply_mask(None)?;
-        let drawn = self.live(py, representation, decay_ms, colormap, normalize, LiveMode::Draw)?;
+        let drawn = self.live(
+            py,
+            representation,
+            decay_ms,
+            colormap,
+            normalize,
+            LiveMode::Draw,
+        )?;
         let Some(mask) = drawn else {
             self.apply_mask(previous)?;
             return Ok(None);
@@ -2941,6 +3370,14 @@ impl PyEventCamera {
         seconds: Option<f64>,
         compression: Option<u8>,
     ) -> PyResult<usize> {
+        // Both write the same windows, so running them together would tear the recording in two:
+        // everything captured here would be missing from the `stream(record=…)` file.
+        if let Some(open) = &self.record_path {
+            return Err(PyValueError::new_err(format!(
+                "this camera is already recording to {open:?} (from stream(record=…)); close it \
+                 first, or drop record= from stream() and use camera.record({path:?}) alone"
+            )));
+        }
         #[cfg(feature = "hdf5")]
         if eventcv_core::io::supports_event_append(path) {
             return self.record_streaming(py, path, seconds, compression);
@@ -3078,16 +3515,12 @@ impl PyEventCamera {
 
     /// Stops the pump, closes the device, and finishes a `stream(record=…)` file if one is open.
     /// Idempotent; further use raises.
+    ///
+    /// Dropping the camera does the same thing, so a throwaway `eventcv.stream(...)` still releases
+    /// the device and closes its recording — but only at whatever point Python collects it. Call
+    /// this (or use `with eventcv.stream(...) as camera:`) to control when that happens.
     fn close(&mut self) -> PyResult<()> {
-        self.park(); // joins the pump thread, handing the recording back
-        let recorder = match std::mem::replace(&mut self.state, CameraState::Closed) {
-            CameraState::Idle { recorder, .. } => recorder,
-            _ => None,
-        };
-        if let Some(recorder) = recorder {
-            recorder.finish().map_err(map_io_error)?;
-        }
-        Ok(())
+        self.shutdown().map_err(map_io_error)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -3106,8 +3539,58 @@ impl PyEventCamera {
     }
 }
 
+/// Releases the camera when Python drops it without `close()` — a throwaway
+/// `eventcv.stream(...).record(...)` is the common case. Without this the `Recorder` was dropped
+/// with its last events unflushed and its file left to `hdf5`'s own teardown, and the USB device
+/// was released at whatever point the pyclass happened to be collected.
+#[cfg(feature = "camera")]
+impl Drop for PyEventCamera {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            eprintln!("eventcv: closing the camera's recording failed: {error}");
+        }
+    }
+}
+
+/// Seals the partial window a stopped capture was still filling and takes anything else it had
+/// queued — the tail a recording keeps when the session ends. A decode pass can seal several
+/// windows while the consumer takes one per call, so this drains rather than popping once.
+#[cfg(feature = "camera")]
+fn drain_tail(
+    capture: &mut eventcv_core::device::Capture,
+) -> Vec<eventcv_core::device::CaptureWindow> {
+    let mut tail: Vec<_> = capture.finish().into_iter().collect();
+    while let Some(window) = capture.take_pending() {
+        tail.push(window);
+    }
+    tail
+}
+
 #[cfg(feature = "camera")]
 impl PyEventCamera {
+    /// Shared body of [`close`](Self::close) and [`Drop`]: stop the pump, seal the trailing window
+    /// into the recording, close the file, and release the device — in that order, so the last
+    /// events reach disk and the USB claim is dropped before anything can fail. Idempotent.
+    fn shutdown(&mut self) -> Result<(), IoError> {
+        self.park(); // joins the pump thread, handing the camera and recording back
+        let (capture, recorder) = match std::mem::replace(&mut self.state, CameraState::Closed) {
+            CameraState::Idle { capture, recorder } => (Some(capture), recorder),
+            _ => (None, None),
+        };
+        let mut capture = capture;
+        let tail = capture.as_mut().map(drain_tail).unwrap_or_default();
+        drop(capture); // release the device before touching the file
+        let Some(mut recorder) = recorder else {
+            return Ok(());
+        };
+        let appended = tail
+            .iter()
+            .try_for_each(|window| recorder.append(&window.stream));
+        // Close the file even if that last append failed: a short flushed recording beats a
+        // half-written one, and the append error is the one reported.
+        appended.and(recorder.finish())
+    }
+
     fn open_check(&self) -> PyResult<()> {
         match self.state {
             CameraState::Closed => Err(PyRuntimeError::new_err("camera is closed")),
@@ -3164,6 +3647,22 @@ impl PyEventCamera {
         let default_decay = self.decay_ms;
         let stored_repr = self.repr;
         let colormap_value = parse_colormap(colormap)?;
+        // The viewer decodes on a wall-clock budget and drops the surplus to hold ~60 FPS, so
+        // feeding the recording from it would write a file full of holes. The recording pauses
+        // instead — say so, rather than let a session come back short.
+        if let Some(path) = &self.record_path {
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+                std::ffi::CString::new(format!(
+                    "the recording to {path} is paused while the live viewer is open — the viewer \
+                     drops events to keep up, so archiving through it would be lossy. Events \
+                     during this period are not saved"
+                ))?
+                .as_c_str(),
+                1,
+            )?;
+        }
         // Take ownership so the capture can move onto the viewer's own drain thread; it is restored
         // into `self` when the viewer closes, so the camera stays usable afterwards.
         self.park();
@@ -3278,6 +3777,24 @@ impl PyEventCamera {
         let capture = self.parked_capture()?;
         let mut sink =
             eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
+        // The loop is kept separate so the sink is flushed and closed on *both* exits: a write
+        // error used to return through `?` and drop it unfinished, losing the last second.
+        let result = Self::fill_sink(py, capture, &mut sink, seconds);
+        let count = sink.n_events();
+        let closed = py.detach(|| sink.finish()).map_err(map_io_error);
+        result?; // the error that ended the recording is the one worth raising
+        closed?;
+        Ok(count)
+    }
+
+    /// Polls the camera into `sink` until the deadline or `Ctrl+C`, flushing about once a second.
+    #[cfg(feature = "hdf5")]
+    fn fill_sink(
+        py: Python<'_>,
+        capture: &mut eventcv_core::device::Capture,
+        sink: &mut eventcv_core::io::Hdf5EventSink,
+        seconds: Option<f64>,
+    ) -> PyResult<()> {
         let deadline =
             seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
         let mut last_flush = std::time::Instant::now();
@@ -3287,7 +3804,8 @@ impl PyEventCamera {
                     if window.first_after_overflow {
                         note_overflow();
                     }
-                    py.detach(|| sink.append(&window.stream)).map_err(map_io_error)?;
+                    py.detach(|| sink.append(&window.stream))
+                        .map_err(map_io_error)?;
                 }
                 Ok(None) => {}
                 Err(message) => return Err(PyRuntimeError::new_err(message)),
@@ -3306,9 +3824,13 @@ impl PyEventCamera {
                 break;
             }
         }
-        let count = sink.n_events();
-        py.detach(|| sink.finish()).map_err(map_io_error)?;
-        Ok(count)
+        // The recording ends here, so the window still filling belongs in it — without this the
+        // file stopped at the last whole `dt_ms` boundary and dropped up to one window of events.
+        for window in drain_tail(capture) {
+            py.detach(|| sink.append(&window.stream))
+                .map_err(map_io_error)?;
+        }
+        Ok(())
     }
 
     /// Buffers the whole recording in memory and writes it once at the end via `save_stream`. Used
@@ -3349,6 +3871,17 @@ impl PyEventCamera {
             // Ctrl+C stops the recording and saves what was captured, rather than discarding it.
             if py.check_signals().is_err() {
                 break;
+            }
+        }
+        // The recording ends here, so the window still filling belongs in it.
+        for window in drain_tail(capture) {
+            for event in window.stream.iter() {
+                builder.push(
+                    event.x as u16,
+                    event.y as u16,
+                    event.timestamp as i64,
+                    event.polarity,
+                );
             }
         }
         let count = builder.len();
@@ -3494,8 +4027,9 @@ fn parse_bias_limits(value: &Bound<'_, PyAny>) -> PyResult<eventcv_core::bias::B
 #[cfg(feature = "camera")]
 #[pyfunction]
 fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
-    let cameras =
-        py.detach(eventcv_core::device::list_cameras).map_err(PyRuntimeError::new_err)?;
+    let cameras = py
+        .detach(eventcv_core::device::list_cameras)
+        .map_err(PyRuntimeError::new_err)?;
     cameras
         .into_iter()
         .map(|info| {
@@ -3526,22 +4060,37 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 #[cfg(feature = "camera")]
 #[pyfunction]
 #[pyo3(signature = (
-    serial=None, *, dt_ms=None, max_events=None, repr=None, bins=None, window_ms=None, tau_ms=None,
-    max_window_ms=None, window=None, normalize=None, pct=None, white_frame=None, record=None,
-    compression=None, latest=false,
-    max_event_rate=None, roi=None, mask=None, adaptive_bias=None, decay_ms=30.0
+    serial=None, *, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None, max_events=None, repr=None,
+    bins=None, window_ms=None, window_s=None, window_us=None, window_ns=None,
+    tau_ms=None, tau_s=None, tau_us=None, tau_ns=None,
+    max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None,
+    window=None, normalize=None, pct=None, white_frame=None, record=None,
+    compression=None, latest=false, max_event_rate=None, roi=None, mask=None, adaptive_bias=None,
+    decay_ms=None, decay_s=None, decay_us=None, decay_ns=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stream(
     py: Python<'_>,
     serial: Option<String>,
     dt_ms: Option<f64>,
+    dt_s: Option<f64>,
+    dt_us: Option<f64>,
+    dt_ns: Option<f64>,
     max_events: Option<usize>,
     repr: Option<String>,
     bins: Option<i64>,
     window_ms: Option<f64>,
+    window_s: Option<f64>,
+    window_us: Option<f64>,
+    window_ns: Option<f64>,
     tau_ms: Option<f64>,
+    tau_s: Option<f64>,
+    tau_us: Option<f64>,
+    tau_ns: Option<f64>,
     max_window_ms: Option<f64>,
+    max_window_s: Option<f64>,
+    max_window_us: Option<f64>,
+    max_window_ns: Option<f64>,
     window: Option<i64>,
     normalize: Option<bool>,
     pct: Option<f64>,
@@ -3553,15 +4102,19 @@ fn stream(
     roi: Option<(i64, i64, i64, i64)>,
     mask: Option<&Bound<'_, PyAny>>,
     adaptive_bias: Option<&Bound<'_, PyAny>>,
-    decay_ms: f64,
+    decay_ms: Option<f64>,
+    decay_s: Option<f64>,
+    decay_us: Option<f64>,
+    decay_ns: Option<f64>,
 ) -> PyResult<PyEventCamera> {
-    let windowing = match (dt_ms, max_events) {
-        (Some(_), Some(_)) => {
-            return Err(PyValueError::new_err("pass dt_ms or max_events, not both"))
-        }
+    let dt = resolve_duration_us("dt", dt_s, dt_ms, dt_us, dt_ns)?.map(|us| us as f64 / 1000.0);
+    let decay_ms =
+        resolve_ms("decay", decay_s, decay_ms, decay_us, decay_ns)?.unwrap_or(DEFAULT_SPAN_MS);
+    let windowing = match (dt, max_events) {
+        (Some(_), Some(_)) => return Err(PyValueError::new_err("pass dt or max_events, not both")),
         (Some(dt), None) => eventcv_core::device::Window::Duration(dt),
         (None, Some(count)) => eventcv_core::device::Window::Count(count),
-        (None, None) => eventcv_core::device::Window::Duration(30.0),
+        (None, None) => eventcv_core::device::Window::Duration(DEFAULT_SPAN_MS),
     };
     let repr = match repr.as_deref() {
         None | Some("raw") => None,
@@ -3577,9 +4130,16 @@ fn stream(
             Some(ReprSpec::new(
                 name,
                 bins,
-                window_ms.or(span),
-                tau_ms.or(span),
-                max_window_ms.or(span),
+                resolve_ms("window", window_s, window_ms, window_us, window_ns)?.or(span),
+                resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.or(span),
+                resolve_ms(
+                    "max_window",
+                    max_window_s,
+                    max_window_ms,
+                    max_window_us,
+                    max_window_ns,
+                )?
+                .or(span),
                 window,
                 normalize,
                 pct,
@@ -3606,15 +4166,43 @@ fn stream(
     let mut capture = py
         .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing, limits, bias))
         .map_err(PyRuntimeError::new_err)?;
+    // A `roi=` this sensor can't block on-chip is honoured as a host-side mask instead — the same
+    // events are dropped, but they still cross the cable, so say so rather than let the caller
+    // believe the source was capped.
+    if let Some((rect, eventcv_core::device::RoiPlacement::Host)) = capture.roi() {
+        let (x0, y0, width, height) = rect;
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+            std::ffi::CString::new(format!(
+                "roi=({x0}, {y0}, {width}, {height}) is filtered on the host: the {} has no \
+                 on-chip region masks, so those events are still sent over USB and decoded before \
+                 being dropped",
+                capture.name(),
+            ))?
+            .as_c_str(),
+            1,
+        )?;
+    }
     let mask = match mask {
         Some((flat, width, height)) => {
             check_mask_sensor((width, height), (capture.width(), capture.height()))?;
+            // The host-side `roi=` fallback also arrives as a capture mask; combine rather than
+            // replace, so `roi=` and `mask=` together keep only what both allow.
+            let flat = match capture.mask() {
+                Some(existing) => existing
+                    .iter()
+                    .zip(&flat)
+                    .map(|(&a, &b)| a && b)
+                    .collect::<Vec<bool>>(),
+                None => flat,
+            };
             capture
                 .set_mask(Some(flat.clone()))
                 .map_err(PyRuntimeError::new_err)?;
             Some(flat)
         }
-        None => None,
+        None => capture.mask().map(<[bool]>::to_vec),
     };
     // Created only now, so a failed camera open never leaves an empty recording behind.
     #[cfg(feature = "hdf5")]
@@ -3629,6 +4217,8 @@ fn stream(
         serial: capture.serial().to_owned(),
         sensor_size: (capture.width(), capture.height()),
         mask,
+        roi: capture.roi(),
+        record_path: recorder.as_ref().and(record),
         state: CameraState::Idle { capture, recorder },
         repr,
         decay_ms,
@@ -3640,6 +4230,85 @@ fn stream(
         skipped: 0,
         overflows: 0,
     })
+}
+
+/// Records a camera to `path` in one call: opens the first (or `serial`-selected) device, captures
+/// for `seconds`, closes it, and returns the number of events saved.
+///
+/// The one-shot form of `stream(...).record(...)`, and the one to prefer when a script only wants a
+/// file: the camera is closed before this returns, so the recording is complete and the device is
+/// free the moment the next line runs. Everything `stream` takes about *what the sensor sends*
+/// (`dt_ms`, `roi`, `mask`, `max_event_rate`, `adaptive_bias`) applies; the viewer and
+/// representation options do not, since nothing is displayed.
+#[cfg(feature = "camera")]
+#[pyfunction]
+#[pyo3(signature = (
+    path, *, seconds=None, serial=None, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None,
+    max_events=None, compression=None, max_event_rate=None, roi=None, mask=None, adaptive_bias=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn record(
+    py: Python<'_>,
+    path: &str,
+    seconds: Option<f64>,
+    serial: Option<String>,
+    dt_ms: Option<f64>,
+    dt_s: Option<f64>,
+    dt_us: Option<f64>,
+    dt_ns: Option<f64>,
+    max_events: Option<usize>,
+    compression: Option<u8>,
+    max_event_rate: Option<f64>,
+    roi: Option<(i64, i64, i64, i64)>,
+    mask: Option<&Bound<'_, PyAny>>,
+    adaptive_bias: Option<&Bound<'_, PyAny>>,
+) -> PyResult<usize> {
+    // Everything passed as `None` here is one of `stream`'s representation, viewer, or own-recorder
+    // options — all off, because this call archives raw events and displays nothing.
+    let mut camera = stream(
+        py,
+        serial,
+        dt_ms,
+        dt_s,
+        dt_us,
+        dt_ns,
+        max_events,
+        /* repr */ None,
+        /* bins */ None,
+        /* window_* */ None,
+        None,
+        None,
+        None,
+        /* tau_* */ None,
+        None,
+        None,
+        None,
+        /* max_window_* */ None,
+        None,
+        None,
+        None,
+        /* window */ None,
+        /* normalize */ None,
+        /* pct */ None,
+        /* white_frame */ None,
+        /* record */ None,
+        /* compression */ None,
+        /* latest */ false,
+        max_event_rate,
+        roi,
+        mask,
+        adaptive_bias,
+        /* decay_* */ None,
+        None,
+        None,
+        None,
+    )?;
+    let recorded = camera.record(py, path, seconds, compression);
+    // Close before raising, so a failed recording still releases the device.
+    let closed = camera.close();
+    let count = recorded?;
+    closed?;
+    Ok(count)
 }
 
 #[pymodule]
@@ -3673,6 +4342,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyEventCamera>()?;
         m.add_function(wrap_pyfunction!(list_cameras, m)?)?;
         m.add_function(wrap_pyfunction!(stream, m)?)?;
+        m.add_function(wrap_pyfunction!(record, m)?)?;
     }
     Ok(())
 }
