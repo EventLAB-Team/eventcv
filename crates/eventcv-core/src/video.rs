@@ -226,18 +226,48 @@ impl FfmpegEncoder {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "writing .mp4 needs ffmpeg on PATH (macOS: `brew install ffmpeg`, \
-                         Debian/Ubuntu: `apt install ffmpeg`, conda: `conda install -c conda-forge \
-                         ffmpeg`). Write .gif or .apng instead to avoid the dependency.",
-                    )
-                } else {
-                    error
-                }
+                missing_ffmpeg(
+                    error,
+                    "writing .mp4 needs ffmpeg on PATH",
+                    "Write .gif or .apng instead to avoid the dependency.",
+                )
             })?;
         Ok(Self { child })
+    }
+}
+
+/// Rewrites a spawn failure into an actionable message when `ffmpeg` simply is not installed.
+///
+/// Shared by the encoder and the decoder because "command not found" is the overwhelmingly common
+/// failure for both, and the bare `NotFound` the OS returns names neither the tool nor the fix.
+/// `alternative` is the way out specific to the caller — there is one for writing, none for reading.
+fn missing_ffmpeg(error: std::io::Error, what: &str, alternative: &str) -> std::io::Error {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return error;
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "{what} (macOS: `brew install ffmpeg`, Debian/Ubuntu: `apt install ffmpeg`, \
+             conda: `conda install -c conda-forge ffmpeg`). {alternative}"
+        )
+        .trim_end()
+        .to_owned(),
+    )
+}
+
+/// Waits for a finished ffmpeg and turns a non-zero exit into an error.
+///
+/// Its stderr is inherited rather than captured, so the diagnostics have already reached the user's
+/// terminal by the time this runs — hence pointing at them rather than repeating them.
+fn wait_for_ffmpeg(child: &mut Child) -> std::io::Result<()> {
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "ffmpeg exited with {status} — its error output is above"
+        )))
     }
 }
 
@@ -252,15 +282,188 @@ impl AnimationEncoder for FfmpegEncoder {
     fn finish(mut self: Box<Self>) -> std::io::Result<()> {
         // Closing stdin is what tells ffmpeg the stream ended; without it, wait() deadlocks.
         drop(self.child.stdin.take());
-        let status = self.child.wait()?;
-        if status.success() {
-            Ok(())
+        wait_for_ffmpeg(&mut self.child)
+    }
+}
+
+/// What `ffprobe` reports about a video before any of it is decoded.
+///
+/// Raw `rgb24` on a pipe carries no framing at all — just a byte stream — so the decoder cannot know
+/// where one frame ends without being told the dimensions first. That is the only reason this exists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoInfo {
+    pub width: usize,
+    pub height: usize,
+    pub fps: f64,
+}
+
+impl VideoInfo {
+    /// Probes `path` with `ffprobe`.
+    pub fn probe(path: &Path) -> std::io::Result<Self> {
+        let output = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=width,height,r_frame_rate"])
+            .args(["-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .map_err(|error| missing_ffmpeg(error, "reading video needs ffmpeg on PATH", ""))?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "ffprobe could not read {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Self::parse(&String::from_utf8_lossy(&output.stdout), path)
+    }
+
+    /// Parses ffprobe's `width,height,num/den` CSV. Split out so the parsing is testable without
+    /// having ffprobe installed.
+    fn parse(text: &str, path: &Path) -> std::io::Result<Self> {
+        let malformed = || {
+            std::io::Error::other(format!(
+                "could not read the video stream of {} — is it a video file?",
+                path.display()
+            ))
+        };
+        let line = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(malformed)?;
+        let mut fields = line.trim().split(',');
+        let width: usize = fields
+            .next()
+            .ok_or_else(malformed)?
+            .trim()
+            .parse()
+            .map_err(|_| malformed())?;
+        let height: usize = fields
+            .next()
+            .ok_or_else(malformed)?
+            .trim()
+            .parse()
+            .map_err(|_| malformed())?;
+        // The frame rate is a rational like `30000/1001`, not a decimal.
+        let rate = fields.next().ok_or_else(malformed)?.trim();
+        let (num, den) = rate.split_once('/').unwrap_or((rate, "1"));
+        let num: f64 = num.parse().map_err(|_| malformed())?;
+        let den: f64 = den.parse().unwrap_or(1.0);
+        let fps = if den > 0.0 && num > 0.0 {
+            num / den
         } else {
-            Err(std::io::Error::other(format!(
-                "ffmpeg exited with {status} — its error output is above"
-            )))
+            30.0
+        };
+        if width == 0 || height == 0 {
+            return Err(malformed());
+        }
+        Ok(Self { width, height, fps })
+    }
+}
+
+/// Decodes a video into [`Rgb8Image`] frames by pulling raw `rgb24` from a system `ffmpeg`.
+///
+/// The mirror of [`FfmpegEncoder`], and deliberately a *pulling* iterator rather than a callback:
+/// the simulator consumes frames in pairs and needs to hold one back, which a push API makes awkward.
+pub struct FfmpegDecoder {
+    child: Child,
+    info: VideoInfo,
+    frame_bytes: usize,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl FfmpegDecoder {
+    /// Opens `path` for decoding. `scale` optionally resizes on the way out, which is far cheaper
+    /// than decoding at full resolution and downsampling afterwards.
+    pub fn open(path: &Path, scale: Option<(usize, usize)>) -> std::io::Result<Self> {
+        let probed = VideoInfo::probe(path)?;
+        let info = match scale {
+            Some((width, height)) if width > 0 && height > 0 => VideoInfo {
+                width,
+                height,
+                fps: probed.fps,
+            },
+            _ => probed,
+        };
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-hide_banner", "-loglevel", "error"])
+            .arg("-i")
+            .arg(path);
+        if scale.is_some() {
+            command.args(["-vf", &format!("scale={}:{}", info.width, info.height)]);
+        }
+        let child = command
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| missing_ffmpeg(error, "reading video needs ffmpeg on PATH", ""))?;
+        Ok(Self {
+            child,
+            info,
+            frame_bytes: info.width * info.height * 3,
+            buffer: vec![0; info.width * info.height * 3],
+            finished: false,
+        })
+    }
+
+    pub fn info(&self) -> VideoInfo {
+        self.info
+    }
+
+    /// Pulls the next frame, or `None` at the end of the stream.
+    ///
+    /// A partial read at the end is treated as end-of-stream rather than an error: ffmpeg closing
+    /// the pipe mid-frame is how a truncated source presents, and there is nothing useful to do with
+    /// half a frame.
+    pub fn next_frame(&mut self) -> std::io::Result<Option<Rgb8Image>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let stdout = self.child.stdout.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ffmpeg stdout was closed")
+        })?;
+        match read_exact_or_eof(stdout, &mut self.buffer[..self.frame_bytes])? {
+            true => Ok(Some(Rgb8Image {
+                width: self.info.width,
+                height: self.info.height,
+                pixels: self.buffer[..self.frame_bytes].to_vec(),
+            })),
+            false => {
+                self.finished = true;
+                wait_for_ffmpeg(&mut self.child)?;
+                Ok(None)
+            }
         }
     }
+}
+
+impl Drop for FfmpegDecoder {
+    fn drop(&mut self) {
+        // A caller that stops early (`max_frames`) leaves ffmpeg writing into a pipe nobody reads.
+        // Killing it is the only way to avoid a process stuck on a full pipe buffer.
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Fills `buffer` completely, returning `false` if the stream ended before any byte was read.
+/// A short read after at least one byte is a truncated frame and reports end-of-stream too.
+fn read_exact_or_eof(reader: &mut impl std::io::Read, buffer: &mut [u8]) -> std::io::Result<bool> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 fn to_io_error<E: std::fmt::Display>(error: E) -> std::io::Error {
@@ -354,6 +557,85 @@ mod tests {
         assert_eq!(&bytes[..6], b"GIF89a");
         assert_eq!(bytes.last(), Some(&0x3B)); // trailer, so the file is complete
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn video_info_parses_ffprobe_csv() {
+        let path = Path::new("clip.mp4");
+        // Integer rate.
+        let info = VideoInfo::parse("64,48,30/1\n", path).unwrap();
+        assert_eq!((info.width, info.height), (64, 48));
+        assert!((info.fps - 30.0).abs() < 1e-9);
+        // NTSC rational — the case a naive `parse::<f64>()` gets wrong.
+        let ntsc = VideoInfo::parse("1920,1080,30000/1001", path).unwrap();
+        assert!((ntsc.fps - 29.97).abs() < 0.01);
+        // Bare rate with no denominator.
+        assert!((VideoInfo::parse("8,8,25", path).unwrap().fps - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn video_info_rejects_nonsense() {
+        let path = Path::new("notes.txt");
+        for text in ["", "\n", "not,a,video", "0,0,30/1"] {
+            assert!(VideoInfo::parse(text, path).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn decoder_reads_back_every_frame_it_was_given() {
+        // Round trip through the encoder so this needs no fixture on disk: write a known number of
+        // frames, decode them back, and check the count and dimensions survive.
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return; // covered by the encoder's own skip; nothing to assert without ffmpeg
+        }
+        let path = temp_path("roundtrip.mp4");
+        let mut encoder: Box<dyn AnimationEncoder + Send> =
+            Box::new(FfmpegEncoder::new(&path, 32, 24, Fps::new(10.0)).unwrap());
+        for shade in [0u8, 60, 120, 180, 240] {
+            encoder.write_frame(&frame(32, 24, shade)).unwrap();
+        }
+        encoder.finish().unwrap();
+
+        let mut decoder = FfmpegDecoder::open(&path, None).unwrap();
+        assert_eq!((decoder.info().width, decoder.info().height), (32, 24));
+        let mut decoded = 0;
+        while let Some(image) = decoder.next_frame().unwrap() {
+            assert_eq!(image.pixels.len(), 32 * 24 * 3);
+            decoded += 1;
+        }
+        assert_eq!(decoded, 5);
+        // Exhausted decoders keep returning None rather than erroring.
+        assert!(decoder.next_frame().unwrap().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn decoder_can_scale_on_the_way_out() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let path = temp_path("scaled.mp4");
+        let mut encoder: Box<dyn AnimationEncoder + Send> =
+            Box::new(FfmpegEncoder::new(&path, 64, 64, Fps::new(10.0)).unwrap());
+        encoder.write_frame(&frame(64, 64, 128)).unwrap();
+        encoder.finish().unwrap();
+
+        let mut decoder = FfmpegDecoder::open(&path, Some((16, 16))).unwrap();
+        let image = decoder.next_frame().unwrap().expect("one frame");
+        assert_eq!((image.width, image.height), (16, 16));
+        assert_eq!(image.pixels.len(), 16 * 16 * 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_exact_or_eof_reports_a_clean_end() {
+        let mut full = [0u8; 4];
+        assert!(read_exact_or_eof(&mut &b"abcd"[..], &mut full).unwrap());
+        assert_eq!(&full, b"abcd");
+        // Nothing at all is a clean end...
+        assert!(!read_exact_or_eof(&mut &b""[..], &mut full).unwrap());
+        // ...and so is a truncated frame, which is what a cut-off source looks like.
+        assert!(!read_exact_or_eof(&mut &b"ab"[..], &mut full).unwrap());
     }
 
     #[test]

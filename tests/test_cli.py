@@ -140,5 +140,58 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
 
+class SimulateCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    @unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg is not installed")
+    def test_simulate_writes_events_from_a_video(self):
+        import subprocess
+
+        source = self.dir / "clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+             "-i", "testsrc=size=32x24:rate=30:duration=1", "-pix_fmt", "yuv420p", str(source)],
+            check=True,
+        )
+        target = self.dir / "events.npz"
+        code, out, _ = _run("simulate", str(source), str(target))
+        self.assertEqual(code, 0)
+        self.assertIn("events", out)
+        events = eventcv.load(str(target))
+        self.assertGreater(len(events), 0)
+        self.assertEqual(events.sensor_size, (32, 24))
+
+    @unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg is not installed")
+    def test_simulate_flags_reach_the_simulator(self):
+        import subprocess
+
+        source = self.dir / "clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+             "-i", "testsrc=size=32x24:rate=30:duration=1", "-pix_fmt", "yuv420p", str(source)],
+            check=True,
+        )
+        # A high threshold must produce fewer events than a low one; if the flag were ignored the
+        # two runs would be identical.
+        counts = []
+        for threshold in ("0.5", "0.1"):
+            target = self.dir / f"t{threshold}.npz"
+            self.assertEqual(
+                _run("simulate", str(source), str(target), "--threshold", threshold, "-q")[0], 0
+            )
+            counts.append(len(eventcv.load(str(target))))
+        self.assertLess(counts[0], counts[1])
+
+    def test_a_missing_video_reports_an_error(self):
+        code, _, err = _run("simulate", "/nonexistent/clip.mp4", str(self.dir / "e.npz"))
+        self.assertEqual(code, 1)
+        self.assertIn("error:", err)
+        self.assertNotIn("Traceback", err)
+
+
 if __name__ == "__main__":
     unittest.main()

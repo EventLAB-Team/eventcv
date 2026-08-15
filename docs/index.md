@@ -14,11 +14,15 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
   ready for NumPy and PyTorch.
 - **Detect features** — corner detectors and the unsupervised, trainable
   {class}`~eventcv.FEAST` feature extractor (the event analogue of `features2d`).
+- **Estimate motion** — contrast maximisation to recover camera motion, and a tracker that follows
+  objects across frames.
 - **Augment** for training with seeded, reproducible random ops that compose straight into a
   PyTorch `DataLoader`.
 - **Visualise** — colormapped frames, animated `.gif` / `.apng` / `.mp4` export, and
   event-rate analytics.
 - **Run a model** — feed a representation to any ONNX network with {class}`~eventcv.Model`.
+- **Simulate** events from video with a v2e-grade sensor model, and **reconstruct** intensity video
+  back from events.
 - **Call it your way** — every operation is available both as a method
   (`stream.voxel()`) and as an OpenCV-style free function (`eventcv.voxel(stream)`).
 
@@ -30,7 +34,10 @@ quickstart
 representations
 augmentation
 feature-detection
+motion
 streaming
+simulation
+reconstruction
 video
 models
 cli
@@ -59,6 +66,7 @@ versioning roughly twenty standard datasets. EventCV reads files and builds tens
 a downloaded dataset and load its files with {func}`eventcv.load`, or use tonic end-to-end. There is
 no value in a second, worse copy of that.
 
-**A model zoo.** {class}`~eventcv.Model` runs any ONNX graph you give it, but EventCV ships no
+**A model zoo.** {class}`~eventcv.Model` runs any ONNX graph you give it — including the
+reconstruction networks in [Reconstruction](reconstruction.md) — but EventCV ships no
 architectures and no weights. Bundling them would mean tracking every upstream model's
 preprocessing forever; building the tensors correctly is the part that belongs here.

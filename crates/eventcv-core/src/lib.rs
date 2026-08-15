@@ -32,6 +32,7 @@ pub mod augment;
 pub mod bias;
 pub mod camera;
 pub mod cluster;
+pub mod cmax;
 #[cfg(feature = "camera")]
 pub mod device;
 pub mod feast;
@@ -44,7 +45,10 @@ pub mod mask;
 /// ONNX inference. Requires the `onnx` feature (on in the published wheels).
 #[cfg(feature = "onnx")]
 pub mod model;
+pub mod net;
 pub mod representation;
+pub mod simulate;
+pub mod track;
 pub mod transform;
 pub mod video;
 pub mod viz;

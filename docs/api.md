@@ -22,6 +22,18 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: collate
 ```
 
+## Simulation and reconstruction
+
+```{eval-rst}
+.. autofunction:: simulate
+.. autofunction:: reconstruct
+.. autoclass:: eventcv.StatefulModel
+   :members:
+```
+
+See :doc:`simulation` for the pixel model and :doc:`reconstruction` for the ONNX export
+requirements.
+
 ## Models
 
 ```{eval-rst}
@@ -92,6 +104,24 @@ keeps. `Enter` accepts, `Esc` returns `None`.
 .. autofunction:: polygon_mask
 .. autofunction:: save_mask
 .. autofunction:: load_mask
+```
+
+## Motion estimation
+
+```{eval-rst}
+.. autoclass:: eventcv.Tracker
+   :members:
+```
+
+See :doc:`motion` for contrast maximisation and the tracker's association rule.
+
+## Networking
+
+```{eval-rst}
+.. autoclass:: eventcv.UdpSender
+   :members:
+.. autoclass:: eventcv.UdpReceiver
+   :members:
 ```
 
 ## Core types
@@ -240,5 +270,6 @@ with `slice`/`windows`/`with_repr` without loading the file.
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
       Polarity, FrameSink, EventSink, EventCamera, FEAST, load, from_numpy, open, save,
-      load_frame, load_feast, export_png, collate, stream, list_cameras, Model
+      load_frame, load_feast, export_png, collate, stream, list_cameras, Model,
+      simulate, reconstruct, StatefulModel, Tracker, UdpSender, UdpReceiver
 ```

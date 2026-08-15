@@ -77,6 +77,7 @@ pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> R
         | RepresentationKind::Count
         | RepresentationKind::CountMask
         | RepresentationKind::Flow
+        | RepresentationKind::Intensity
         | RepresentationKind::Labels
         | RepresentationKind::Tencode => Scene::Image(render_frame(frame, colormap, normalize)),
         RepresentationKind::Voxel => Scene::Cloud {
@@ -257,7 +258,7 @@ mod tests {
         // Mirrors `view` without opening a window: image vs cloud dispatch.
         use eventcv_core::representation::RepresentationKind::*;
         match frame.kind() {
-            Polarity | Binary | Count | CountMask | Flow | Labels | Tencode => Scene::Image(
+            Polarity | Binary | Count | CountMask | Flow | Intensity | Labels | Tencode => Scene::Image(
                 eventcv_core::viz::render_frame(frame, Colormap::Viridis, true),
             ),
             Voxel => Scene::Cloud {

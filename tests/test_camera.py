@@ -13,6 +13,25 @@ import eventcv
 
 @unittest.skipUnless(eventcv.EventCamera is not None, "built without camera feature")
 class CameraApiTests(unittest.TestCase):
+    def test_enumeration_never_raises(self):
+        # The regression this file exists to prevent. `list_cameras()` used to raise on any machine
+        # whose USB subsystem could not be initialised — no camera attached, a container, a CI
+        # runner — which made a question about what is plugged in into a fatal error, and made the
+        # behaviour differ between Linux and macOS. Asking is always allowed; the answer may be
+        # nothing.
+        #
+        # `test_list_cameras_returns_a_list` below asserts the *shape* of the answer, but it only
+        # reaches its assertion on a machine where the call already worked. This asserts the call
+        # itself.
+        import warnings
+
+        with warnings.catch_warnings():
+            # A RuntimeWarning is legitimate here (a camera attached without udev rules), so it must
+            # not be promoted to an error — but nothing may be raised.
+            warnings.simplefilter("always")
+            cameras = eventcv.list_cameras()
+        self.assertIsInstance(cameras, list)
+
     def test_list_cameras_returns_a_list(self):
         cameras = eventcv.list_cameras()
         self.assertIsInstance(cameras, list)

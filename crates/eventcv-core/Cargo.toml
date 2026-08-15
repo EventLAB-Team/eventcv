@@ -61,6 +61,15 @@ ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, fea
     "api-27",           # pin the ONNX Runtime API level rather than inherit it from defaults
 ] }
 
+[dev-dependencies]
+# Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
+# carries the numbers, and the plots need gnuplot or a heavier plotting stack.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
 # The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
 # The `camera` feature turns on USB streaming (compiles the driver crate + a vendored libusb).
 [features]

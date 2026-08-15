@@ -149,7 +149,12 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
     let data = frame.data();
     match frame.kind() {
         // One channel — the value itself, unsigned.
-        RepresentationKind::Binary | RepresentationKind::Count | RepresentationKind::Labels => {
+        // Intensity joins these: one unsigned channel whose value is the pixel, so the default
+        // sequential colormap applies and a greyscale render is the identity.
+        RepresentationKind::Binary
+        | RepresentationKind::Count
+        | RepresentationKind::Intensity
+        | RepresentationKind::Labels => {
             ((0..plane_len).map(|i| value_at(data, i)).collect(), false)
         }
         // Flow is handled by render_flow before this call (Middlebury colour coding).

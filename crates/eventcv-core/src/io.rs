@@ -28,7 +28,7 @@ pub use text::{
     TextReader, TimeUnit,
 };
 
-use crate::representation::EventFrame;
+use crate::representation::{EventFrame, EventFrameData};
 use crate::viz::{render_frame, Colormap};
 
 /// A single event as produced by a reader, before it is placed on the sensor grid.
@@ -593,9 +593,69 @@ pub fn write_mask(
 /// so a mask binarised in another tool loads as-is: a pixel is **kept where it is non-black and not
 /// fully transparent**. The counterpart of [`write_mask`].
 pub fn read_mask(path: impl AsRef<Path>) -> Result<(Vec<bool>, usize, usize), IoError> {
-    let path = path.as_ref();
+    let png = decode_png(path.as_ref(), "masks are loaded from .png")?;
+    let mut mask = Vec::with_capacity(png.width * png.height);
+    png.for_each_pixel(|colour, opacity| {
+        // Any non-black, non-transparent pixel is "keep" — the intensities themselves don't matter
+        // for a mask, only whether the pixel was painted.
+        mask.push(colour.iter().any(|&value| value != 0) && opacity.first() != Some(&0));
+    });
+    Ok((mask, png.width, png.height))
+}
+
+/// Reads a PNG as a single-channel 8-bit intensity frame.
+///
+/// Colour images are collapsed to luma with the Rec. 601 weights the rest of the library uses;
+/// an alpha channel is ignored rather than composited, since there is no background to composite
+/// against and a half-transparent pixel still had a measured brightness.
+pub fn read_png_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
+    let png = decode_png(path.as_ref(), "frames are loaded from .png")?;
+    let mut samples = Vec::with_capacity(png.width * png.height);
+    png.for_each_pixel(|colour, _| samples.push(luma(colour)));
+    EventFrame::intensity(EventFrameData::U8(samples), png.width, png.height)
+        .map_err(|error| IoError::Format(error.to_string()))
+}
+
+/// Rec. 601 luma. A single sample is already grey and passes through untouched, which keeps a
+/// greyscale PNG bit-exact rather than round-tripping it through the weights.
+fn luma(colour: &[u8]) -> u8 {
+    match colour {
+        [grey] => *grey,
+        [r, g, b, ..] => {
+            (0.299 * f32::from(*r) + 0.587 * f32::from(*g) + 0.114 * f32::from(*b)).round() as u8
+        }
+        _ => 0,
+    }
+}
+
+/// An 8-bit PNG decoded into memory, with enough shape to walk its pixels.
+struct DecodedPng {
+    buffer: Vec<u8>,
+    width: usize,
+    height: usize,
+    line_size: usize,
+    samples: usize,
+    alpha: bool,
+}
+
+impl DecodedPng {
+    /// Calls `visit(colour, opacity)` per pixel in row-major order, where `colour` excludes any
+    /// alpha sample and `opacity` is the alpha (empty when the image has none).
+    fn for_each_pixel(&self, mut visit: impl FnMut(&[u8], &[u8])) {
+        for row in self.buffer.chunks_exact(self.line_size).take(self.height) {
+            for pixel in row[..self.width * self.samples].chunks_exact(self.samples) {
+                let (colour, opacity) = pixel.split_at(self.samples - usize::from(self.alpha));
+                visit(colour, opacity);
+            }
+        }
+    }
+}
+
+/// Shared 8-bit PNG decode behind [`read_mask`] and [`read_png_frame`]. `unsupported` is the
+/// message used when the path is not a PNG at all, so each caller can say what it wanted.
+fn decode_png(path: &Path, unsupported: &str) -> Result<DecodedPng, IoError> {
     if !matches!(detect_format(path)?, Format::Png) {
-        return Err(IoError::Unsupported("masks are loaded from .png".to_owned()));
+        return Err(IoError::Unsupported(unsupported.to_owned()));
     }
     let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
     // Expands palette and sub-byte images and strips 16-bit samples, so everything below is 8-bit.
@@ -603,20 +663,17 @@ pub fn read_mask(path: impl AsRef<Path>) -> Result<(Vec<bool>, usize, usize), Io
     let mut reader = decoder.read_info().map_err(png_decoding_error)?;
     let mut buffer = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buffer).map_err(png_decoding_error)?;
-    let (width, height) = (info.width as usize, info.height as usize);
-    let samples = info.color_type.samples();
-    let alpha = matches!(
-        info.color_type,
-        png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
-    );
-    let mut mask = Vec::with_capacity(width * height);
-    for row in buffer.chunks_exact(info.line_size).take(height) {
-        for pixel in row[..width * samples].chunks_exact(samples) {
-            let (colour, opacity) = pixel.split_at(samples - usize::from(alpha));
-            mask.push(colour.iter().any(|&value| value != 0) && opacity.first() != Some(&0));
-        }
-    }
-    Ok((mask, width, height))
+    Ok(DecodedPng {
+        width: info.width as usize,
+        height: info.height as usize,
+        line_size: info.line_size,
+        samples: info.color_type.samples(),
+        alpha: matches!(
+            info.color_type,
+            png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
+        ),
+        buffer,
+    })
 }
 
 fn png_decoding_error(error: png::DecodingError) -> IoError {
@@ -632,6 +689,9 @@ pub fn load_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
     let path = path.as_ref();
     match detect_format(path)? {
         Format::Npz => npz::read_npz_frame(path),
+        // A PNG has no stored kind or channel names, so it comes back as a greyscale intensity
+        // frame — the one representation that is not derived from events.
+        Format::Png => read_png_frame(path),
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {

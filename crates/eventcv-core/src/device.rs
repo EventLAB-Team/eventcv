@@ -36,7 +36,7 @@ const TIMESTAMP_SCALE_MS: f64 = 0.001;
 const POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// A camera discovered by [`list_cameras`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CameraInfo {
     /// Machine-readable type, e.g. `"prophesee_evk4"` (the driver's module name).
     pub kind: String,
@@ -52,30 +52,73 @@ pub struct CameraInfo {
     pub speed: String,
 }
 
+/// What enumeration found, and anything worth telling the user about how it went.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CameraListing {
+    /// Connected, supported cameras. Empty is a normal answer, not a failure.
+    pub cameras: Vec<CameraInfo>,
+    /// Set only when enumeration was blocked by *permissions* rather than finding nothing — the
+    /// case where a camera is probably attached and udev rules are the fix. Callers should surface
+    /// this (as a warning, not an error): the list is still empty either way, but only here does
+    /// the emptiness mean something is wrong.
+    pub warning: Option<String>,
+}
+
 /// Enumerates every connected, supported event camera. The returned [`CameraInfo::serial`] can be
 /// passed to [`Capture::open`] to select a specific device when several are plugged in.
-pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
-    // Enumeration opens each candidate device to read its type and serial, so it fails as a whole
-    // when the host won't let us near one of them — the commonest cause by far, and one the raw
-    // libusb message ("Access denied") does not point at.
-    let listed = nd::list_devices().map_err(|error| {
-        format!(
-            "could not enumerate USB event cameras ({error}). On Linux this is usually missing \
-             udev rules for the device (see the neuromorphic-drivers README, then re-plug it); on \
-             Windows, a missing WinUSB driver for it"
-        )
-    })?;
-    Ok(listed
-        .into_iter()
-        .map(|device| CameraInfo {
-            kind: device.device_type.to_string(),
-            name: device.device_type.name().to_owned(),
-            serial: device.serial.ok(),
-            bus_number: device.bus_number,
-            address: device.address,
-            speed: speed_name(device.speed).to_owned(),
-        })
-        .collect())
+///
+/// **Never fails.** Asking what is attached is a question, and "nothing" is a valid answer — on a
+/// machine with no camera, in a container without USB passthrough, or on a CI runner with no
+/// `/dev/bus/usb` at all. Returning an error for those made a reasonable question fatal, and made
+/// the behaviour differ by platform: the same call already returned an empty list on macOS.
+///
+/// A permissions failure is different in kind — something is there and we are not allowed to look —
+/// so that comes back in [`CameraListing::warning`] rather than being silently indistinguishable.
+pub fn list_cameras() -> CameraListing {
+    let listed = match nd::list_devices() {
+        Ok(listed) => listed,
+        Err(error) => {
+            return CameraListing {
+                cameras: Vec::new(),
+                warning: enumeration_warning(error),
+            }
+        }
+    };
+    CameraListing {
+        cameras: listed
+            .into_iter()
+            .map(|device| CameraInfo {
+                kind: device.device_type.to_string(),
+                name: device.device_type.name().to_owned(),
+                serial: device.serial.ok(),
+                bus_number: device.bus_number,
+                address: device.address,
+                speed: speed_name(device.speed).to_owned(),
+            })
+            .collect(),
+        warning: None,
+    }
+}
+
+/// Decides whether an enumeration failure is worth reporting.
+///
+/// `Access` and `Busy` mean libusb saw a device and could not use it — on Linux that is almost
+/// always missing udev rules, and the raw message ("Access denied") does not say so. Everything
+/// else means there was nothing to enumerate in the first place: `Other` is what `libusb_init`
+/// returns when the usbfs backend cannot start, which is the ordinary state of a VM or container
+/// with no USB subsystem, and reporting it would cry wolf on every headless machine.
+///
+/// Split out from [`list_cameras`] so the decision is testable without a USB stack — it is the only
+/// part of enumeration with a judgement in it.
+fn enumeration_warning(error: nd::rusb::Error) -> Option<String> {
+    match error {
+        nd::rusb::Error::Access | nd::rusb::Error::Busy => Some(format!(
+            "a USB event camera appears to be attached but could not be read ({error}). On Linux \
+             this is usually missing udev rules for the device (see the neuromorphic-drivers \
+             README, then re-plug it); on Windows, a missing WinUSB driver for it"
+        )),
+        _ => None,
+    }
 }
 
 /// Turns a raw `nd::open` failure into an actionable message. The driver reports a device that is
@@ -83,7 +126,7 @@ pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
 /// a truly absent one — "no device found". So when enumeration *can* still see a supported camera,
 /// we say the device is present-but-unavailable rather than repeat the misleading "not found".
 fn open_error(serial: Option<&str>, error: impl std::fmt::Display) -> String {
-    let visible = list_cameras().unwrap_or_default();
+    let visible = list_cameras().cameras;
     let matched = match serial {
         Some(serial) => visible
             .iter()
@@ -1154,5 +1197,53 @@ mod tests {
 
         assert!(windower.pending[0].first_after_overflow);
         assert!(!windower.pending[1].first_after_overflow);
+    }
+
+    #[test]
+    fn only_permission_failures_warn() {
+        use neuromorphic_drivers::rusb::Error;
+
+        // A device is there and we are not allowed to touch it — the genuine udev case, and the
+        // only one where an empty list means something is wrong.
+        for error in [Error::Access, Error::Busy] {
+            let warning = super::enumeration_warning(error).expect("should warn");
+            assert!(warning.contains("udev"), "{warning}");
+            assert!(warning.contains("attached"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn an_absent_usb_stack_is_silent() {
+        use neuromorphic_drivers::rusb::Error;
+
+        // `Other` is what `libusb_init` returns when the usbfs backend cannot start — the ordinary
+        // state of a VM, a container without USB passthrough, or a CI runner. Warning about it
+        // would cry wolf on every headless machine, which is exactly what broke CI.
+        for error in [
+            Error::Other,
+            Error::NoDevice,
+            Error::NotFound,
+            Error::NotSupported,
+            Error::Io,
+        ] {
+            assert_eq!(
+                super::enumeration_warning(error),
+                None,
+                "{error:?} should be silent"
+            );
+        }
+    }
+
+    #[test]
+    fn enumeration_never_fails() {
+        // The contract the docstring always promised and the implementation did not keep. This runs
+        // on any machine — with a camera, without one, or with no USB subsystem at all — and must
+        // return a list every time.
+        let listing = super::list_cameras();
+        // A warning is only legitimate alongside an empty list: if we could see cameras, nothing
+        // was blocked.
+        if listing.warning.is_some() {
+            assert!(listing.cameras.is_empty());
+        }
     }
 }

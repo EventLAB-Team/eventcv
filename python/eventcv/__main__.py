@@ -149,6 +149,49 @@ def _cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_simulate(args: argparse.Namespace) -> int:
+    """Turn a video into the events a DVS would have produced watching it."""
+    from . import save, simulate
+
+    events = simulate(
+        args.input,
+        pos_thres=args.threshold,
+        neg_thres=args.threshold,
+        sigma_thres=args.sigma_thres,
+        cutoff_hz=args.cutoff_hz,
+        leak_rate_hz=args.leak_rate_hz,
+        shot_noise_rate_hz=args.shot_noise_rate_hz,
+        refractory_us=args.refractory_us,
+        seed=args.seed,
+        upsample=args.upsample,
+        scale=tuple(args.scale) if args.scale else None,
+        max_frames=args.max_frames,
+    )
+    save(events, args.output)
+    if not args.quiet:
+        print(f"wrote {args.output} ({_format_count(len(events))} events)")
+    return 0
+
+
+def _cmd_reconstruct(args: argparse.Namespace) -> int:
+    """Run a reconstruction model over a recording to recover an intensity video."""
+    from . import Model, open as open_reader, reconstruct
+
+    reader = open_reader(args.input, dt_ms=args.dt_ms, **_source_options(args)).with_repr(
+        args.repr, bins=args.bins
+    )
+    frames = reconstruct(
+        reader,
+        Model(args.model),
+        args.output,
+        fps=args.fps,
+        max_frames=args.max_frames,
+    )
+    if not args.quiet:
+        print(f"wrote {args.output} ({frames} frames at {args.fps:g} fps)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="eventcv",
@@ -218,6 +261,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
     render.set_defaults(func=_cmd_render)
+
+    simulate = subparsers.add_parser(
+        "simulate", help="turn a video into synthetic events (needs ffmpeg on PATH)"
+    )
+    simulate.add_argument("input", help="source video")
+    simulate.add_argument("output", help="destination event file; the extension picks the format")
+    simulate.add_argument(
+        "--threshold", type=float, default=0.2, metavar="C",
+        help="log-contrast threshold for both polarities (default: 0.2)",
+    )
+    simulate.add_argument(
+        "--sigma-thres", type=float, default=0.03, metavar="S",
+        help="per-pixel threshold spread; 0 for an ideal sensor (default: 0.03)",
+    )
+    simulate.add_argument(
+        "--cutoff-hz", type=float, default=200.0, metavar="HZ",
+        help="photoreceptor bandwidth for a white pixel; 0 disables (default: 200)",
+    )
+    simulate.add_argument(
+        "--leak-rate-hz", type=float, default=1.0, metavar="HZ",
+        help="spontaneous ON events per pixel per second (default: 1)",
+    )
+    simulate.add_argument(
+        "--shot-noise-rate-hz", type=float, default=10.0, metavar="HZ",
+        help="noise floor in dark pixels (default: 10)",
+    )
+    simulate.add_argument(
+        "--refractory-us", type=int, default=100, metavar="US",
+        help="dead time after each event (default: 100)",
+    )
+    simulate.add_argument(
+        "--upsample", default=None, metavar="MODE",
+        help='frame subdivision: "adaptive" (default), "off", or an integer factor',
+    )
+    simulate.add_argument(
+        "--scale", type=int, nargs=2, default=None, metavar=("W", "H"),
+        help="decode the video at this size instead of its native one",
+    )
+    simulate.add_argument("--max-frames", type=int, default=None, metavar="N",
+                          help="stop after N frames")
+    simulate.add_argument("--seed", type=int, default=0, help="seed for mismatch and noise")
+    simulate.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
+    simulate.set_defaults(func=_cmd_simulate)
+
+    reconstruct = subparsers.add_parser(
+        "reconstruct", help="recover an intensity video from events using an ONNX model"
+    )
+    reconstruct.add_argument("input", help="source recording")
+    reconstruct.add_argument("output", help="destination video; the extension picks the format")
+    reconstruct.add_argument("model", help="ONNX reconstruction model (e.g. an E2VID export)")
+    _add_source_options(reconstruct)
+    reconstruct.add_argument("--dt-ms", type=float, default=33.0, metavar="MS",
+                             help="time per reconstructed frame (default: 33)")
+    reconstruct.add_argument("--fps", type=float, default=30.0, help="playback rate (default: 30)")
+    reconstruct.add_argument("--repr", default="voxel",
+                             help="representation the model expects (default: voxel)")
+    reconstruct.add_argument("--bins", type=int, default=5,
+                             help="bins for the voxel representation (default: 5)")
+    reconstruct.add_argument("--max-frames", type=int, default=None, metavar="N",
+                             help="stop after N frames")
+    reconstruct.add_argument("-q", "--quiet", action="store_true",
+                             help="suppress the summary line")
+    reconstruct.set_defaults(func=_cmd_reconstruct)
 
     return parser
 

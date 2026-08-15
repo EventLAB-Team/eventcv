@@ -259,6 +259,86 @@ impl PyEventStream {
         self.wrap(py.detach(|| self.inner.filter_polarity(polarity)))
     }
 
+
+    /// Recovers the camera motion that makes the warped events sharpest.
+    ///
+    /// Returns a dict with `params` (px/s for translation, rad/s for rotation), `score`,
+    /// `score_at_rest` and `improvement` — check `improvement` before trusting `params`, since at
+    /// or below 1.0 the optimiser found no motion and stopped wherever it happened to be.
+    #[pyo3(signature = (
+        *, model="translation", objective="variance", camera=None, blur_sigma=None,
+        initial=None, initial_step=50.0, max_iterations=200, tolerance=1e-3,
+        time_reference="midpoint"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn contrast_maximise<'py>(
+        &self,
+        py: Python<'py>,
+        model: &str,
+        objective: &str,
+        camera: Option<PyRef<'_, PyCamera>>,
+        blur_sigma: Option<f64>,
+        initial: Option<Vec<f64>>,
+        initial_step: f64,
+        max_iterations: usize,
+        tolerance: f64,
+        time_reference: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use eventcv_core::cmax::{CmaxConfig, TimeReference};
+
+        let warp = parse_warp_model(model, camera.as_deref())?;
+        let mut initial_params = [0.0_f64; 3];
+        if let Some(values) = initial {
+            if values.len() > 3 {
+                return Err(PyValueError::new_err("initial takes at most three values"));
+            }
+            initial_params[..values.len()].copy_from_slice(&values);
+        }
+        let config = CmaxConfig {
+            objective: parse_objective(objective)?,
+            time_reference: match time_reference {
+                "midpoint" => TimeReference::Midpoint,
+                "start" => TimeReference::Start,
+                "end" => TimeReference::End,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "time_reference must be \"midpoint\", \"start\" or \"end\", not {other:?}"
+                    )))
+                }
+            },
+            blur_sigma,
+            initial: Some(initial_params),
+            initial_step,
+            max_iterations,
+            tolerance,
+        };
+        let result = py
+            .detach(|| self.inner.contrast_maximise(warp, config))
+            .map_err(map_cmax_error)?;
+        let dict = PyDict::new(py);
+        dict.set_item("params", result.params.clone())?;
+        dict.set_item("score", result.score)?;
+        dict.set_item("score_at_rest", result.score_at_rest)?;
+        dict.set_item("improvement", result.improvement())?;
+        dict.set_item("iterations", result.iterations)?;
+        Ok(dict)
+    }
+
+    /// Builds the image of warped events for an explicit motion — the picture the objective scores.
+    #[pyo3(signature = (params, *, model="translation", camera=None))]
+    fn iwe(
+        &self,
+        py: Python<'_>,
+        params: Vec<f64>,
+        model: &str,
+        camera: Option<PyRef<'_, PyCamera>>,
+    ) -> PyResult<PyEventFrame> {
+        let warp = parse_warp_model(model, camera.as_deref())?;
+        py.detach(|| self.inner.iwe(warp, &params))
+            .map(|inner| PyEventFrame { inner })
+            .map_err(map_cmax_error)
+    }
+
     /// Activity over time, binned into fixed intervals.
     ///
     /// Returns a dict of numpy arrays — `t` (each bin's left edge, µs), `count`, `positive`,
@@ -2487,6 +2567,295 @@ fn save(
 
 /// Reads an `EventFrame` previously written by `frame.save(...)` / `eventcv.save(...)`
 /// (`.npz` or `.h5`), restoring its dtype, `kind`, and `channel_names`.
+/// Simulates a DVS camera watching `source`, returning the events it would have produced.
+///
+/// `source` is a video file path, or an array of intensity frames — `[N, H, W]` greyscale or
+/// `[N, H, W, 3]` RGB, any dtype, with values read as `[0, 255]` for integers and `[0, 1]` for
+/// floats. Frames need an explicit `fps`; a video file carries its own.
+#[pyfunction]
+#[pyo3(signature = (
+    source, *, pos_thres=0.2, neg_thres=0.2, sigma_thres=0.03, refractory_us=100,
+    cutoff_hz=200.0, leak_rate_hz=1.0, shot_noise_rate_hz=10.0, seed=0,
+    upsample=None, max_events_per_pixel=1.0, fps=None, scale=None, max_frames=None
+))]
+#[allow(clippy::too_many_arguments)]
+fn simulate(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    pos_thres: f32,
+    neg_thres: f32,
+    sigma_thres: f32,
+    refractory_us: i64,
+    cutoff_hz: f32,
+    leak_rate_hz: f32,
+    shot_noise_rate_hz: f32,
+    seed: u64,
+    upsample: Option<&str>,
+    max_events_per_pixel: f32,
+    fps: Option<f64>,
+    scale: Option<(usize, usize)>,
+    max_frames: Option<usize>,
+) -> PyResult<PyEventStream> {
+    use eventcv_core::simulate::{simulate_video, Simulator, SimulatorConfig, Upsample};
+
+    let upsample = match upsample {
+        None | Some("adaptive") => Upsample::Adaptive {
+            max_events_per_pixel,
+        },
+        Some("off") | Some("none") => Upsample::Off,
+        Some(other) => match other.parse::<usize>() {
+            Ok(n) => Upsample::Fixed(n),
+            Err(_) => {
+                return Err(PyValueError::new_err(format!(
+                    "upsample must be \"adaptive\", \"off\", or an integer factor, not {other:?}"
+                )))
+            }
+        },
+    };
+    let config = SimulatorConfig {
+        pos_thres,
+        neg_thres,
+        sigma_thres,
+        refractory_us,
+        cutoff_hz,
+        leak_rate_hz,
+        shot_noise_rate_hz,
+        seed,
+        upsample,
+    };
+
+    // Collecting the per-interval streams and concatenating once at the end keeps the simulator
+    // itself streaming; only this convenience wrapper materialises the whole recording, which is
+    // what a caller asking for one EventStream has asked for.
+    let mut chunks: Vec<EventStream> = Vec::new();
+
+    if let Ok(path) = source.extract::<String>() {
+        py.detach(|| {
+            simulate_video(
+                std::path::Path::new(&path),
+                config,
+                scale,
+                max_frames,
+                |stream| {
+                    chunks.push(stream);
+                    Ok(())
+                },
+            )
+        })
+        .map_err(map_std_io_error)?;
+    } else {
+        let frames = source
+            .call_method1("astype", ("float32",))
+            .unwrap_or_else(|_| source.clone())
+            .extract::<numpy::PyReadonlyArrayDyn<f32>>()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "simulate takes a video path or an array of frames ([N,H,W] or [N,H,W,3])",
+                )
+            })?;
+        let array = frames.as_array();
+        let shape = array.shape().to_vec();
+        let (count, height, width, channels) = match shape.as_slice() {
+            [n, h, w] => (*n, *h, *w, 1),
+            [n, h, w, c] if *c == 1 || *c == 3 => (*n, *h, *w, *c),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "frames must be [N,H,W] or [N,H,W,3], got {shape:?}"
+                )))
+            }
+        };
+        let fps = fps.ok_or_else(|| {
+            PyValueError::new_err("simulating from frames needs fps= (a video file carries its own)")
+        })?;
+        if !(fps.is_finite() && fps > 0.0) {
+            return Err(PyValueError::new_err("fps must be finite and positive"));
+        }
+        // Integer-valued input is 0..255; float input is already 0..1. Deciding per array rather
+        // than per frame keeps the scale consistent across a recording that happens to start dark.
+        let peak = array.iter().copied().fold(0.0_f32, f32::max);
+        let divisor = if peak > 1.0 { 255.0 } else { 1.0 };
+        let us_per_frame = (1_000_000.0 / fps).round() as i64;
+        let values: Vec<f32> = array.iter().copied().collect();
+        drop(frames);
+
+        py.detach(|| {
+            let mut simulator = Simulator::new(width, height, config);
+            let plane = width * height;
+            let mut luma = vec![0.0_f32; plane];
+            let limit = max_frames.map_or(count, |limit| limit.min(count));
+            for index in 0..limit {
+                let base = index * plane * channels;
+                for pixel in 0..plane {
+                    luma[pixel] = if channels == 3 {
+                        let offset = base + pixel * 3;
+                        eventcv_core::simulate::linear_luma(
+                            (values[offset] / divisor * 255.0).clamp(0.0, 255.0) as u8,
+                            (values[offset + 1] / divisor * 255.0).clamp(0.0, 255.0) as u8,
+                            (values[offset + 2] / divisor * 255.0).clamp(0.0, 255.0) as u8,
+                        )
+                    } else {
+                        // Greyscale goes through the same sRGB transfer as colour — the weights
+                        // sum to one, so this is exactly "linearise" and nothing else. Skipping it
+                        // here would make a grey scene simulate differently depending on whether it
+                        // arrived as one channel or three.
+                        let level = (values[base + pixel] / divisor * 255.0).clamp(0.0, 255.0) as u8;
+                        eventcv_core::simulate::linear_luma(level, level, level)
+                    };
+                }
+                let stream = simulator.push_frame(&luma, index as i64 * us_per_frame);
+                if !stream.is_empty() {
+                    chunks.push(stream);
+                }
+            }
+        });
+    }
+
+    // `concat` takes references and preserves order, so the globally-sorted invariant the simulator
+    // guarantees per interval survives the join.
+    let inner = py.detach(|| match chunks.split_first() {
+        Some((first, rest)) => first.concat(&rest.iter().collect::<Vec<_>>()),
+        None => EventStreamBuilder::new(
+            scale.map_or(0, |(w, _)| w),
+            scale.map_or(0, |(_, h)| h),
+            0.001,
+        )
+        .build(),
+    });
+    Ok(PyEventStream { inner, repr: None })
+}
+
+/// Reconstructs an intensity video from events by running a trained model over each slice.
+///
+/// `reader` must carry the representation the model expects (`open(repr=…)` / `with_repr`), and
+/// `model` is any ONNX graph taking that representation and returning a single-channel image —
+/// E2VID and its relatives. EventCV supplies the runner and the tensors, not the weights.
+///
+/// Writes to `path` in whatever format the extension names (`.gif`, `.apng`, `.mp4`) and returns
+/// the number of frames written.
+#[cfg(feature = "onnx")]
+#[pyfunction]
+#[pyo3(signature = (reader, model, path, *, fps=30.0, colormap="grayscale", max_frames=None))]
+fn reconstruct(
+    py: Python<'_>,
+    reader: PyRef<'_, PyEventReader>,
+    model: PyRef<'_, PyModel>,
+    path: &str,
+    fps: f64,
+    colormap: &str,
+    max_frames: Option<usize>,
+) -> PyResult<usize> {
+    use eventcv_core::representation::{EventFrame, EventFrameData};
+    use eventcv_core::video::{encoder_for, Fps};
+    use eventcv_core::viz::{render_frame_scaled, Scale};
+
+    let spec = reader.repr.ok_or_else(|| {
+        PyValueError::new_err(
+            "reconstruct needs the representation the model expects; open(repr=…) or with_repr(…)",
+        )
+    })?;
+    let colormap = parse_colormap(colormap)?;
+    let mode = reader.require_mode()?;
+    let total = reader.frame_count(mode);
+    let frames = max_frames.map_or(total, |limit| limit.min(total));
+    if frames == 0 {
+        return Err(PyValueError::new_err(
+            "nothing to reconstruct: the reader has no slices",
+        ));
+    }
+
+    // Capture plain references, not the GIL-bound PyRefs: `py.detach` needs a Send closure.
+    let session = &model.inner;
+    let mut encoder: Option<Box<dyn eventcv_core::video::AnimationEncoder + Send>> = None;
+    for index in 0..frames {
+        let stream = fetch_window(
+            py,
+            &reader.inner,
+            reader.window_for_index(index as i64)?,
+            index,
+            reader.slice_ops.clone(),
+            reader.hot_pixel_mask.clone(),
+        )?;
+        let input = py
+            .detach(|| spec.generate(&stream))
+            .map_err(map_representation_error)?;
+        let (channels, height, width) = input.shape();
+        let tensor = frame_to_f32_array(&input, channels, height, width);
+        let mut outputs = py
+            .detach(|| {
+                session
+                    .lock()
+                    .expect("model mutex was poisoned by a previous panic")
+                    .run(tensor)
+            })
+            .map_err(map_model_error)?;
+        let output = outputs
+            .drain(..)
+            .next()
+            .ok_or_else(|| PyValueError::new_err("the model produced no output"))?;
+
+        // Reconstruction models emit [N,1,H,W] or [1,H,W]; either way the trailing H*W is the
+        // image, so the leading axes are collapsed rather than demanding one exact rank.
+        let shape = output.shape().to_vec();
+        let (out_h, out_w) = match shape.as_slice() {
+            [.., h, w] => (*h, *w),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "expected an image output with at least two dimensions, got {shape:?}"
+                )))
+            }
+        };
+        let samples: Vec<f32> = output.iter().copied().take(out_h * out_w).collect();
+        let image_frame = EventFrame::intensity(EventFrameData::F32(samples), out_w, out_h)
+            .map_err(map_representation_error)?;
+        // Natural scale: a reconstruction already lives in [0, 1], and auto-contrast would make
+        // the brightness pump across the sequence exactly as it does for rendered representations.
+        let image = py.detach(|| render_frame_scaled(&image_frame, colormap, Scale::Natural));
+
+        let encoder = match encoder.as_mut() {
+            Some(encoder) => encoder,
+            None => encoder.insert(
+                encoder_for(
+                    std::path::Path::new(path),
+                    frames as u32,
+                    image.width,
+                    image.height,
+                    Fps::new(fps),
+                )
+                .map_err(map_std_io_error)?,
+            ),
+        };
+        encoder.write_frame(&image).map_err(map_std_io_error)?;
+        py.check_signals()?;
+    }
+    if let Some(encoder) = encoder.take() {
+        py.detach(|| encoder.finish()).map_err(map_std_io_error)?;
+    }
+    Ok(frames)
+}
+
+/// Copies a frame into the `[1, C, H, W]` float tensor a model expects, adding the batch axis the
+/// graph almost certainly declares.
+#[cfg(feature = "onnx")]
+fn frame_to_f32_array(
+    frame: &eventcv_core::representation::EventFrame,
+    channels: usize,
+    height: usize,
+    width: usize,
+) -> numpy::ndarray::ArrayD<f32> {
+    use eventcv_core::representation::EventFrameData;
+    let values: Vec<f32> = match frame.data() {
+        EventFrameData::U8(data) => data.iter().map(|&v| f32::from(v)).collect(),
+        EventFrameData::U16(data) => data.iter().map(|&v| f32::from(v)).collect(),
+        EventFrameData::U64(data) => data.iter().map(|&v| v as f32).collect(),
+        EventFrameData::F32(data) => data.clone(),
+    };
+    numpy::ndarray::ArrayD::from_shape_vec(
+        numpy::ndarray::IxDyn(&[1, channels, height, width]),
+        values,
+    )
+    .expect("frame shape matches its data by construction")
+}
+
 #[pyfunction]
 fn load_frame(py: Python<'_>, path: &str) -> PyResult<PyEventFrame> {
     py.detach(|| eventcv_core::io::load_frame(path))
@@ -2723,6 +3092,208 @@ fn map_std_io_error(error: std::io::Error) -> PyErr {
         PyValueError::new_err(error.to_string())
     } else {
         PyOSError::new_err(error.to_string())
+    }
+}
+
+/// Maps the Python model name onto a warp, checking that rotation was given the intrinsics it needs.
+fn parse_warp_model(
+    name: &str,
+    camera: Option<&PyCamera>,
+) -> PyResult<eventcv_core::cmax::WarpModel> {
+    use eventcv_core::cmax::WarpModel;
+    match name {
+        "translation" => Ok(WarpModel::Translation),
+        "rotation" => {
+            let camera = camera.ok_or_else(|| {
+                PyValueError::new_err(
+                    "the rotation model needs camera= intrinsics to map pixels onto rays",
+                )
+            })?;
+            Ok(WarpModel::Rotation {
+                camera: camera.inner,
+            })
+        }
+        other => Err(PyValueError::new_err(format!(
+            "model must be \"translation\" or \"rotation\", not {other:?}"
+        ))),
+    }
+}
+
+fn parse_objective(name: &str) -> PyResult<eventcv_core::cmax::Objective> {
+    use eventcv_core::cmax::Objective;
+    match name {
+        "variance" => Ok(Objective::Variance),
+        "sos" | "sum_of_squares" => Ok(Objective::SumOfSquares),
+        "soe" | "sum_of_exponentials" => Ok(Objective::SumOfExponentials),
+        other => Err(PyValueError::new_err(format!(
+            "objective must be \"variance\", \"sos\" or \"soe\", not {other:?}"
+        ))),
+    }
+}
+
+fn map_cmax_error(error: eventcv_core::cmax::CmaxError) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+/// Follows connected components across frames, keeping their identities.
+///
+/// Connected-component labels are assigned in scan order and renumber whenever anything moves, so
+/// they mean nothing across time. A tracker adds the memory.
+#[pyclass(name = "Tracker")]
+struct PyTracker {
+    inner: eventcv_core::track::Tracker,
+}
+
+#[pymethods]
+impl PyTracker {
+    /// `min_area` filters noise (a hot pixel makes a one-pixel component), `max_distance` is the
+    /// gate beyond which a blob is a different object, and `max_missed` is how many frames a track
+    /// survives unmatched — what carries it through a brief occlusion.
+    #[new]
+    #[pyo3(signature = (*, connectivity=8, min_area=4, max_distance=20.0, max_missed=3))]
+    fn new(connectivity: u8, min_area: usize, max_distance: f64, max_missed: usize) -> PyResult<Self> {
+        if connectivity != 4 && connectivity != 8 {
+            return Err(PyValueError::new_err("connectivity must be 4 or 8"));
+        }
+        Ok(Self {
+            inner: eventcv_core::track::Tracker::new(eventcv_core::track::TrackerConfig {
+                connectivity,
+                min_area,
+                max_distance,
+                max_missed,
+            }),
+        })
+    }
+
+    /// Segments `frame`, matches its blobs to the existing tracks, and returns the live tracks as
+    /// a list of dicts: `id`, `centroid`, `velocity`, `area`, `age`, `missed`.
+    fn update<'py>(
+        &mut self,
+        py: Python<'py>,
+        frame: PyRef<'_, PyEventFrame>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let inner = &frame.inner;
+        let tracks = py
+            .detach(|| self.inner.update(inner).map(|tracks| tracks.to_vec()))
+            .map_err(map_cluster_error)?;
+        tracks.iter().map(|track| track_to_dict(py, track)).collect()
+    }
+
+    /// The live tracks without advancing the tracker.
+    #[getter]
+    fn tracks<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.inner
+            .tracks()
+            .iter()
+            .map(|track| track_to_dict(py, track))
+            .collect()
+    }
+
+    /// Forgets every track. Ids continue from where they left off, so an old track and a new one
+    /// can never be confused in a log.
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Tracker({} live)", self.inner.tracks().len())
+    }
+}
+
+fn track_to_dict<'py>(
+    py: Python<'py>,
+    track: &eventcv_core::track::Track,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", track.id)?;
+    dict.set_item("centroid", track.centroid)?;
+    dict.set_item("velocity", track.velocity)?;
+    dict.set_item("area", track.area)?;
+    dict.set_item("age", track.age)?;
+    dict.set_item("missed", track.missed)?;
+    Ok(dict)
+}
+
+/// Sends events over UDP, wire-compatible with aestream and SPIF.
+#[pyclass(name = "UdpSender")]
+struct PyUdpSender {
+    inner: eventcv_core::net::UdpSender,
+}
+
+#[pymethods]
+impl PyUdpSender {
+    /// `host_endian` defaults to True to match aestream, whose packing is host-endian despite its
+    /// own comments saying it should not be. Set it False for correct network byte order.
+    #[new]
+    #[pyo3(signature = (target, *, timestamps=false, host_endian=true))]
+    fn new(target: &str, timestamps: bool, host_endian: bool) -> PyResult<Self> {
+        let format = eventcv_core::net::WireFormat {
+            timestamps,
+            host_endian,
+        };
+        eventcv_core::net::UdpSender::connect(target, format)
+            .map(|inner| Self { inner })
+            .map_err(map_std_io_error)
+    }
+
+    /// Sends every event, split across datagrams. Returns how many were sent.
+    fn send(&self, py: Python<'_>, stream: PyRef<'_, PyEventStream>) -> PyResult<usize> {
+        let inner = &stream.inner;
+        py.detach(|| self.inner.send(inner)).map_err(map_std_io_error)
+    }
+
+    #[getter]
+    fn address(&self) -> PyResult<String> {
+        self.inner
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .map_err(map_std_io_error)
+    }
+}
+
+/// Receives events over UDP.
+#[pyclass(name = "UdpReceiver")]
+struct PyUdpReceiver {
+    inner: eventcv_core::net::UdpReceiver,
+}
+
+#[pymethods]
+impl PyUdpReceiver {
+    #[new]
+    #[pyo3(signature = (address, sensor_size, *, timestamps=false, host_endian=true))]
+    fn new(
+        address: &str,
+        sensor_size: (usize, usize),
+        timestamps: bool,
+        host_endian: bool,
+    ) -> PyResult<Self> {
+        let format = eventcv_core::net::WireFormat {
+            timestamps,
+            host_endian,
+        };
+        eventcv_core::net::UdpReceiver::bind(address, sensor_size.0, sensor_size.1, format)
+            .map(|inner| Self { inner })
+            .map_err(map_std_io_error)
+    }
+
+    /// Collects whatever arrives within `dt_ms`. An empty stream means silence, not failure.
+    #[pyo3(signature = (dt_ms=30.0))]
+    fn recv(&self, py: Python<'_>, dt_ms: f64) -> PyResult<PyEventStream> {
+        if !(dt_ms.is_finite() && dt_ms > 0.0) {
+            return Err(PyValueError::new_err("dt_ms must be finite and positive"));
+        }
+        let window = std::time::Duration::from_micros((dt_ms * 1000.0) as u64);
+        py.detach(|| self.inner.recv_window(window))
+            .map(|inner| PyEventStream { inner, repr: None })
+            .map_err(map_std_io_error)
+    }
+
+    #[getter]
+    fn address(&self) -> PyResult<String> {
+        self.inner
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .map_err(map_std_io_error)
     }
 }
 
@@ -3018,6 +3589,39 @@ impl PyModel {
             list.append(output.into_pyarray(py))?;
         }
         Ok(list.into_any())
+    }
+
+    /// Runs the model with every input bound by name, returning `{name: array}`.
+    ///
+    /// The form `__call__` cannot express. A recurrent graph takes its hidden state as extra
+    /// inputs and returns the updated state as extra outputs; feeding those back is what
+    /// `StatefulModel` does on top of this.
+    fn run_named<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let mut bound = Vec::with_capacity(inputs.len());
+        for (key, value) in inputs.iter() {
+            let name: String = key.extract().map_err(|_| {
+                PyValueError::new_err("input names must be strings")
+            })?;
+            bound.push((name, to_f32_array(py, &value)?));
+        }
+        let session = &self.inner;
+        let outputs = py
+            .detach(|| {
+                session
+                    .lock()
+                    .expect("model mutex was poisoned by a previous panic")
+                    .run_named(bound)
+            })
+            .map_err(map_model_error)?;
+        let result = PyDict::new(py);
+        for (name, array) in outputs {
+            result.set_item(name, array.into_pyarray(py))?;
+        }
+        Ok(result)
     }
 
     fn __repr__(&self) -> String {
@@ -4562,10 +5166,20 @@ fn parse_bias_limits(value: &Bound<'_, PyAny>) -> PyResult<eventcv_core::bias::B
 #[cfg(feature = "camera")]
 #[pyfunction]
 fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
-    let cameras = py
-        .detach(eventcv_core::device::list_cameras)
-        .map_err(PyRuntimeError::new_err)?;
-    cameras
+    let listing = py.detach(eventcv_core::device::list_cameras);
+    // A permissions failure means a camera is probably attached and unreadable — worth saying, but
+    // not worth making "what is plugged in?" a fatal question. Everything else (no USB subsystem,
+    // nothing attached) is an ordinary empty answer and passes silently.
+    if let Some(message) = listing.warning {
+        PyErr::warn(
+            py,
+            &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+            std::ffi::CString::new(message)?.as_c_str(),
+            1,
+        )?;
+    }
+    listing
+        .cameras
         .into_iter()
         .map(|info| {
             let dict = PyDict::new(py);
@@ -4864,6 +5478,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPolarity>()?;
     m.add_class::<PyCamera>()?;
     m.add_class::<PyFeast>()?;
+    m.add_class::<PyTracker>()?;
+    m.add_class::<PyUdpSender>()?;
+    m.add_class::<PyUdpReceiver>()?;
     #[cfg(feature = "onnx")]
     m.add_class::<PyModel>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
@@ -4871,6 +5488,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(load_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate, m)?)?;
+    #[cfg(feature = "onnx")]
+    m.add_function(wrap_pyfunction!(reconstruct, m)?)?;
     m.add_function(wrap_pyfunction!(rect_mask, m)?)?;
     m.add_function(wrap_pyfunction!(ellipse_mask, m)?)?;
     m.add_function(wrap_pyfunction!(circle_mask, m)?)?;

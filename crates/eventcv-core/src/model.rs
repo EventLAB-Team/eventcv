@@ -118,22 +118,53 @@ impl Model {
     /// holds the lock. Outputs come back in the graph's declared order, so
     /// `run(...)[i]` corresponds to [`Model::outputs`]`()[i]`.
     pub fn run(&mut self, input: ArrayD<f32>) -> Result<Vec<ArrayD<f32>>, ModelError> {
-        let shape: Vec<i64> = input.shape().iter().map(|&dim| dim as i64).collect();
-        let (data, _) = input.into_raw_vec_and_offset();
-        let tensor = Tensor::from_array((shape, data))
-            .map_err(|error| ModelError::Run(error.to_string()))?;
         let name = self
             .inputs
             .first()
             .map(|port| port.name.clone())
             .ok_or_else(|| ModelError::Run("the graph declares no inputs".into()))?;
+        Ok(self
+            .run_named(vec![(name, input)])?
+            .into_iter()
+            .map(|(_, array)| array)
+            .collect())
+    }
+
+    /// Runs the graph with every input bound by name, returning every output paired with its name.
+    ///
+    /// The multi-input form [`Model::run`] cannot express. Recurrent networks — E2VID and its
+    /// relatives — take `(data, state_0, …)` and return `(image, new_state_0, …)`; feeding the new
+    /// states back on the next call is what makes them recurrent, and that needs both ends bound by
+    /// name rather than by position.
+    ///
+    /// Outputs come back in the graph's declared order, so they line up with [`Model::outputs`].
+    pub fn run_named(
+        &mut self,
+        inputs: Vec<(String, ArrayD<f32>)>,
+    ) -> Result<Vec<(String, ArrayD<f32>)>, ModelError> {
+        if inputs.is_empty() {
+            return Err(ModelError::Run("no inputs were supplied".into()));
+        }
+        let declared: Vec<&str> = self.inputs.iter().map(|port| port.name.as_str()).collect();
+        for (name, _) in &inputs {
+            if !declared.contains(&name.as_str()) {
+                return Err(ModelError::Run(format!(
+                    "the graph has no input named {name:?}; it declares {declared:?}"
+                )));
+            }
+        }
+        let mut values = Vec::with_capacity(inputs.len());
+        for (name, array) in inputs {
+            let shape: Vec<i64> = array.shape().iter().map(|&dim| dim as i64).collect();
+            let (data, _) = array.into_raw_vec_and_offset();
+            let tensor = Tensor::from_array((shape, data))
+                .map_err(|error| ModelError::Run(error.to_string()))?;
+            values.push((name, tensor));
+        }
         let outputs = self
             .session
-            .run(ort::inputs![name => tensor])
+            .run(values)
             .map_err(|error| ModelError::Run(error.to_string()))?;
-
-        // Collect by the graph's declared output order rather than by iterating the map, so the
-        // returned index always lines up with `outputs()`.
         self.outputs
             .iter()
             .map(|port| {
@@ -143,7 +174,7 @@ impl Model {
                         port.name
                     ))
                 })?;
-                extract_f32(value, &port.name)
+                Ok((port.name.clone(), extract_f32(value, &port.name)?))
             })
             .collect()
     }
