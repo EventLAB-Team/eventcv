@@ -22,6 +22,16 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: collate
 ```
 
+## Models
+
+```{eval-rst}
+.. autoclass:: eventcv.Model
+   :members:
+```
+
+Requires a build with the ``onnx`` feature (the published wheels have it). See
+:doc:`models` for scope and usage.
+
 ### E2VID export
 
 A `.zip` target — or `format="e2vid"` on a `.txt` — writes the layout
@@ -230,5 +240,5 @@ with `slice`/`windows`/`with_repr` without loading the file.
    :members:
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
       Polarity, FrameSink, EventSink, EventCamera, FEAST, load, from_numpy, open, save,
-      load_frame, load_feast, export_png, collate, stream, list_cameras
+      load_frame, load_feast, export_png, collate, stream, list_cameras, Model
 ```

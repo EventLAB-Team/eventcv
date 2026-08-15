@@ -45,6 +45,39 @@ impl Colormap {
 /// `[0, 1]` / `[-1, 1]`, integer counts divided by 255). Diverging kinds ignore `colormap`
 /// and use `RedBlue`; Tencode and CountMask ignore it entirely (already RGB encodings).
 pub fn render_frame(frame: &EventFrame, colormap: Colormap, normalize: bool) -> Rgb8Image {
+    render_frame_scaled(frame, colormap, Scale::from_normalize(normalize))
+}
+
+/// How a frame's scalar field is mapped onto the colormap's `[0, 1]` / `[-1, 1]` input range.
+///
+/// [`render_frame`] picks between the first two. The third exists for animation: auto-contrast is
+/// computed per frame, so a sequence rendered that way re-scales on every frame and the brightness
+/// visibly pumps. Holding one extent across the sequence is what makes an exported video readable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Scale {
+    /// Read values at their natural scale — `f32` reprs in `[0, 1]` / `[-1, 1]`, integer counts /255.
+    Natural,
+    /// Stretch to this frame's own robust extent (auto-contrast).
+    Auto,
+    /// Stretch to a caller-supplied extent, shared across however many frames the caller renders.
+    /// Values beyond it clamp to the end of the colormap. A non-positive extent falls back to
+    /// [`Scale::Natural`], so a calibration pass over blank frames cannot black out a whole video.
+    Fixed(f64),
+}
+
+impl Scale {
+    fn from_normalize(normalize: bool) -> Self {
+        if normalize {
+            Self::Auto
+        } else {
+            Self::Natural
+        }
+    }
+}
+
+/// [`render_frame`] with explicit control over the value scaling — see [`Scale`].
+pub fn render_frame_scaled(frame: &EventFrame, colormap: Colormap, scale: Scale) -> Rgb8Image {
+    let normalize = matches!(scale, Scale::Auto);
     let (_, height, width) = frame.shape();
     let plane_len = width * height;
 
@@ -68,7 +101,11 @@ pub fn render_frame(frame: &EventFrame, colormap: Colormap, normalize: bool) -> 
     }
 
     let (field, signed) = scalar_field(frame, plane_len);
-    let scale = field_scale(&field, signed, is_float(frame.data()), normalize);
+    let scale = match scale {
+        Scale::Fixed(extent) if extent > 0.0 => 1.0 / extent,
+        Scale::Fixed(_) => field_scale(&field, signed, is_float(frame.data()), false),
+        _ => field_scale(&field, signed, is_float(frame.data()), normalize),
+    };
     let colormap = if signed { Colormap::RedBlue } else { colormap };
 
     let mut pixels = Vec::with_capacity(plane_len * 3);
@@ -86,6 +123,24 @@ pub fn render_frame(frame: &EventFrame, colormap: Colormap, normalize: bool) -> 
         height,
         pixels,
     }
+}
+
+/// The display extent [`Scale::Auto`] would choose for this frame.
+///
+/// Exposed so a sequence can be calibrated before it is rendered: take this over a sample of frames,
+/// keep the largest, and pass it as [`Scale::Fixed`] to every frame. Returns `0.0` for a frame with
+/// no non-zero values, and for the kinds that bypass scalar mapping entirely (Tencode, CountMask,
+/// Flow) — those already carry their own scaling and are unaffected by [`Scale`].
+pub fn frame_extent(frame: &EventFrame) -> f64 {
+    if matches!(
+        frame.kind(),
+        RepresentationKind::Tencode | RepresentationKind::CountMask | RepresentationKind::Flow
+    ) {
+        return 0.0;
+    }
+    let (_, height, width) = frame.shape();
+    let (field, signed) = scalar_field(frame, width * height);
+    robust_extent(&field, signed)
 }
 
 /// Collapses a frame's channels to one scalar per pixel and reports whether it is signed.

@@ -27,6 +27,8 @@
 
 use ndarray::Array2;
 
+pub mod analytics;
+pub mod augment;
 pub mod bias;
 pub mod camera;
 pub mod cluster;
@@ -39,8 +41,12 @@ pub mod flow;
 pub mod image;
 pub mod io;
 pub mod mask;
+/// ONNX inference. Requires the `onnx` feature (on in the published wheels).
+#[cfg(feature = "onnx")]
+pub mod model;
 pub mod representation;
 pub mod transform;
+pub mod video;
 pub mod viz;
 
 const COLUMN_COUNT: usize = 4;

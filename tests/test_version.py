@@ -39,13 +39,16 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(_declared(ROOT / "crates" / "eventcv-core" / "Cargo.toml"), expected)
 
     def test_features_list_what_was_built_in(self):
-        # Published wheels carry both; a plain `cargo build` of the bindings carries neither.
+        # Published wheels carry all three; a plain `cargo build` of the bindings carries none.
         features = eventcv._rust.__features__
         self.assertIsInstance(features, list)
-        self.assertLessEqual(set(features), {"hdf5", "camera"})
+        self.assertLessEqual(set(features), {"hdf5", "camera", "onnx"})
         # Whatever they say must match what the module actually exposes.
         self.assertEqual("hdf5" in features, eventcv.EventSink is not None)
         self.assertEqual("camera" in features, eventcv.EventCamera is not None)
+        # `Model` is always bound — to the real class, or to a stub that explains the rebuild —
+        # so presence of the name proves nothing and the check has to be for the working one.
+        self.assertEqual("onnx" in features, eventcv.Model is getattr(eventcv._rust, "Model", None))
 
 
 class CommandLineTests(unittest.TestCase):

@@ -14,6 +14,11 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
   ready for NumPy and PyTorch.
 - **Detect features** — corner detectors and the unsupervised, trainable
   {class}`~eventcv.FEAST` feature extractor (the event analogue of `features2d`).
+- **Augment** for training with seeded, reproducible random ops that compose straight into a
+  PyTorch `DataLoader`.
+- **Visualise** — colormapped frames, animated `.gif` / `.apng` / `.mp4` export, and
+  event-rate analytics.
+- **Run a model** — feed a representation to any ONNX network with {class}`~eventcv.Model`.
 - **Call it your way** — every operation is available both as a method
   (`stream.voxel()`) and as an OpenCV-style free function (`eventcv.voxel(stream)`).
 
@@ -23,8 +28,12 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
 
 quickstart
 representations
+augmentation
 feature-detection
 streaming
+video
+models
+cli
 tutorials/index
 api
 ```
@@ -35,5 +44,21 @@ api
 pip install eventcv
 ```
 
-The wheel bundles its own libhdf5, so `.h5`/`.hdf5` support works with no extra installs.
+The wheel bundles its own libhdf5, so `.h5`/`.hdf5` support works with no extra installs, and its
+own ONNX Runtime for {class}`~eventcv.Model`. Writing `.mp4` is the one thing that expects
+something on your system — `ffmpeg` on `PATH`; `.gif` and `.apng` need nothing. Run
+`eventcv --version` to see which optional features a build has.
+
 The Rust core's API is documented separately on [docs.rs](https://docs.rs/eventcv-core).
+
+## What EventCV is not
+
+**A dataset library.** N-MNIST, DVS-Gesture, N-Caltech101 and friends are
+[tonic](https://tonic.readthedocs.io)'s job, and it does it well — auto-downloading, caching and
+versioning roughly twenty standard datasets. EventCV reads files and builds tensors; point tonic at
+a downloaded dataset and load its files with {func}`eventcv.load`, or use tonic end-to-end. There is
+no value in a second, worse copy of that.
+
+**A model zoo.** {class}`~eventcv.Model` runs any ONNX graph you give it, but EventCV ships no
+architectures and no weights. Bundling them would mean tracking every upstream model's
+preprocessing forever; building the tensors correctly is the part that belongs here.

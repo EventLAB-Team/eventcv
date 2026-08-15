@@ -46,6 +46,14 @@ clipped = stream.crop(0, 0, 320, 240).flip_x().hot_pixel_filter()
 clipped = ecv.hot_pixel_filter(ecv.flip_x(ecv.crop(stream, 0, 0, 320, 240)))
 ```
 
+For training there are seeded random counterparts — `random_flip_x`, `event_drop`,
+`spatial_jitter`, and friends — which chain the same way and stay reproducible across a shuffled
+`DataLoader`. See [Augmentation](augmentation.md).
+
+```python
+augmented = stream.random_flip_x(0.5, seed=0).event_drop(0.1, seed=0)
+```
+
 ## Represent as a dense tensor
 
 ```python

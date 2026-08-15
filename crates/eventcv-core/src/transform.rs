@@ -17,11 +17,14 @@ impl EventStream {
     /// `f` returns `None` to drop an event, or new `(x, y, t, p)` as `i64` coordinates;
     /// events landing outside the grid (including negative coordinates) are dropped before the
     /// `u16` cast. The single construction path shared by the geometric transforms.
+    ///
+    /// `f` is `FnMut` so the random augmentations can carry their seeded RNG in the closure; events
+    /// are visited once each, in order, so a stateful `f` sees a well-defined sequence.
     pub(crate) fn remap(
         &self,
         width: usize,
         height: usize,
-        f: impl Fn(i64, i64, i64, bool) -> Option<(i64, i64, i64, bool)>,
+        mut f: impl FnMut(i64, i64, i64, bool) -> Option<(i64, i64, i64, bool)>,
     ) -> EventStream {
         let mut builder =
             EventStreamBuilder::with_capacity(width, height, self.timestamp_scale_ms(), self.len());

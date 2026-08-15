@@ -20,7 +20,12 @@ rosbag = "0.6.3"
 # Same major version npyz already pulls transitively; only `FileOptions` is named here.
 zip = { version = "0.6", default-features = false }
 # Pure-Rust PNG encoder for colormapped frame export (`.png`) — no system deps, keeps wheels easy.
+# Also writes animated PNG (`acTL`/`fcTL`), so `.apng` export costs no extra dependency.
 png = "0.17"
+# Pure-Rust GIF encoder for animated export. Same no-system-deps story as `png`; `color_quant`
+# (pulled in by default) builds the 256-colour palette each frame needs. MP4 deliberately has no
+# crate here — it is piped to a system ffmpeg, see `video.rs` for why.
+gif = "0.14"
 # Optional: `.h5`/`.hdf5` reading. Builds libhdf5 from source (needs cmake) and
 # bundles the LZF filter used by event datasets. Enable with `--features hdf5`.
 hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-features = false, features = ["static", "lzf", "zlib"] }
@@ -41,11 +46,29 @@ neuromorphic-drivers = { version = "0.17", optional = true }
 # driver.) Remove this once the fields are public upstream.
 serde_json = { version = "1", optional = true }
 
+# Optional: ONNX inference. `download-binaries` fetches a prebuilt ONNX Runtime at build time, so
+# a wheel is self-contained and users install nothing extra. Pinned exactly because ort has no
+# stable release yet (2.0 is still RC) and a point release can move the API under us — the feature
+# gate means a bad RC is a build-flag change, not an API break. Enable with `--features onnx`.
+# `tls-rustls` is required by `download-binaries` and keeps the fetch pure-Rust (no OpenSSL to
+# find on any of the four wheel targets).
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+    "std",
+    "ndarray",          # take/return ndarray tensors, which representations already are
+    "download-binaries", # self-contained wheel: no ONNX Runtime install for the user
+    "tls-rustls",       # pure-Rust fetch; `tls-native` (the default) would want OpenSSL on manylinux
+    "copy-dylibs",      # place the runtime next to the extension so it resolves at import
+    "api-27",           # pin the ONNX Runtime API level rather than inherit it from defaults
+] }
+
 # The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
 # The `camera` feature turns on USB streaming (compiles the driver crate + a vendored libusb).
 [features]
 hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 camera = ["dep:neuromorphic-drivers", "dep:serde_json"]
+# ONNX inference for `Model`. Off by default so a source build never has to fetch a runtime;
+# the published wheels turn it on (see `[tool.maturin] features` in pyproject.toml).
+onnx = ["dep:ort"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.

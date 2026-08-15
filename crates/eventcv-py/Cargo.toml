@@ -25,3 +25,6 @@ hdf5 = ["eventcv-core/hdf5"]
 # Build USB event-camera streaming into the extension (forwards to eventcv-core, which pulls in
 # the neuromorphic-drivers crate + a vendored libusb). Enable with `maturin develop --features camera`.
 camera = ["eventcv-core/camera"]
+# Build ONNX inference (`Model`) into the extension (forwards to eventcv-core, which downloads a
+# prebuilt ONNX Runtime at build time). Enable with `maturin develop --features onnx`.
+onnx = ["eventcv-core/onnx"]

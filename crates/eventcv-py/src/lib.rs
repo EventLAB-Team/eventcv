@@ -33,6 +33,10 @@ use pyo3::exceptions::{
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyTuple};
+// Only the ONNX path returns a list (a multi-output graph), so the import carries the same gate
+// as the code that uses it — otherwise a default build warns about it being unused.
+#[cfg(feature = "onnx")]
+use pyo3::types::PyList;
 
 /// Default time span for the representations that have one (`window_ms`, `tau_ms`,
 /// `max_window_ms`) when none of its unit forms is given.
@@ -45,12 +49,19 @@ const FEATURES: &[&str] = &[
     "hdf5",
     #[cfg(feature = "camera")]
     "camera",
+    #[cfg(feature = "onnx")]
+    "onnx",
 ];
 
 /// Events read per pass when converting a whole `EventReader` to another format. Large enough
 /// that the per-chunk overhead disappears, small enough that the decoded columns stay well under
 /// a gigabyte on any sensor.
 const EXPORT_CHUNK: usize = 4_000_000;
+
+/// Slices sampled to pick one display scale for an exported animation. A robust percentile over a
+/// few frames tracks the recording closely enough, and bounding it keeps `save_video` from reading
+/// a long file twice just to decide how bright to draw it.
+const CLIM_CALIBRATION_FRAMES: usize = 8;
 
 #[pyclass(name = "EventStream", frozen)]
 struct PyEventStream {
@@ -246,6 +257,101 @@ impl PyEventStream {
     fn filter_polarity(&self, py: Python<'_>, polarity: i64) -> PyEventStream {
         let polarity = polarity != 0;
         self.wrap(py.detach(|| self.inner.filter_polarity(polarity)))
+    }
+
+    /// Activity over time, binned into fixed intervals.
+    ///
+    /// Returns a dict of numpy arrays — `t` (each bin's left edge, µs), `count`, `positive`,
+    /// `negative`, and `rate` (events/second) — so it plots directly:
+    /// `plt.plot(*r["t"] / 1e6, r["rate"])`. The spatial counterpart is `pixel_counts()` on a
+    /// reader, which totals events per pixel over a whole file.
+    #[pyo3(signature = (bin_ms=None, *, bin_s=None, bin_us=None, bin_ns=None))]
+    fn event_rate<'py>(
+        &self,
+        py: Python<'py>,
+        bin_ms: Option<f64>,
+        bin_s: Option<f64>,
+        bin_us: Option<f64>,
+        bin_ns: Option<f64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let bin_us = resolve_duration_us("bin", bin_s, bin_ms, bin_us, bin_ns)?.unwrap_or(1_000);
+        let rate = py.detach(|| self.inner.event_rate(bin_us));
+        let dict = PyDict::new(py);
+        dict.set_item("t", rate.starts.clone().into_pyarray(py))?;
+        dict.set_item("count", rate.counts.clone().into_pyarray(py))?;
+        dict.set_item("positive", rate.positive.clone().into_pyarray(py))?;
+        dict.set_item("negative", rate.negative.clone().into_pyarray(py))?;
+        dict.set_item("rate", rate.per_second().into_pyarray(py))?;
+        dict.set_item("bin_us", rate.bin_us)?;
+        Ok(dict)
+    }
+
+    // --- Random augmentations -------------------------------------------------------------
+    // Every one is a pure function of its inputs and `seed`: the same seed gives the same result,
+    // so a training run is reproducible from its config. On an `EventReader` the same names seed
+    // per slice instead, so a shuffled DataLoader still augments each slice identically.
+
+    /// Mirrors left-right with probability `p`.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn random_flip_x(&self, py: Python<'_>, p: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.random_flip_x(p, seed)))
+    }
+
+    /// Mirrors top-bottom with probability `p`.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn random_flip_y(&self, py: Python<'_>, p: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.random_flip_y(p, seed)))
+    }
+
+    /// Inverts every polarity with probability `p` (all events, not a random subset).
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn random_polarity_flip(&self, py: Python<'_>, p: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.random_polarity_flip(p, seed)))
+    }
+
+    /// Takes a random `width` × `height` crop; a window at least as large as the sensor is a no-op.
+    #[pyo3(signature = (width, height, *, seed=0))]
+    fn random_crop(&self, py: Python<'_>, width: usize, height: usize, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.random_crop(width, height, seed)))
+    }
+
+    /// Drops each event independently with probability `p`.
+    #[pyo3(signature = (p=0.1, *, seed=0))]
+    fn event_drop(&self, py: Python<'_>, p: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.event_drop(p, seed)))
+    }
+
+    /// Silences a random `p` fraction of pixels for the whole stream (dead-pixel simulation).
+    #[pyo3(signature = (p=0.1, *, seed=0))]
+    fn pixel_dropout(&self, py: Python<'_>, p: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.pixel_dropout(p, seed)))
+    }
+
+    /// Jitters each event's position by a gaussian offset of standard deviation `sigma` pixels.
+    #[pyo3(signature = (sigma=1.0, *, seed=0))]
+    fn spatial_jitter(&self, py: Python<'_>, sigma: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.spatial_jitter(sigma, seed)))
+    }
+
+    /// Jitters each event's timestamp by a gaussian offset, re-sorting afterwards.
+    #[pyo3(signature = (sigma_ms=None, *, sigma_s=None, sigma_us=None, sigma_ns=None, seed=0))]
+    fn time_jitter(
+        &self,
+        py: Python<'_>,
+        sigma_ms: Option<f64>,
+        sigma_s: Option<f64>,
+        sigma_us: Option<f64>,
+        sigma_ns: Option<f64>,
+        seed: u64,
+    ) -> PyResult<PyEventStream> {
+        let sigma = resolve_us("sigma", sigma_s, sigma_ms, sigma_us, sigma_ns)?.unwrap_or(1000.0);
+        Ok(self.wrap(py.detach(|| self.inner.time_jitter(sigma, seed))))
+    }
+
+    /// Plays the stream backwards with probability `p`, inverting polarity to match.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn time_reversal(&self, py: Python<'_>, p: f64, seed: u64) -> PyEventStream {
+        self.wrap(py.detach(|| self.inner.time_reversal(p, seed)))
     }
 
     /// Flips every event's polarity.
@@ -1273,7 +1379,11 @@ struct PyEventReader {
 /// A per-slice `EventStream` → `EventStream` transform a reader defers onto every fetched
 /// slice — the machinery behind `reader.hot_pixel_filter()`, `reader.flip_x()`, `efast`, … .
 /// Boxed so any stream op composes, and `Send + Sync` so it runs off-GIL in `py.detach`.
-type SliceOp = Arc<dyn Fn(EventStream) -> EventStream + Send + Sync>;
+/// The `usize` is the index of the slice being processed. Deterministic ops ignore it; the random
+/// augmentations seed from it, so slice `i` augments identically however it is reached — a shuffled
+/// `DataLoader`, several workers at once, or plain iteration all agree. Threading the index is what
+/// lets the RNG stay a pure function of `(seed, index)` instead of state carried between calls.
+type SliceOp = Arc<dyn Fn(usize, EventStream) -> EventStream + Send + Sync>;
 
 /// A reader's chain of deferred per-slice ops (empty = none), applied in push order.
 type SliceOps = Arc<[SliceOp]>;
@@ -1284,8 +1394,17 @@ fn no_slice_ops() -> SliceOps {
 }
 
 /// Applies a reader's deferred per-slice ops (in order) to a freshly fetched slice.
-fn apply_slice_ops(ops: &[SliceOp], stream: EventStream) -> EventStream {
-    ops.iter().fold(stream, |stream, op| op(stream))
+fn apply_slice_ops(ops: &[SliceOp], index: usize, stream: EventStream) -> EventStream {
+    ops.iter().fold(stream, |stream, op| op(index, stream))
+}
+
+/// Combines a user's `seed` with a slice index into the seed that slice's augmentation uses.
+///
+/// Adding them would make `seed=0, slice=1` and `seed=1, slice=0` the same draw, which would tie
+/// together runs a user expects to be independent; the odd multiplier keeps those apart, and
+/// `augment::slice_rng` runs the result through splitmix64's finalizer before use.
+fn mix_seed(seed: u64, index: usize) -> u64 {
+    seed.wrapping_add((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 /// How `slice(n)` / `reader[n]` / `windows()` partition the recording: fixed-duration
@@ -1305,10 +1424,13 @@ enum SliceWindow {
 
 /// Reads `window` from the shared reader off-GIL, dropping the whole-recording hot pixels (if
 /// any) before the deferred per-slice ops, so corner detectors never fire on stuck pixels.
+///
+/// `index` identifies which slice this is, and is handed to every deferred op — see [`SliceOp`].
 fn fetch_window(
     py: Python<'_>,
     reader: &Arc<Mutex<Reader>>,
     window: SliceWindow,
+    index: usize,
     ops: SliceOps,
     hot_pixel_mask: Option<Arc<[bool]>>,
 ) -> PyResult<EventStream> {
@@ -1324,7 +1446,7 @@ fn fetch_window(
                 Some(mask) => stream.drop_masked_pixels(mask),
                 None => stream,
             };
-            apply_slice_ops(&ops, stream)
+            apply_slice_ops(&ops, index, stream)
         })
     })
     .map_err(map_io_error)
@@ -1500,7 +1622,9 @@ impl PyEventReader {
                 t1.map_or(hi.saturating_add(1), |us| us.round() as i64),
             )
         };
-        self.fetch_slice(py, window)
+        // An ad-hoc t0/t1 window is not a numbered slice, so it seeds from 0; an explicit index
+        // seeds from that slice, matching `reader[n]`.
+        self.fetch_slice(py, window, index.map_or(0, |index| self.slice_seed(index)))
     }
 
     /// `reader[n]` — the `n`-th fixed frame (requires `open(dt_ms=…)` or
@@ -1509,7 +1633,7 @@ impl PyEventReader {
     /// `[C, H, W]` array, so a `torch.utils.data.DataLoader` can collate the reader directly.
     fn __getitem__(&self, py: Python<'_>, index: i64) -> PyResult<Py<PyAny>> {
         let window = self.window_for_index(index)?;
-        let stream = self.fetch(py, window)?;
+        let stream = self.fetch(py, window, self.slice_seed(index))?;
         match self.repr {
             Some(spec) => {
                 let frame = py
@@ -1585,58 +1709,58 @@ impl PyEventReader {
 
     /// Crops each slice to the `w`×`h` window at `(x0, y0)` (see [`EventStream::crop`]).
     fn crop(&self, x0: i64, y0: i64, w: usize, h: usize) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.crop(x0, y0, w, h)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.crop(x0, y0, w, h)))
     }
 
     /// Mirrors each slice horizontally.
     fn flip_x(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.flip_x()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.flip_x()))
     }
 
     /// Mirrors each slice vertically.
     fn flip_y(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.flip_y()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.flip_y()))
     }
 
     /// Rotates each slice by `k * 90°` clockwise.
     fn rotate90(&self, k: i32) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.rotate90(k)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.rotate90(k)))
     }
 
     /// Reflects each slice across the main diagonal.
     fn transpose(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.transpose()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.transpose()))
     }
 
     /// Translates each slice by `(dx, dy)`.
     fn translate(&self, dx: i64, dy: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.translate(dx, dy)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.translate(dx, dy)))
     }
 
     /// Event-domain resize of each slice to a `width`×`height` grid.
     fn resize(&self, width: usize, height: usize) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.resize(width, height)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.resize(width, height)))
     }
 
     /// Scales each slice's sensor by `(sx, sy)`.
     fn scale(&self, sx: f64, sy: f64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.scale(sx, sy)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.scale(sx, sy)))
     }
 
     /// Applies a 2×3 affine matrix to each slice.
     fn warp_affine(&self, matrix: [[f64; 3]; 2]) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.warp_affine(matrix)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.warp_affine(matrix)))
     }
 
     /// Applies a 3×3 perspective matrix to each slice.
     fn warp_perspective(&self, matrix: [[f64; 3]; 3]) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.warp_perspective(matrix)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.warp_perspective(matrix)))
     }
 
     /// Undistorts each slice with a `Camera`'s intrinsics + distortion.
     fn undistort(&self, camera: PyRef<'_, PyCamera>) -> PyEventReader {
         let camera = camera.inner;
-        self.with_slice_op(Arc::new(move |s: EventStream| s.undistort(&camera)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.undistort(&camera)))
     }
 
     /// Keeps each slice's events inside the region of interest — a `(H, W)` boolean mask (or 8-bit
@@ -1645,7 +1769,7 @@ impl PyEventReader {
     fn mask(&self, mask: &Bound<'_, PyAny>) -> PyResult<PyEventReader> {
         let (width, height) = self.sensor_size();
         let flat = parse_mask(mask, (width, height))?;
-        Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.mask(&flat, width, height))))
+        Ok(self.with_slice_op(Arc::new(move |_, s: EventStream| s.mask(&flat, width, height))))
     }
 
     /// Keeps each slice's events whose timestamp lies in `[t0, t1)` — positionally in
@@ -1667,7 +1791,7 @@ impl PyEventReader {
     ) -> PyResult<PyEventReader> {
         let t0 = resolve_bound("t0", t0, t0_s, t0_ms, t0_us, t0_ns)?.unwrap_or(i64::MIN);
         let t1 = resolve_bound("t1", t1, t1_s, t1_ms, t1_us, t1_ns)?.unwrap_or(i64::MAX);
-        Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.time_window(t0, t1))))
+        Ok(self.with_slice_op(Arc::new(move |_, s: EventStream| s.time_window(t0, t1))))
     }
 
     /// Shifts each slice's timestamps by `dt` — positionally in microseconds, or in any unit via
@@ -1682,69 +1806,262 @@ impl PyEventReader {
         dt_ns: Option<f64>,
     ) -> PyResult<PyEventReader> {
         let dt = resolve_bound("dt", dt, dt_s, dt_ms, dt_us, dt_ns)?.unwrap_or(0);
-        Ok(self.with_slice_op(Arc::new(move |s: EventStream| s.time_shift(dt))))
+        Ok(self.with_slice_op(Arc::new(move |_, s: EventStream| s.time_shift(dt))))
     }
 
     /// Scales each slice's timestamps by `factor`.
     fn time_scale(&self, factor: f64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.time_scale(factor)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.time_scale(factor)))
     }
 
     /// Shifts each slice's timestamps so its earliest event starts at zero.
     fn normalize_time(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.normalize_time()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.normalize_time()))
+    }
+
+    /// Renders every slice and writes them as one animation. Format comes from `path`'s
+    /// extension: `.gif`, `.apng`/`.png`, or `.mp4` (which pipes to a system `ffmpeg`).
+    ///
+    /// Needs a representation — `open(repr=…)` or `with_repr(…)` — since a video is a sequence of
+    /// rendered frames.
+    ///
+    /// `clim` fixes the value that maps to the top of the colormap, held across every frame. Left
+    /// as `None`, it is calibrated from the first few slices and then held, because auto-contrast
+    /// computed per frame makes the brightness pump visibly over a sequence. Pass `clim=0` to get
+    /// the per-frame behaviour back, or an explicit value to match two videos to the same scale.
+    #[pyo3(signature = (path, *, fps=30.0, colormap="viridis", clim=None, max_frames=None))]
+    fn save_video(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        fps: f64,
+        colormap: &str,
+        clim: Option<f64>,
+        max_frames: Option<usize>,
+    ) -> PyResult<usize> {
+        use eventcv_core::video::{encoder_for, Fps};
+        use eventcv_core::viz::{frame_extent, render_frame_scaled, Scale};
+
+        let spec = self.repr.ok_or_else(|| {
+            PyValueError::new_err(
+                "save_video needs a representation; open(repr=…) or reader.with_repr(…)",
+            )
+        })?;
+        let colormap = parse_colormap(colormap)?;
+        let mode = self.require_mode()?;
+        let total = self.frame_count(mode);
+        let frames = max_frames.map_or(total, |limit| limit.min(total));
+        if frames == 0 {
+            return Err(PyValueError::new_err(
+                "nothing to render: the reader has no slices",
+            ));
+        }
+
+        // Calibrate one display scale for the whole sequence. Bounded to a handful of slices so a
+        // multi-GB recording doesn't get read twice; the extent is a robust percentile, so a short
+        // sample is representative unless the scene changes completely.
+        let scale = match clim {
+            Some(value) if value > 0.0 => Scale::Fixed(value),
+            Some(_) => Scale::Auto, // clim=0 opts back in to per-frame auto-contrast
+            None => {
+                let mut extent = 0.0_f64;
+                for index in 0..frames.min(CLIM_CALIBRATION_FRAMES) {
+                    let stream = fetch_window(
+                        py,
+                        &self.inner,
+                        self.window_for_index(index as i64)?,
+                        index,
+                        self.slice_ops.clone(),
+                        self.hot_pixel_mask.clone(),
+                    )?;
+                    let frame = py
+                        .detach(|| spec.generate(&stream))
+                        .map_err(map_representation_error)?;
+                    extent = extent.max(py.detach(|| frame_extent(&frame)));
+                }
+                if extent > 0.0 {
+                    Scale::Fixed(extent)
+                } else {
+                    Scale::Auto
+                }
+            }
+        };
+
+        let mut encoder: Option<Box<dyn eventcv_core::video::AnimationEncoder + Send>> = None;
+        for index in 0..frames {
+            let stream = fetch_window(
+                py,
+                &self.inner,
+                self.window_for_index(index as i64)?,
+                index,
+                self.slice_ops.clone(),
+                self.hot_pixel_mask.clone(),
+            )?;
+            let image = py
+                .detach(|| {
+                    spec.generate(&stream)
+                        .map(|frame| render_frame_scaled(&frame, colormap, scale))
+                })
+                .map_err(map_representation_error)?;
+            // Opened on the first frame so the encoder learns the dimensions from real output
+            // rather than from the sensor size, which a crop or resize op may have changed.
+            let encoder = match encoder.as_mut() {
+                Some(encoder) => encoder,
+                None => encoder.insert(
+                    encoder_for(
+                        std::path::Path::new(path),
+                        frames as u32,
+                        image.width,
+                        image.height,
+                        Fps::new(fps),
+                    )
+                    .map_err(map_std_io_error)?,
+                ),
+            };
+            encoder.write_frame(&image).map_err(map_std_io_error)?;
+            py.check_signals()?; // a long render has to stay interruptible
+        }
+        if let Some(encoder) = encoder.take() {
+            py.detach(|| encoder.finish()).map_err(map_std_io_error)?;
+        }
+        Ok(frames)
+    }
+
+    // --- Random augmentations -------------------------------------------------------------
+    // Each op mixes `seed` with the index of the slice it is given, so slice `i` always augments
+    // the same way — whether it is reached by `reader[i]`, by `batch()`, by iteration, or by
+    // several DataLoader workers at once — while different slices still augment differently.
+
+    /// Mirrors each slice left-right with probability `p`.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn random_flip_x(&self, p: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.random_flip_x(p, mix_seed(seed, i))
+        }))
+    }
+
+    /// Mirrors each slice top-bottom with probability `p`.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn random_flip_y(&self, p: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.random_flip_y(p, mix_seed(seed, i))
+        }))
+    }
+
+    /// Inverts every polarity in a slice with probability `p`.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn random_polarity_flip(&self, p: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.random_polarity_flip(p, mix_seed(seed, i))
+        }))
+    }
+
+    /// Takes a random `width` × `height` crop of each slice.
+    #[pyo3(signature = (width, height, *, seed=0))]
+    fn random_crop(&self, width: usize, height: usize, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.random_crop(width, height, mix_seed(seed, i))
+        }))
+    }
+
+    /// Drops each event in a slice independently with probability `p`.
+    #[pyo3(signature = (p=0.1, *, seed=0))]
+    fn event_drop(&self, p: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.event_drop(p, mix_seed(seed, i))
+        }))
+    }
+
+    /// Silences a random `p` fraction of pixels in each slice.
+    #[pyo3(signature = (p=0.1, *, seed=0))]
+    fn pixel_dropout(&self, p: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.pixel_dropout(p, mix_seed(seed, i))
+        }))
+    }
+
+    /// Jitters event positions in each slice by a gaussian of standard deviation `sigma` pixels.
+    #[pyo3(signature = (sigma=1.0, *, seed=0))]
+    fn spatial_jitter(&self, sigma: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.spatial_jitter(sigma, mix_seed(seed, i))
+        }))
+    }
+
+    /// Jitters event timestamps in each slice, re-sorting afterwards.
+    #[pyo3(signature = (sigma_ms=None, *, sigma_s=None, sigma_us=None, sigma_ns=None, seed=0))]
+    fn time_jitter(
+        &self,
+        sigma_ms: Option<f64>,
+        sigma_s: Option<f64>,
+        sigma_us: Option<f64>,
+        sigma_ns: Option<f64>,
+        seed: u64,
+    ) -> PyResult<PyEventReader> {
+        let sigma = resolve_us("sigma", sigma_s, sigma_ms, sigma_us, sigma_ns)?.unwrap_or(1000.0);
+        Ok(self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.time_jitter(sigma, mix_seed(seed, i))
+        })))
+    }
+
+    /// Plays each slice backwards with probability `p`, inverting polarity to match.
+    #[pyo3(signature = (p=0.5, *, seed=0))]
+    fn time_reversal(&self, p: f64, seed: u64) -> PyEventReader {
+        self.with_slice_op(Arc::new(move |i, s: EventStream| {
+            s.time_reversal(p, mix_seed(seed, i))
+        }))
     }
 
     /// Keeps every `k`-th event of each slice.
     fn decimate(&self, k: usize) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.decimate(k)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.decimate(k)))
     }
 
     /// Keeps only events of the given polarity per slice (nonzero / `True` = ON).
     fn filter_polarity(&self, polarity: i64) -> PyEventReader {
         let polarity = polarity != 0;
-        self.with_slice_op(Arc::new(move |s: EventStream| s.filter_polarity(polarity)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.filter_polarity(polarity)))
     }
 
     /// Flips every event's polarity, per slice.
     fn invert_polarity(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.invert_polarity()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.invert_polarity()))
     }
 
     /// Reorders each slice by ascending timestamp (stable).
     fn sort_by_time(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.sort_by_time()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.sort_by_time()))
     }
 
     /// Background-activity (nearest-neighbour) noise filter, per slice.
     fn background_activity_filter(&self, dt: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| {
+        self.with_slice_op(Arc::new(move |_, s: EventStream| {
             s.background_activity_filter(dt)
         }))
     }
 
     /// Refractory-period filter, per slice.
     fn refractory_filter(&self, dt: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.refractory_filter(dt)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.refractory_filter(dt)))
     }
 
     /// Hot-pixel removal applied to each slice (per-slice statistics; distinct from
     /// `open(hot_pixel_filter=True)`, which computes one mask over the whole recording).
     #[pyo3(signature = (n_std=3.0))]
     fn hot_pixel_filter(&self, n_std: f64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.hot_pixel_filter(n_std)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.hot_pixel_filter(n_std)))
     }
 
     /// Returns a new reader whose every slice is passed through [`EventStream::efast`], so the
     /// reader yields corner sub-streams (chain `.count()` / `with_repr` to visualise them).
     fn efast(&self) -> PyEventReader {
-        self.with_slice_op(Arc::new(|s: EventStream| s.efast()))
+        self.with_slice_op(Arc::new(|_, s: EventStream| s.efast()))
     }
 
     /// Returns a new reader whose every slice is passed through [`EventStream::harris_corners`].
     #[pyo3(signature = (threshold=0.0))]
     fn harris_corners(&self, threshold: f64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |s: EventStream| s.harris_corners(threshold)))
+        self.with_slice_op(Arc::new(move |_, s: EventStream| s.harris_corners(threshold)))
     }
 
     /// Renders slice `indices` into one dense `[B, C, H, W]` array — the explicit-batch path
@@ -1763,6 +2080,7 @@ impl PyEventReader {
                 py,
                 &self.inner,
                 window,
+                self.slice_seed(index),
                 self.slice_ops.clone(),
                 self.hot_pixel_mask.clone(),
             )?;
@@ -1806,7 +2124,7 @@ impl PyEventReader {
             usize::try_from(i0).map_err(|_| PyValueError::new_err("i0 must be non-negative"))?;
         let i1 =
             usize::try_from(i1).map_err(|_| PyValueError::new_err("i1 must be non-negative"))?;
-        self.fetch_slice(py, SliceWindow::Index(i0, i1))
+        self.fetch_slice(py, SliceWindow::Index(i0, i1), 0)
     }
 
     /// Lazy iterator of consecutive windows: each is `[start, start + span_ms)` and
@@ -1886,6 +2204,9 @@ impl PyEventReader {
                 py,
                 &self.inner,
                 SliceWindow::Index(start, end),
+                // Export walks the recording in fixed chunks rather than slices, so the chunk
+                // ordinal is the stable identifier here — the same export always augments the same.
+                (start - self.base_index) / EXPORT_CHUNK,
                 self.slice_ops.clone(),
                 self.hot_pixel_mask.clone(),
             )?;
@@ -1898,11 +2219,12 @@ impl PyEventReader {
 
     /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
     /// applying the per-slice op (e.g. `efast`) if one is set.
-    fn fetch(&self, py: Python<'_>, window: SliceWindow) -> PyResult<PyEventStream> {
+    fn fetch(&self, py: Python<'_>, window: SliceWindow, index: usize) -> PyResult<PyEventStream> {
         fetch_window(
             py,
             &self.inner,
             window,
+            index,
             self.slice_ops.clone(),
             self.hot_pixel_mask.clone(),
         )
@@ -1914,11 +2236,12 @@ impl PyEventReader {
 
     /// Reads `window` and wraps it for a public slice API: rendered to the reader's
     /// `EventFrame` when a representation is set, else the raw `EventStream`.
-    fn fetch_slice(&self, py: Python<'_>, window: SliceWindow) -> PyResult<Py<PyAny>> {
+    fn fetch_slice(&self, py: Python<'_>, window: SliceWindow, index: usize) -> PyResult<Py<PyAny>> {
         let stream = fetch_window(
             py,
             &self.inner,
             window,
+            index,
             self.slice_ops.clone(),
             self.hot_pixel_mask.clone(),
         )?;
@@ -1946,6 +2269,7 @@ impl PyEventReader {
         PyWindowIterator {
             reader: Arc::clone(&self.inner),
             cursor,
+            emitted: 0,
             slice_ops: self.slice_ops.clone(),
             repr: self.repr,
             hot_pixel_mask: self.hot_pixel_mask.clone(),
@@ -1958,6 +2282,19 @@ impl PyEventReader {
                 "reader was opened without dt_ms or max_events; pass open(path, dt_ms=…) or open(path, max_events=…) to use integer slice indices",
             )
         })
+    }
+
+    /// The slice ordinal deferred ops should seed from, resolving a negative index the same way
+    /// [`PyEventReader::window_for_index`] does so `reader[-1]` and `reader[n - 1]` — the same
+    /// slice — augment identically. Out-of-range indices fall back to `0`; the fetch that follows
+    /// raises the real `IndexError`, and this must not be the thing that reports it.
+    fn slice_seed(&self, index: i64) -> usize {
+        let total = match self.require_mode() {
+            Ok(mode) => self.frame_count(mode) as i64,
+            Err(_) => return 0,
+        };
+        let resolved = if index < 0 { index + total } else { index };
+        usize::try_from(resolved).unwrap_or(0)
     }
 
     /// The window for the `index`-th slice under the reader's mode, validating the range
@@ -2019,6 +2356,9 @@ impl PyEventReader {
 struct PyWindowIterator {
     reader: Arc<Mutex<Reader>>,
     cursor: WindowCursor,
+    /// How many windows have been yielded — the ordinal deferred ops seed from, so iterating a
+    /// recording augments the same way indexing it does.
+    emitted: usize,
     slice_ops: SliceOps,
     /// The reader's stored representation. When set (`open(repr=…)` / `with_repr`) each yielded
     /// window is rendered to that `EventFrame`; otherwise a raw `EventStream` is yielded.
@@ -2082,10 +2422,13 @@ impl PyWindowIterator {
         let Some(window) = self.cursor.advance() else {
             return Ok(None);
         };
+        let index = self.emitted;
+        self.emitted += 1;
         let stream = fetch_window(
             py,
             &self.reader,
             window,
+            index,
             self.slice_ops.clone(),
             self.hot_pixel_mask.clone(),
         )?;
@@ -2370,6 +2713,19 @@ fn map_io_error(error: IoError) -> PyErr {
     }
 }
 
+/// The animation encoders return plain `std::io::Error` rather than the reader/writer `IoError`,
+/// so they get their own mapper. Missing-file becomes `FileNotFoundError`, which is also what a
+/// missing `ffmpeg` surfaces as — its message already names the fix.
+fn map_std_io_error(error: std::io::Error) -> PyErr {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        PyFileNotFoundError::new_err(error.to_string())
+    } else if error.kind() == std::io::ErrorKind::InvalidInput {
+        PyValueError::new_err(error.to_string())
+    } else {
+        PyOSError::new_err(error.to_string())
+    }
+}
+
 fn map_representation_error(error: RepresentationError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -2587,6 +2943,176 @@ fn map_resize_error(error: ResizeError) -> PyErr {
 
 fn map_feast_error(error: FeastError) -> PyErr {
     PyValueError::new_err(error.to_string())
+}
+
+/// Runs a trained ONNX network over a representation.
+///
+/// Deliberately a runner, not a model zoo: it takes any `.onnx` file and knows nothing about the
+/// architecture inside it. EventCV's job is to produce the tensor — a voxel grid or time surface is
+/// already a dense `f32` array in the layout ONNX wants — and to get out of the way.
+///
+/// Requires a build with the `onnx` feature; `eventcv --version` reports whether this one has it.
+#[cfg(feature = "onnx")]
+#[pyclass(name = "Model")]
+struct PyModel {
+    // ONNX Runtime's session internals are not thread-safe and `run` needs `&mut`, but a `#[pyclass]`
+    // hands out shared references. The mutex makes concurrent calls from Python threads safe rather
+    // than a data race; inference is long enough that the lock is not the bottleneck.
+    inner: Mutex<eventcv_core::model::Model>,
+    inputs: Vec<eventcv_core::model::Port>,
+    outputs: Vec<eventcv_core::model::Port>,
+}
+
+#[cfg(feature = "onnx")]
+#[pymethods]
+impl PyModel {
+    /// Loads an ONNX model from `path`.
+    #[new]
+    fn new(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let inner = py
+            .detach(|| eventcv_core::model::Model::load(path))
+            .map_err(map_model_error)?;
+        Ok(Self {
+            inputs: inner.inputs().to_vec(),
+            outputs: inner.outputs().to_vec(),
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// What the graph expects: a list of `{"name", "shape", "dtype"}`, with `-1` for any dimension
+    /// the graph leaves free (usually the batch axis).
+    #[getter]
+    fn inputs<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        ports_to_dicts(py, &self.inputs)
+    }
+
+    /// What the graph produces, in the same form as `inputs`.
+    #[getter]
+    fn outputs<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        ports_to_dicts(py, &self.outputs)
+    }
+
+    /// Runs the model over `data` — an `EventFrame` or any float32-convertible array.
+    ///
+    /// Returns one array for a single-output graph, or a list in the graph's declared output order.
+    /// A missing batch axis is added when the graph asks for one, so a `[C, H, W]` representation
+    /// feeds a `[N, C, H, W]` network without the caller reshaping it.
+    fn __call__<'py>(&self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let array = to_f32_array(py, data)?;
+        let array = self.match_input_rank(array);
+        let mut outputs = py
+            .detach(|| {
+                self.inner
+                    .lock()
+                    .expect("model mutex was poisoned by a previous panic")
+                    .run(array)
+            })
+            .map_err(map_model_error)?;
+        if outputs.len() == 1 {
+            // The overwhelmingly common case; returning a one-element list would make every call
+            // site index it for no reason.
+            return Ok(outputs.remove(0).into_pyarray(py).into_any());
+        }
+        let list = PyList::empty(py);
+        for output in outputs {
+            list.append(output.into_pyarray(py))?;
+        }
+        Ok(list.into_any())
+    }
+
+    fn __repr__(&self) -> String {
+        let shape = self
+            .inputs
+            .first()
+            .map(|port| format!("{:?}", port.shape))
+            .unwrap_or_else(|| "?".into());
+        format!(
+            "Model(inputs={}, outputs={}, input_shape={})",
+            self.inputs.len(),
+            self.outputs.len(),
+            shape
+        )
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl PyModel {
+    /// Adds a leading batch axis when the graph wants one and the caller did not supply it.
+    ///
+    /// A representation is `[C, H, W]` while nearly every trained network is `[N, C, H, W]`, so
+    /// without this every call site would carry the same `arr[None]`. Only ever *adds* an axis, and
+    /// only when the ranks differ by exactly one — anything else is a real mismatch the graph
+    /// should reject with its own message.
+    fn match_input_rank(&self, array: numpy::ndarray::ArrayD<f32>) -> numpy::ndarray::ArrayD<f32> {
+        let Some(expected) = self.inputs.first().map(|port| port.shape.len()) else {
+            return array;
+        };
+        if expected == array.ndim() + 1 {
+            let mut shape = vec![1usize];
+            shape.extend_from_slice(array.shape());
+            if let Ok(reshaped) = array.clone().into_shape_with_order(shape) {
+                return reshaped;
+            }
+        }
+        array
+    }
+}
+
+/// Renders model port metadata as plain dicts, so the shape/dtype of a graph can be inspected
+/// without importing anything or learning a new type.
+#[cfg(feature = "onnx")]
+fn ports_to_dicts<'py>(
+    py: Python<'py>,
+    ports: &[eventcv_core::model::Port],
+) -> PyResult<Vec<Bound<'py, PyDict>>> {
+    ports
+        .iter()
+        .map(|port| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", port.name.as_str())?;
+            dict.set_item("shape", port.shape.clone())?;
+            dict.set_item("dtype", port.dtype.as_str())?;
+            Ok(dict)
+        })
+        .collect()
+}
+
+/// Coerces a model input to an owned `f32` array, accepting an `EventFrame` directly.
+#[cfg(feature = "onnx")]
+fn to_f32_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<numpy::ndarray::ArrayD<f32>> {
+    if let Ok(frame) = data.extract::<PyRef<PyEventFrame>>() {
+        // Go through the frame's own numpy view so every EventFrameData dtype is handled in one
+        // place rather than matched again here.
+        let array = frame_numpy(py, &frame.inner);
+        return to_f32_array(py, &array);
+    }
+    let array = data
+        .call_method1("astype", ("float32",))
+        .unwrap_or_else(|_| data.clone());
+    let readonly = array.extract::<numpy::PyReadonlyArrayDyn<f32>>().map_err(|_| {
+        PyValueError::new_err(
+            "model input must be an EventFrame or a numpy array convertible to float32",
+        )
+    })?;
+    Ok(readonly.as_array().to_owned())
+}
+
+#[cfg(feature = "onnx")]
+fn map_model_error(error: eventcv_core::model::ModelError) -> PyErr {
+    use eventcv_core::model::ModelError;
+    match error {
+        // A path that does not exist is the common mistake and deserves the specific exception.
+        // ort words this as "File at `…` does not exist"; match loosely so a reworded message in
+        // a later release degrades to ValueError rather than being mapped to something wrong.
+        ModelError::Load(message)
+            if message.contains("does not exist") || message.contains("No such file") =>
+        {
+            PyFileNotFoundError::new_err(message)
+        }
+        ModelError::Load(message)
+        | ModelError::Run(message)
+        | ModelError::UnsupportedOutput(message) => PyValueError::new_err(message),
+    }
 }
 
 /// FEAST feature extractor (Afshar et al., 2020) — an unsupervised, online, sklearn-style model.
@@ -4326,8 +4852,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // than whatever distribution metadata happens to sit beside it — which is the version worth
     // having in a bug report. `tests/test_version.py` keeps it in step with pyproject.toml.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    // Which optional features this build has, so `eventcv --version` can say whether HDF5 reading
-    // and USB camera streaming are actually compiled in (the published wheels have both).
+    // Which optional features this build has, so `eventcv --version` can say whether HDF5 reading,
+    // USB camera streaming and ONNX inference are actually compiled in (the published wheels have
+    // all three).
     m.add("__features__", FEATURES)?;
     m.add_class::<PyEventStream>()?;
     m.add_class::<PyEventFrame>()?;
@@ -4337,6 +4864,8 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPolarity>()?;
     m.add_class::<PyCamera>()?;
     m.add_class::<PyFeast>()?;
+    #[cfg(feature = "onnx")]
+    m.add_class::<PyModel>()?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;

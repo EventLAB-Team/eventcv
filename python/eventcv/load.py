@@ -11,6 +11,26 @@ Camera = _rust.Camera
 FEAST = _rust.FEAST
 
 
+class _MissingModel:
+    """Stand-in for `Model` in a build without the `onnx` feature.
+
+    The published wheels have it, so this is only reached by a source build that left the feature
+    off. Raising at construction with the actual fix beats `AttributeError: no attribute 'Model'`,
+    which reads like the feature does not exist at all.
+    """
+
+    def __init__(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "eventcv was built without ONNX support, so Model is unavailable. Reinstall from "
+            "PyPI (`pip install --force-reinstall eventcv`), or rebuild with "
+            "`maturin develop --features onnx`. `eventcv --version` lists the features this "
+            "build has."
+        )
+
+
+Model = getattr(_rust, "Model", _MissingModel)
+
+
 def load(
     path: str,
     *,
@@ -830,6 +850,7 @@ __all__ = [
     "EventStream",
     "FEAST",
     "FrameSink",
+    "Model",
     "Polarity",
     "circle_mask",
     "collate",
