@@ -38,6 +38,15 @@ use pyo3::types::{PyAny, PyDict, PyTuple};
 /// `max_window_ms`) when none of its unit forms is given.
 const DEFAULT_SPAN_MS: f64 = 30.0;
 
+/// The optional features compiled into this extension, in a fixed order so the string is stable.
+/// Empty when neither is on — a plain `cargo build` of the bindings.
+const FEATURES: &[&str] = &[
+    #[cfg(feature = "hdf5")]
+    "hdf5",
+    #[cfg(feature = "camera")]
+    "camera",
+];
+
 /// Events read per pass when converting a whole `EventReader` to another format. Large enough
 /// that the per-chunk overhead disappears, small enough that the decoded columns stay well under
 /// a gigabyte on any sensor.
@@ -4313,6 +4322,13 @@ fn record(
 
 #[pymodule]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Baked in from this crate's Cargo.toml, so it describes the extension actually loaded rather
+    // than whatever distribution metadata happens to sit beside it — which is the version worth
+    // having in a bug report. `tests/test_version.py` keeps it in step with pyproject.toml.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // Which optional features this build has, so `eventcv --version` can say whether HDF5 reading
+    // and USB camera streaming are actually compiled in (the published wheels have both).
+    m.add("__features__", FEATURES)?;
     m.add_class::<PyEventStream>()?;
     m.add_class::<PyEventFrame>()?;
     m.add_class::<PyEventPointSet>()?;

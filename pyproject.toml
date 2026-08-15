@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "eventcv"
-version = "1.0.4"
+version = "1.0.5"
 description = "Open source event-based computer vision library."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -47,6 +47,11 @@ classifiers = [
 # the Rust reader links its own libhdf5.
 [project.optional-dependencies]
 test = ["h5py>=3", "hdf5plugin"]
+
+# `eventcv --version` reports the installed version and which optional features the wheel was
+# built with. `python -m eventcv --version` does the same without the console script on PATH.
+[project.scripts]
+eventcv = "eventcv.__main__:main"
 
 [project.urls]
 homepage = "https://eventcv.net"

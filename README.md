@@ -29,6 +29,14 @@ conda install eventcv
 pixi add eventcv
 ```
 
+Check what you have installed — the version, and whether the wheel includes HDF5 reading and USB
+camera streaming (the published ones do). Worth pasting into a bug report:
+```console
+$ eventcv --version          # or: python -m eventcv --version
+eventcv 1.0.5 (hdf5, camera)
+Python 3.13.5 on macOS-14.8.3-arm64-arm-64bit-Mach-O
+```
+
 ## Contributing
 EventCV is an open-sourced project for the event-based computer vision community. We welcome and appreciate contributions from users who would like to propose improvements or feature additions.
 
