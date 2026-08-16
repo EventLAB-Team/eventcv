@@ -23,6 +23,22 @@ print(result["improvement"])   # how much sharper than assuming no motion
 stopped wherever it happened to be — the parameters are meaningless. That happens when the slice is
 too short, too sparse, or the scene genuinely was still.
 
+### Filter hot pixels first
+
+On real recordings this is not optional. A single stuck pixel firing at ~15 kHz puts hundreds of
+events on one coordinate in a 50 ms slice, and because it does not move, warping only smears it —
+so the sharpest image is the unwarped one and contrast maximisation confidently reports **zero
+motion** on a camera that is visibly turning.
+
+```python
+events = reader.slice(...).hot_pixel_filter(3.0)     # then contrast_maximise
+```
+
+Measured on a DAVIS346 recording: filtering removed 7.6% of events and dropped the busiest pixel
+from 745 events to 27. Before it, the recovered velocity was exactly zero; after it, +200 px/s
+against an IMU-predicted 142 px/s. If `improvement` comes back at 1.0 and the parameters are all
+zero, this is the first thing to check.
+
 ### Warp models
 
 | `model` | Parameters | When it applies |
@@ -138,3 +154,19 @@ A recording cannot do this — it has no ground-truth motion attached, which is 
 implementations validate qualitatively or not at all. The test suite asserts this recovery, so a
 regression in the warp, the objective or the optimiser fails the build rather than quietly
 degrading the estimate.
+
+### Validated against a real IMU
+
+A DAVIS carries an IMU, which *is* an independent measurement of how the camera moved. On a
+car-mounted DAVIS346 turning a corner, over six consecutive 50 ms windows:
+
+| | measured |
+| --- | --- |
+| IMU yaw | −0.549 to −0.591 rad/s |
+| Recovered `wy` | −0.571 to −0.657 rad/s |
+| Correlation | +0.83 |
+| Sharpening over the static hypothesis | 1.13–1.17× |
+
+Same axis, same sign, agreeing to about 10%. The residual is expected: the car is translating as
+well as turning, and a pure-rotation fit absorbs some of that. Reading the IMU takes one call —
+see {func}`eventcv.read_imu`.

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use rosbag::{ChunkRecord, IndexRecord, MessageRecord, RosBag};
 
 use super::{IoError, LoadOptions, SliceSource};
+use crate::representation::{EventFrame, EventFrameData};
 use crate::{EventStream, EventStreamBuilder};
 
 const DEFAULT_TOPIC: &str = "/davis/left/events";
@@ -570,6 +571,280 @@ fn map_bag_error(error: rosbag::Error) -> IoError {
     IoError::Format(format!("rosbag: {error}"))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Auxiliary streams: APS frames, IMU and intrinsics
+//
+// A DAVIS bag carries more than events, and until now this reader dropped all of it. The frames are
+// what the simulator needs a reference for; the IMU is the only ground-truth motion available for
+// contrast maximisation; the intrinsics are what the rotation warp needs to map pixels onto rays.
+// The chunk index, connection matching and `ByteReader` below are the same ones the event path
+// uses — only the message layouts are new.
+// ---------------------------------------------------------------------------------------------
+
+const IMAGE_TYPE: &str = "sensor_msgs/Image";
+const IMU_TYPE: &str = "sensor_msgs/Imu";
+const CAMERA_INFO_TYPE: &str = "sensor_msgs/CameraInfo";
+
+/// One `sensor_msgs/Imu` sample.
+///
+/// Orientation is in the message but not here: on a DAVIS it is dead-reckoned from the same gyro
+/// and accelerometer, so exposing it would imply an independent measurement that does not exist.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImuSample {
+    pub t_us: i64,
+    /// Rad/s about the IMU's x, y and z axes.
+    pub angular_velocity: [f64; 3],
+    /// m/s² along the same axes, gravity included.
+    pub linear_acceleration: [f64; 3],
+}
+
+/// Every topic in a bag, with its message type.
+///
+/// Bags do not agree on topic names — this reader defaults to `/davis/left/events` while a DAVIS
+/// recorded through the `dvs_ros_driver` uses `/dvs/events` — so being able to ask is the
+/// difference between a reader that works on the first file someone tries and one that appears
+/// broken.
+pub fn bag_topics(path: impl AsRef<Path>) -> Result<Vec<(String, String)>, IoError> {
+    let bag = RosBag::new(path).map_err(IoError::Io)?;
+    let mut topics: Vec<(String, String)> = Vec::new();
+    for record in bag.index_records() {
+        if let IndexRecord::Connection(connection) = record.map_err(map_bag_error)? {
+            let entry = (connection.topic.to_owned(), connection.tp.to_owned());
+            if !topics.contains(&entry) {
+                topics.push(entry);
+            }
+        }
+    }
+    topics.sort();
+    Ok(topics)
+}
+
+/// Finds the connection ids carrying `wanted_type`, preferring `topic` when it is given and
+/// present. Returns the ids and the topic they belong to.
+///
+/// Falling back to the sole connection of the right type is deliberate: asking for frames from a
+/// bag that has exactly one image topic should work without the caller having to know its name.
+fn connections_of_type(
+    bag: &RosBag,
+    wanted_type: &str,
+    topic: Option<&str>,
+) -> Result<(Vec<u32>, String), IoError> {
+    let mut by_topic: HashMap<String, Vec<u32>> = HashMap::new();
+    for record in bag.index_records() {
+        if let IndexRecord::Connection(connection) = record.map_err(map_bag_error)? {
+            if connection.tp == wanted_type {
+                by_topic
+                    .entry(connection.topic.to_owned())
+                    .or_default()
+                    .push(connection.id);
+            }
+        }
+    }
+    if let Some(topic) = topic {
+        if let Some(ids) = by_topic.get(topic) {
+            return Ok((ids.clone(), topic.to_owned()));
+        }
+    }
+    match by_topic.len() {
+        1 => {
+            let (found, ids) = by_topic.into_iter().next().expect("checked len");
+            Ok((ids, found))
+        }
+        0 => Err(IoError::Unsupported(format!(
+            "the bag has no {wanted_type} topic"
+        ))),
+        _ => {
+            let mut names: Vec<String> = by_topic.into_keys().collect();
+            names.sort();
+            Err(IoError::Unsupported(format!(
+                "the bag has several {wanted_type} topics ({}); pass one explicitly",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// Chunk metadata for the whole bag, so a windowed read can skip chunks entirely.
+fn chunk_metadata(bag: &RosBag) -> Result<Vec<ChunkMeta>, IoError> {
+    let mut chunks = Vec::new();
+    for record in bag.index_records() {
+        if let IndexRecord::ChunkInfo(info) = record.map_err(map_bag_error)? {
+            chunks.push(ChunkMeta {
+                pos: info.chunk_pos,
+                start_us: (info.start_time / 1_000) as i64,
+                end_us: (info.end_time / 1_000) as i64,
+            });
+        }
+    }
+    chunks.sort_by_key(|chunk| chunk.start_us);
+    Ok(chunks)
+}
+
+/// Walks messages on the given connections, skipping whole chunks outside `[t0_us, t1_us)`.
+/// Essential rather than an optimisation: these bags run to tens of gigabytes.
+///
+/// The window is applied *coarsely* here, on the bag's record times, and each reader then filters
+/// precisely on the timestamp inside the message. Those are not the same clock: a message's header
+/// stamp is when the sensor sampled, while its record time is when the recorder wrote it, and on
+/// this DAVIS they differ by several milliseconds. The header stamp is the one that lines up with
+/// the events, so it is the one readers report and filter on — and this pass has to be generous
+/// enough not to drop a message whose header falls inside the window while its record time does
+/// not.
+fn for_each_message(
+    bag: &RosBag,
+    conn_ids: &[u32],
+    t0_us: i64,
+    t1_us: i64,
+    visit: &mut dyn FnMut(&[u8]) -> Result<bool, IoError>,
+) -> Result<(), IoError> {
+    let chunks = chunk_metadata(bag)?;
+    for chunk in select_chunks(&chunks, t0_us, t1_us) {
+        let mut iterator = bag.chunk_records();
+        iterator.seek(chunk.pos).map_err(map_bag_error)?;
+        let Some(record) = iterator.next() else {
+            continue;
+        };
+        let ChunkRecord::Chunk(decoded) = record.map_err(map_bag_error)? else {
+            continue;
+        };
+        for message in decoded.messages() {
+            if let MessageRecord::MessageData(data) = message.map_err(map_bag_error)? {
+                if !conn_ids.contains(&data.conn_id) {
+                    continue;
+                }
+                if visit(data.data)? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads `sensor_msgs/Image` frames in `[t0_us, t1_us)` as timestamped greyscale frames.
+///
+/// DAVIS APS is `mono8`. Other encodings are refused by name rather than silently misread — a
+/// `bgr8` frame decoded as `mono8` produces a plausible-looking image that is simply wrong.
+pub fn read_bag_frames(
+    path: impl AsRef<Path>,
+    topic: Option<&str>,
+    t0_us: i64,
+    t1_us: i64,
+) -> Result<Vec<(i64, EventFrame)>, IoError> {
+    let bag = RosBag::new(path).map_err(IoError::Io)?;
+    let (conn_ids, _) = connections_of_type(&bag, IMAGE_TYPE, topic)?;
+    let mut frames = Vec::new();
+    for_each_message(&bag, &conn_ids, t0_us, t1_us, &mut |bytes| {
+        let mut reader = ByteReader::new(bytes);
+        let t_us = reader.ros_header()?;
+        if t_us < t0_us || t_us >= t1_us {
+            return Ok(false);
+        }
+        let height = reader.u32()? as usize;
+        let width = reader.u32()? as usize;
+        let encoding = reader.string()?;
+        reader.skip(1)?; // is_bigendian
+        let step = reader.u32()? as usize;
+        let length = reader.u32()? as usize;
+        let data = reader.take(length)?;
+
+        // A DAVIS publishes `mono8` when the driver hands the APS through untouched and `rgb8` when
+        // it colourises first — this recording does the latter — so both have to work. Colour is
+        // reduced to luma with the same weights the PNG reader uses, since the underlying APS pixel
+        // was monochrome to begin with and the three channels carry no extra information.
+        let channels = match encoding.as_str() {
+            "mono8" => 1usize,
+            "rgb8" | "bgr8" => 3,
+            other => {
+                return Err(IoError::Unsupported(format!(
+                    "frame encoding {other:?} is not supported; this reader handles mono8, rgb8 \
+                     and bgr8"
+                )))
+            }
+        };
+        let swap_rb = encoding == "bgr8";
+        // `step` is the row stride, which may exceed `width * channels` for alignment — copy row by
+        // row rather than assuming the buffer is tightly packed.
+        let mut samples = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let start = row * step;
+            let line = data.get(start..start + width * channels).ok_or_else(|| {
+                IoError::Format("image row runs past the message payload".to_owned())
+            })?;
+            for pixel in line.chunks_exact(channels) {
+                samples.push(match (channels, swap_rb) {
+                    (1, _) => pixel[0],
+                    (_, false) => super::luma(pixel),
+                    (_, true) => super::luma(&[pixel[2], pixel[1], pixel[0]]),
+                });
+            }
+        }
+        let frame = EventFrame::intensity(EventFrameData::U8(samples), width, height)
+            .map_err(|error| IoError::Format(error.to_string()))?;
+        frames.push((t_us, frame));
+        Ok(false)
+    })?;
+    Ok(frames)
+}
+
+/// Reads `sensor_msgs/Imu` samples in `[t0_us, t1_us)`.
+pub fn read_bag_imu(
+    path: impl AsRef<Path>,
+    topic: Option<&str>,
+    t0_us: i64,
+    t1_us: i64,
+) -> Result<Vec<ImuSample>, IoError> {
+    let bag = RosBag::new(path).map_err(IoError::Io)?;
+    let (conn_ids, _) = connections_of_type(&bag, IMU_TYPE, topic)?;
+    let mut samples = Vec::new();
+    for_each_message(&bag, &conn_ids, t0_us, t1_us, &mut |bytes| {
+        let mut reader = ByteReader::new(bytes);
+        let t_us = reader.ros_header()?;
+        if t_us < t0_us || t_us >= t1_us {
+            return Ok(false);
+        }
+        reader.skip(4 * 8)?; // orientation quaternion
+        reader.skip(9 * 8)?; // orientation_covariance
+        let angular_velocity = reader.vector3()?;
+        reader.skip(9 * 8)?; // angular_velocity_covariance
+        let linear_acceleration = reader.vector3()?;
+        samples.push(ImuSample {
+            t_us,
+            angular_velocity,
+            linear_acceleration,
+        });
+        Ok(false)
+    })?;
+    Ok(samples)
+}
+
+/// Reads the first `sensor_msgs/CameraInfo` as camera intrinsics.
+///
+/// Only the pinhole terms are taken from `K`; distortion coefficients are read but not applied,
+/// because `Camera::with_distortion` expects the radial/tangential model and a bag may carry any of
+/// several. Callers wanting undistortion should build the `Camera` themselves from `D`.
+pub fn read_bag_camera_info(
+    path: impl AsRef<Path>,
+    topic: Option<&str>,
+) -> Result<Option<crate::camera::Camera>, IoError> {
+    let bag = RosBag::new(path).map_err(IoError::Io)?;
+    let (conn_ids, _) = connections_of_type(&bag, CAMERA_INFO_TYPE, topic)?;
+    let mut camera = None;
+    for_each_message(&bag, &conn_ids, i64::MIN, i64::MAX, &mut |bytes| {
+        let mut reader = ByteReader::new(bytes);
+        reader.ros_header()?;
+        reader.skip(4 + 4)?; // height, width
+        let _distortion_model = reader.string()?;
+        let coefficients = reader.u32()? as usize;
+        reader.skip(coefficients * 8)?; // D
+                                        // K is row-major [fx 0 cx; 0 fy cy; 0 0 1].
+        let k: Vec<f64> = (0..9).map(|_| reader.f64()).collect::<Result<_, _>>()?;
+        camera = Some(crate::camera::Camera::new(k[0], k[4], k[2], k[5]));
+        Ok(true) // intrinsics do not change mid-recording
+    })?;
+    Ok(camera)
+}
+
 /// Little-endian cursor over a ROS message payload.
 struct ByteReader<'a> {
     bytes: &'a [u8],
@@ -606,6 +881,31 @@ impl<'a> ByteReader<'a> {
 
     fn u32(&mut self) -> Result<u32, IoError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn f64(&mut self) -> Result<f64, IoError> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// A ROS string: 32-bit length then the bytes. Invalid UTF-8 is replaced rather than rejected —
+    /// a mangled `frame_id` is no reason to fail a frame that decodes fine otherwise.
+    fn string(&mut self) -> Result<String, IoError> {
+        let length = self.u32()? as usize;
+        Ok(String::from_utf8_lossy(self.take(length)?).into_owned())
+    }
+
+    /// `std_msgs/Header`: seq, stamp, frame_id. Returns the stamp in microseconds, which is the
+    /// clock every reader here works in.
+    fn ros_header(&mut self) -> Result<i64, IoError> {
+        self.skip(4)?; // seq
+        let seconds = i64::from(self.u32()?);
+        let nanoseconds = i64::from(self.u32()?);
+        let _frame_id = self.string()?;
+        Ok(seconds * 1_000_000 + nanoseconds / 1_000)
+    }
+
+    fn vector3(&mut self) -> Result<[f64; 3], IoError> {
+        Ok([self.f64()?, self.f64()?, self.f64()?])
     }
 }
 

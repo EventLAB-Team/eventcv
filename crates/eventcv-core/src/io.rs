@@ -13,7 +13,10 @@ mod prophesee_raw;
 mod text;
 
 pub use aedat::read_aedat;
-pub use bag::{open_bag_slice, read_bag, write_bag, BagSliceSource};
+pub use bag::{
+    bag_topics, open_bag_slice, read_bag, read_bag_camera_info, read_bag_frames, read_bag_imu,
+    write_bag, BagSliceSource, ImuSample,
+};
 pub use e2vid::{write_e2vid, E2vidWriter};
 #[cfg(feature = "hdf5")]
 pub use h5::{
@@ -618,7 +621,7 @@ pub fn read_png_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
 
 /// Rec. 601 luma. A single sample is already grey and passes through untouched, which keeps a
 /// greyscale PNG bit-exact rather than round-tripping it through the weights.
-fn luma(colour: &[u8]) -> u8 {
+pub(crate) fn luma(colour: &[u8]) -> u8 {
     match colour {
         [grey] => *grey,
         [r, g, b, ..] => {

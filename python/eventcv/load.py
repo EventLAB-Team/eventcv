@@ -54,7 +54,12 @@ def load(
     Supported today: ``.npz`` (N-ImageNet), ``.txt``/``.csv`` (e.g. EV-IMO
     ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), ``.hdf5``/``.h5``,
     ``.aedat`` (AEDAT 2.0, jAER/DAVIS), ``.dat`` (Prophesee CD events), and
-    Prophesee EVT3 ``.raw`` recordings.
+    Prophesee EVT2 and EVT3 ``.raw`` recordings.
+
+    A `.raw` file's encoding comes from its header, and its sensor size from ``% geometry`` when
+    present — some recorders omit it, and the size is then derived from the events themselves,
+    which is a tight bound on what fired rather than the physical sensor. Pass ``sensor_size``
+    to override.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted and only act
     as overrides: rosbags carry both in the message; HDF5/text infer the time unit
@@ -287,6 +292,9 @@ EventSink = getattr(_rust, "EventSink", None)
 # `EventCamera` and the live-streaming functions are only built when the extension includes
 # USB camera support (the published wheels do); keep imports resilient otherwise.
 EventCamera = getattr(_rust, "EventCamera", None)
+
+# Sentinel for "to the end of the recording" — i64::MAX on the Rust side.
+_MAX_US = (1 << 63) - 1
 
 _NO_CAMERA = (
     "eventcv was built without USB camera support. Install a build with the `camera` feature "
@@ -895,6 +903,79 @@ class StatefulModel:
         raise ValueError("every output is claimed by state_map, leaving no image to return")
 
 
+def bag_topics(path: str) -> list[tuple[str, str]]:
+    """List every topic in a ROS bag with its message type.
+
+    Bags disagree about names — a DAVIS recorded through ``dvs_ros_driver`` publishes
+    ``/dvs/events`` where :func:`load` defaults to ``/davis/left/events`` — so this is usually the
+    first thing to call on an unfamiliar file::
+
+        >>> ecv.bag_topics("recording.bag")
+        [('/dvs/camera_info', 'sensor_msgs/CameraInfo'),
+         ('/dvs/events', 'dvs_msgs/EventArray'),
+         ('/dvs/image_raw', 'sensor_msgs/Image'),
+         ('/dvs/imu', 'sensor_msgs/Imu')]
+    """
+    return _rust.bag_topics(path)
+
+
+def read_frames(
+    path: str,
+    *,
+    topic: str | None = None,
+    t0_us: int = 0,
+    t1_us: int | None = None,
+) -> list[tuple[int, EventFrame]]:
+    """Read DAVIS APS frames from a bag as ``[(t_us, EventFrame), …]``.
+
+    The greyscale images a DAVIS captures alongside its events — the reference the simulator is
+    calibrated against, since the frames and the events see the same scene through the same lens.
+
+    ``topic`` defaults to the bag's only ``sensor_msgs/Image`` topic when there is exactly one.
+    The time window matters: these recordings run to tens of gigabytes, and whole chunks outside it
+    are skipped without being decoded. Only ``mono8`` is supported; any other encoding raises rather
+    than being misread.
+    """
+    return _rust.read_frames(
+        path, topic=topic, t0_us=t0_us, t1_us=_MAX_US if t1_us is None else t1_us
+    )
+
+
+def read_imu(
+    path: str,
+    *,
+    topic: str | None = None,
+    t0_us: int = 0,
+    t1_us: int | None = None,
+) -> dict:
+    """Read IMU samples from a bag as a dict of arrays.
+
+    Keys are ``t`` (µs), ``angular_velocity`` and ``linear_acceleration``, the latter two ``[N, 3]``
+    in rad/s and m/s². On a DAVIS this is the only independent measurement of how the camera moved,
+    which makes it the ground truth for :meth:`~eventcv.EventStream.contrast_maximise`::
+
+        imu = ecv.read_imu("recording.bag", t0_us=t0, t1_us=t1)
+        truth = imu["angular_velocity"].mean(axis=0)
+
+    Orientation is in the message but not returned: on a DAVIS it is dead-reckoned from this same
+    gyro, so it is not an independent quantity.
+    """
+    return _rust.read_imu(
+        path, topic=topic, t0_us=t0_us, t1_us=_MAX_US if t1_us is None else t1_us
+    )
+
+
+def read_camera_info(path: str, *, topic: str | None = None):
+    """Read camera intrinsics from a bag's ``sensor_msgs/CameraInfo``, or ``None`` if absent.
+
+    Returns a :class:`Camera` ready to pass to
+    ``contrast_maximise(model="rotation", camera=…)``, which needs intrinsics to map pixels onto
+    rays. Distortion coefficients are not applied — build a :class:`Camera` yourself from the bag's
+    ``D`` if you need undistortion.
+    """
+    return _rust.read_camera_info(path, topic=topic)
+
+
 def circle_mask(sensor_size: tuple[int, int], cx: float, cy: float, r: float):
     """Build a circular ROI mask of radius ``r`` centred on ``(cx, cy)``.
 
@@ -1050,6 +1131,7 @@ __all__ = [
     "UdpReceiver",
     "UdpSender",
     "circle_mask",
+    "bag_topics",
     "collate",
     "ellipse_mask",
     "export_png",
@@ -1061,6 +1143,9 @@ __all__ = [
     "load_mask",
     "open",
     "polygon_mask",
+    "read_camera_info",
+    "read_frames",
+    "read_imu",
     "record",
     "reconstruct",
     "rect_mask",

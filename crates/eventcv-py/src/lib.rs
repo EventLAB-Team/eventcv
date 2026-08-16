@@ -2856,6 +2856,84 @@ fn frame_to_f32_array(
     .expect("frame shape matches its data by construction")
 }
 
+/// Lists every topic in a ROS bag with its message type, as `[(topic, type), …]`.
+///
+/// Bags disagree about topic names — a DAVIS recorded through `dvs_ros_driver` uses `/dvs/events`
+/// where this reader defaults to `/davis/left/events` — so this is usually the first thing to call
+/// on an unfamiliar file.
+#[pyfunction]
+fn bag_topics(py: Python<'_>, path: &str) -> PyResult<Vec<(String, String)>> {
+    py.detach(|| eventcv_core::io::bag_topics(path))
+        .map_err(map_io_error)
+}
+
+/// Reads DAVIS APS frames from a bag as `[(t_us, EventFrame), …]`.
+///
+/// `topic` defaults to the bag's only `sensor_msgs/Image` topic when there is exactly one. The
+/// window is required, not optional: these recordings run to tens of gigabytes.
+#[pyfunction]
+#[pyo3(signature = (path, *, topic=None, t0_us=0, t1_us=i64::MAX))]
+fn read_frames(
+    py: Python<'_>,
+    path: &str,
+    topic: Option<&str>,
+    t0_us: i64,
+    t1_us: i64,
+) -> PyResult<Vec<(i64, PyEventFrame)>> {
+    py.detach(|| eventcv_core::io::read_bag_frames(path, topic, t0_us, t1_us))
+        .map_err(map_io_error)
+        .map(|frames| {
+            frames
+                .into_iter()
+                .map(|(t, inner)| (t, PyEventFrame { inner }))
+                .collect()
+        })
+}
+
+/// Reads IMU samples from a bag as a dict of numpy arrays: `t` (µs), `angular_velocity` and
+/// `linear_acceleration`, both `[N, 3]`.
+#[pyfunction]
+#[pyo3(signature = (path, *, topic=None, t0_us=0, t1_us=i64::MAX))]
+fn read_imu<'py>(
+    py: Python<'py>,
+    path: &str,
+    topic: Option<&str>,
+    t0_us: i64,
+    t1_us: i64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let samples = py
+        .detach(|| eventcv_core::io::read_bag_imu(path, topic, t0_us, t1_us))
+        .map_err(map_io_error)?;
+    let times: Vec<i64> = samples.iter().map(|sample| sample.t_us).collect();
+    let flatten = |pick: fn(&eventcv_core::io::ImuSample) -> [f64; 3]| {
+        numpy::ndarray::Array2::from_shape_vec(
+            (samples.len(), 3),
+            samples.iter().flat_map(&pick).collect(),
+        )
+        .expect("three components per sample by construction")
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("t", times.into_pyarray(py))?;
+    dict.set_item(
+        "angular_velocity",
+        flatten(|sample| sample.angular_velocity).into_pyarray(py),
+    )?;
+    dict.set_item(
+        "linear_acceleration",
+        flatten(|sample| sample.linear_acceleration).into_pyarray(py),
+    )?;
+    Ok(dict)
+}
+
+/// Reads camera intrinsics from a bag's `sensor_msgs/CameraInfo`, or `None` if it has none.
+#[pyfunction]
+#[pyo3(signature = (path, *, topic=None))]
+fn read_camera_info(py: Python<'_>, path: &str, topic: Option<&str>) -> PyResult<Option<PyCamera>> {
+    py.detach(|| eventcv_core::io::read_bag_camera_info(path, topic))
+        .map_err(map_io_error)
+        .map(|camera| camera.map(|inner| PyCamera { inner }))
+}
+
 #[pyfunction]
 fn load_frame(py: Python<'_>, path: &str) -> PyResult<PyEventFrame> {
     py.detach(|| eventcv_core::io::load_frame(path))
@@ -5488,6 +5566,10 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(load_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(bag_topics, m)?)?;
+    m.add_function(wrap_pyfunction!(read_frames, m)?)?;
+    m.add_function(wrap_pyfunction!(read_imu, m)?)?;
+    m.add_function(wrap_pyfunction!(read_camera_info, m)?)?;
     m.add_function(wrap_pyfunction!(simulate, m)?)?;
     #[cfg(feature = "onnx")]
     m.add_function(wrap_pyfunction!(reconstruct, m)?)?;
