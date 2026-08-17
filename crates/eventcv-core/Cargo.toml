@@ -12,7 +12,11 @@ categories = ["computer-vision"]
 ndarray = "0.17"
 npyz = { version = "0.9", features = ["derive", "npz"] }
 # Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
-rand = "0.8"
+# `small_rng` is the simulator's per-block noise generator: its parallel pixel loop needs one cheap,
+# independently seeded RNG per block, and `StdRng` (ChaCha12) costs far more than the arithmetic it
+# feeds. Reproducibility comes from how the seeds are derived, not from the algorithm — see
+# `simulate::block_seed`.
+rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 rayon = "1.10"
 rosbag = "0.6.3"
@@ -46,20 +50,27 @@ neuromorphic-drivers = { version = "0.17", optional = true }
 # driver.) Remove this once the fields are public upstream.
 serde_json = { version = "1", optional = true }
 
-# Optional: ONNX inference. `download-binaries` fetches a prebuilt ONNX Runtime at build time, so
-# a wheel is self-contained and users install nothing extra. Pinned exactly because ort has no
-# stable release yet (2.0 is still RC) and a point release can move the API under us — the feature
-# gate means a bad RC is a build-flag change, not an API break. Enable with `--features onnx`.
-# `tls-rustls` is required by `download-binaries` and keeps the fetch pure-Rust (no OpenSSL to
-# find on any of the four wheel targets).
+# Optional: ONNX inference. The runtime is loaded at *run* time (`load-dynamic`), not linked in:
+# `download-binaries` used to fetch a prebuilt static ONNX Runtime, but that binary is built
+# against glibc 2.38, so linking it made the extension unloadable on every distro below that
+# (Ubuntu 22.04, Debian 12, RHEL 9) — an `undefined symbol: __isoc23_strtol` at import, which
+# the manylinux check misses because the references are unversioned. It also makes a source build
+# network-free. The wheels are still self-contained: they carry Microsoft's *shared* build (glibc
+# 2.27) instead, fetched by `scripts/fetch_onnxruntime.py`. `ORT_DYLIB_PATH` says which library to
+# open, and `python/eventcv/_ort.py` sets it from whatever the installation provides.
+# Pinned exactly because ort has no stable release yet (2.0 is still RC) and a point release can
+# move the API under us — the feature gate means a bad RC is a build-flag change, not an API
+# break. Enable with `--features onnx`.
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "std",
     "ndarray",          # take/return ndarray tensors, which representations already are
-    "download-binaries", # self-contained wheel: no ONNX Runtime install for the user
-    "tls-rustls",       # pure-Rust fetch; `tls-native` (the default) would want OpenSSL on manylinux
-    "copy-dylibs",      # place the runtime next to the extension so it resolves at import
-    "api-27",           # pin the ONNX Runtime API level rather than inherit it from defaults
+    "load-dynamic",     # dlopen libonnxruntime on first use; nothing linked, nothing downloaded
+    "api-17",           # lowest API level this code compiles against, so any ORT >= 1.17 loads
 ] }
+# Opens the runtime ourselves before handing over to ort, so "no ONNX Runtime here", "that file is
+# not ONNX Runtime" and "that ONNX Runtime is too old" are three different messages instead of one
+# panic from inside ort's lazy initialiser. Already in the tree — ort pulls it in for the same job.
+libloading = { version = "0.9", optional = true }
 
 [dev-dependencies]
 # Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
@@ -77,7 +88,7 @@ hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 camera = ["dep:neuromorphic-drivers", "dep:serde_json"]
 # ONNX inference for `Model`. Off by default so a source build never has to fetch a runtime;
 # the published wheels turn it on (see `[tool.maturin] features` in pyproject.toml).
-onnx = ["dep:ort"]
+onnx = ["dep:ort", "dep:libloading"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.

@@ -12,8 +12,37 @@ for i in range(len(reader)):
     prediction = model(reader[i])
 ```
 
-The ONNX Runtime is compiled into the published wheels, so there is nothing to install. Check with
-`eventcv --version`, which lists the features a build has.
+## Where the runtime comes from
+
+The published wheels carry ONNX Runtime, so `pip install eventcv` is all it takes — there is no
+companion package to install. What the wheel bundles is Microsoft's own build (MIT licensed; the
+licence and third-party notices travel with it in `eventcv/_libs/`).
+
+It is *loaded* rather than linked in, so a build can find one anywhere. EventCV looks in this
+order, and `eventcv --version` reports which it used:
+
+| Order | Source | When it applies |
+| --- | --- | --- |
+| 1 | `ORT_DYLIB_PATH` | You named a library; your choice always wins |
+| 2 | An already-imported `onnxruntime` | The process holds one already — no second copy |
+| 3 | `eventcv/_libs/` | The bundled copy: an ordinary wheel install |
+| 4 | The environment's `lib` directory | conda, e.g. `conda install -c conda-forge onnxruntime-cpp` |
+| 5 | An installed `onnxruntime` package | Source builds: `pip install eventcv[onnx]` |
+
+To use a different build — a GPU runtime, a system package, one you compiled yourself:
+
+```console
+export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+```
+
+If none of those turns up a usable library, constructing a `Model` raises a `RuntimeError` that
+says which of "nothing found", "that file is not ONNX Runtime" or "that ONNX Runtime is too old"
+went wrong. Anything from ONNX Runtime 1.17 up satisfies the binding.
+
+Loading rather than linking is what keeps the wheel portable at all: the prebuilt *static*
+runtime is built against glibc 2.38, so linking it made the whole extension fail to import on
+Ubuntu 22.04, Debian 12 and RHEL 9 — including all the parts that have nothing to do with
+models. Microsoft's shared build needs only glibc 2.27, below the floor the wheels declare.
 
 ## Scope
 
@@ -72,14 +101,19 @@ Inference releases the GIL, so it overlaps with other Python threads. Calls are 
 lock because ONNX Runtime's session internals are not thread-safe; to run inference in parallel,
 construct one `Model` per thread.
 
-There is no GPU execution provider wired up: the runtime is built for CPU. For GPU inference, run
-the model in PyTorch or `onnxruntime-gpu` and use EventCV for the tensors — {func}`eventcv.collate`
-and the map-style {class}`~eventcv.EventReader` are built for exactly that handoff. See
+EventCV registers no execution providers, so inference runs on the CPU even when the runtime you
+point `ORT_DYLIB_PATH` at can do more. For GPU inference, run the model in PyTorch or
+`onnxruntime-gpu` and use EventCV for the tensors — {func}`eventcv.collate` and the map-style
+{class}`~eventcv.EventReader` are built for exactly that handoff. See
 [Quickstart](quickstart.md) for the `DataLoader` path.
 
 ## If `Model` is unavailable
 
-A source build without the feature raises a `RuntimeError` naming the fix. Rebuild with:
+Two different `RuntimeError`s, each naming its own fix. *"EventCV loads ONNX Runtime at run
+time…"* means the binding is there but no usable runtime is — reinstall the wheel, install one
+alongside (`pip install eventcv[onnx]`, or conda's `onnxruntime-cpp`), or set `ORT_DYLIB_PATH`.
+*"eventcv was built without ONNX support"* means the feature was left out of a source build;
+rebuild with:
 
 ```console
 $ maturin develop --features onnx

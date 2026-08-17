@@ -30,8 +30,14 @@
 //! bus-bandwidth saturation, hot and dead pixels (see [`EventStream::pixel_dropout`] for those), and
 //! threshold dependence on illumination beyond the bandwidth term.
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::sync::OnceLock;
+
+use rand::{
+    rngs::{SmallRng, StdRng},
+    Rng, SeedableRng,
+};
 use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 
 use crate::viz::Rgb8Image;
 use crate::{EventStream, EventStreamBuilder};
@@ -49,9 +55,34 @@ const MIN_BANDWIDTH_FRACTION: f32 = 0.1;
 /// How much quieter shot noise is in the brightest pixels than the darkest (v2e's `c`).
 const SHOT_NOISE_BRIGHT_FACTOR: f32 = 0.25;
 
-/// Ceiling on adaptive upsampling, so a hard cut between two frames cannot ask for thousands of
-/// sub-steps and stall the run.
-const MAX_UPSAMPLE: usize = 64;
+/// Default ceiling on adaptive upsampling, so a hard cut between two frames cannot ask for
+/// thousands of sub-steps and stall the run. Overridable per run via
+/// [`SimulatorConfig::max_upsample`] — the ceiling is a cost/accuracy trade, not a physical bound.
+pub const MAX_UPSAMPLE: usize = 64;
+
+/// Hard ceiling on [`SimulatorConfig::max_upsample`]. A sub-step costs a full pass over every
+/// pixel, so an unbounded value turns a typo into an unkillable run.
+const MAX_UPSAMPLE_CEILING: usize = 4096;
+
+/// Pixels per parallel work block.
+///
+/// Fixed rather than derived from the core count, because each block seeds its own noise RNG: a
+/// block size that varied with the machine would make the events depend on how many cores ran the
+/// simulation. Sized so one block's [`PixelState`] (~192 KiB) stays resident across every sub-step
+/// of a frame pair, which is why the sub-step loop lives *inside* the block rather than around it.
+const PIXEL_BLOCK: usize = 8192;
+
+/// Below this many pixels the rayon dispatch costs more than the work it splits, so the whole
+/// interval runs inline. Mirrors `cmax`'s `PARALLEL_EVENT_THRESHOLD`.
+const PARALLEL_PIXEL_THRESHOLD: usize = 1 << 16;
+
+/// Above this many events in one interval the sort is worth handing to rayon.
+const PARALLEL_SORT_THRESHOLD: usize = 1 << 16;
+
+/// Entries in the per-sub-interval shot-noise probability table, indexed by quantised luma.
+/// One 8-bit level of luma moves the probability by well under a percent of itself, which is far
+/// below the noise the table is describing.
+const NOISE_LUT_LEN: usize = 256;
 
 /// How finely the interval between two source frames is subdivided before simulating.
 ///
@@ -102,6 +133,13 @@ pub struct SimulatorConfig {
     pub seed: u64,
     /// Frame subdivision — see [`Upsample`].
     pub upsample: Upsample,
+    /// Ceiling on the sub-steps any one frame pair may be split into.
+    ///
+    /// Adaptive upsampling is driven by the *busiest* pixel, so one high-contrast edge can push a
+    /// whole 1080p frame to the ceiling — 64 full-sensor passes for that pair. Lowering this
+    /// bounds the worst case at some cost in timestamp accuracy where the scene really is that
+    /// fast; raising it buys accuracy on hard cuts. Clamped to `1..=4096`.
+    pub max_upsample: usize,
 }
 
 impl Default for SimulatorConfig {
@@ -116,6 +154,7 @@ impl Default for SimulatorConfig {
             shot_noise_rate_hz: 10.0,
             seed: 0,
             upsample: Upsample::default(),
+            max_upsample: MAX_UPSAMPLE,
         }
     }
 }
@@ -138,39 +177,82 @@ impl SimulatorConfig {
     }
 }
 
+/// Everything the model remembers about one pixel.
+///
+/// Held as one array of these rather than five parallel arrays: the sub-step loop touches all of a
+/// pixel's state together (so this is one cache line's worth of locality instead of five streams),
+/// and a single slice is what [`par_chunks_mut`](rayon::slice::ParallelSliceMut::par_chunks_mut)
+/// can hand to a worker without a five-way zip.
+#[derive(Clone, Copy, Debug)]
+struct PixelState {
+    /// Memorised log intensity — the level each event is measured against.
+    log_ref: f32,
+    /// Photoreceptor lowpass state.
+    lowpass: f32,
+    /// Thresholds, drawn once at construction: mismatch is a property of the silicon, not noise
+    /// that resamples every frame.
+    thres_pos: f32,
+    thres_neg: f32,
+    /// Last emission time, for the refractory check.
+    last_t: i64,
+}
+
+/// One generated event, before it is sorted and handed to an [`EventStreamBuilder`].
+#[derive(Clone, Copy, Debug)]
+struct SimEvent {
+    t: i64,
+    x: u16,
+    y: u16,
+    positive: bool,
+}
+
 /// A DVS pixel array, driven one frame at a time.
 ///
 /// Frames are pushed in time order and each call returns the events generated since the previous
 /// one, already sorted. Nothing accumulates across calls, so a recording of any length simulates in
 /// memory proportional to one frame interval rather than to the whole output.
+///
+/// # Parallelism
+///
+/// A frame pair is split into fixed-size blocks of pixels and simulated with rayon. Pixels are
+/// independent — nothing in the model couples one to its neighbours — so the only shared thing was
+/// the random number generator, and each block draws from its own stream instead (see
+/// [`block_seed`]). Both the block size and the seed derivation are fixed constants, so the output
+/// is a function of the configuration alone: the same `seed` gives the same events on one core or
+/// thirty-two.
 pub struct Simulator {
     config: SimulatorConfig,
     width: usize,
     height: usize,
-    /// Memorised log intensity per pixel — the level each event is measured against.
-    log_ref: Vec<f32>,
-    /// Photoreceptor lowpass state per pixel.
-    lowpass: Vec<f32>,
-    /// Per-pixel thresholds, drawn once at construction: mismatch is a property of the silicon, not
-    /// noise that resamples every frame.
-    thres_pos: Vec<f32>,
-    thres_neg: Vec<f32>,
-    /// Last emission time per pixel, for the refractory check.
-    last_t: Vec<i64>,
+    /// Per-pixel model state.
+    state: Vec<PixelState>,
     /// Working buffer for the incoming frame's lin-log intensity, reused across calls.
     log_now: Vec<f32>,
     /// Luma in `[0, 1]` for the incoming frame, reused across calls.
     luma: Vec<f32>,
-    previous: Option<(Vec<f32>, Vec<f32>, i64)>,
-    rng: StdRng,
+    /// The previous frame's pair, swapped with the incoming buffers rather than cloned.
+    prev_log: Vec<f32>,
+    prev_luma: Vec<f32>,
+    /// `None` until the first frame seeds the state.
+    t_previous: Option<i64>,
+    /// Counts pushed frames, so each interval's noise draws a different stream.
+    frame: u64,
+    /// One event buffer per pixel block, kept allocated across frames so a steady event rate stops
+    /// reallocating. Concatenated in block order, which is what makes the result reproducible.
+    blocks: Vec<Vec<SimEvent>>,
+    /// The concatenated interval, sorted in place before being handed out.
+    events: Vec<SimEvent>,
 }
 
 impl Simulator {
     pub fn new(width: usize, height: usize, config: SimulatorConfig) -> Self {
         let pixels = width * height;
         let mut rng = StdRng::seed_from_u64(config.seed);
-        // Mismatch is sampled once and kept. Thresholds are clamped well above zero: a threshold at
-        // or below zero would emit unboundedly on any change at all.
+        // Mismatch is sampled once and kept, from one serial stream: it is O(pixels) at
+        // construction rather than per sub-step, so there is nothing to gain by splitting it, and
+        // keeping it serial means the pattern of mismatch is unchanged by the parallel loop.
+        // Thresholds are clamped well above zero: a threshold at or below zero would emit
+        // unboundedly on any change at all.
         let sample = |rng: &mut StdRng, base: f32| -> Vec<f32> {
             match Normal::new(0.0_f32, config.sigma_thres.max(0.0)) {
                 Ok(normal) if config.sigma_thres > 0.0 => (0..pixels)
@@ -181,19 +263,30 @@ impl Simulator {
         };
         let thres_pos = sample(&mut rng, config.pos_thres);
         let thres_neg = sample(&mut rng, config.neg_thres);
+        let state = thres_pos
+            .into_iter()
+            .zip(thres_neg)
+            .map(|(thres_pos, thres_neg)| PixelState {
+                log_ref: 0.0,
+                lowpass: 0.0,
+                thres_pos,
+                thres_neg,
+                last_t: i64::MIN / 4,
+            })
+            .collect();
         Self {
             config,
             width,
             height,
-            log_ref: vec![0.0; pixels],
-            lowpass: vec![0.0; pixels],
-            thres_pos,
-            thres_neg,
-            last_t: vec![i64::MIN / 4; pixels],
+            state,
             log_now: vec![0.0; pixels],
             luma: vec![0.0; pixels],
-            previous: None,
-            rng,
+            prev_log: vec![0.0; pixels],
+            prev_luma: vec![0.0; pixels],
+            t_previous: None,
+            frame: 0,
+            blocks: vec![Vec::new(); pixels.div_ceil(PIXEL_BLOCK)],
+            events: Vec::new(),
         }
     }
 
@@ -217,157 +310,321 @@ impl Simulator {
             self.log_now[index] = lin_log(clamped * 255.0);
         }
 
-        let Some((previous_log, previous_luma, t_previous)) = self.previous.take() else {
-            self.log_ref.copy_from_slice(&self.log_now);
-            self.lowpass.copy_from_slice(&self.log_now);
-            self.last_t.fill(t_us);
-            self.previous = Some((self.log_now.clone(), self.luma.clone(), t_us));
+        let Some(t_previous) = self.t_previous else {
+            for (pixel, &log) in self.state.iter_mut().zip(&self.log_now) {
+                pixel.log_ref = log;
+                pixel.lowpass = log;
+                pixel.last_t = t_us;
+            }
+            self.advance(t_us);
             return self.empty_stream();
         };
 
         let span = (t_us - t_previous).max(0);
-        let steps = self.upsample_steps(&previous_log, span);
-        let mut events: Vec<(u16, u16, i64, bool)> = Vec::new();
+        let steps = self.upsample_steps(span);
+        self.simulate_interval(t_previous, span, steps);
+        self.advance(t_us);
+        self.collect_interval()
+    }
 
-        for step in 1..=steps {
-            // Linear interpolation in log space between the two frames. Sub-intervals are walked in
-            // order, so events stay grouped in ascending time even before the sort below.
-            let alpha = step as f32 / steps as f32;
-            let t_start = t_previous + (span as f64 * (step - 1) as f64 / steps as f64) as i64;
-            let t_end = t_previous + (span as f64 * step as f64 / steps as f64) as i64;
-            let dt_s = ((t_end - t_start) as f64 / 1e6) as f32;
+    /// Simulates one frame pair into `self.blocks`, in parallel over blocks of pixels.
+    ///
+    /// The sub-step loop runs *inside* each block rather than around all of them: pixels never
+    /// interact, so a block can walk the whole interval on its own, which keeps its state hot in
+    /// cache and costs one rayon dispatch per frame instead of one per sub-step.
+    fn simulate_interval(&mut self, t_previous: i64, span: i64, steps: usize) {
+        let width = self.width;
+        let pixels = self.state.len();
+        // Field-by-field borrows: the state is written, everything else only read.
+        let config = &self.config;
+        let frame = self.frame;
+        let (prev_log, log_now) = (&self.prev_log, &self.log_now);
+        let (prev_luma, luma) = (&self.prev_luma, &self.luma);
 
-            for index in 0..self.width * self.height {
-                let target =
-                    previous_log[index] + (self.log_now[index] - previous_log[index]) * alpha;
-                let luma = previous_luma[index] + (self.luma[index] - previous_luma[index]) * alpha;
-                self.integrate_pixel(index, target, luma, t_start, t_end, dt_s, &mut events);
+        let run = |block: usize, state: &mut [PixelState], out: &mut Vec<SimEvent>| {
+            out.clear();
+            let base = block * PIXEL_BLOCK;
+            let mut rng = SmallRng::seed_from_u64(block_seed(config.seed, frame, block));
+            for step in 1..=steps {
+                // Linear interpolation in log space between the two frames. Sub-intervals are
+                // walked in order, so events stay grouped in ascending time even before the sort.
+                let alpha = step as f32 / steps as f32;
+                let t_start = t_previous + (span as f64 * (step - 1) as f64 / steps as f64) as i64;
+                let t_end = t_previous + (span as f64 * step as f64 / steps as f64) as i64;
+                let dt_s = ((t_end - t_start) as f64 / 1e6) as f32;
+                let noise = NoiseTable::new(config.shot_noise_rate_hz, dt_s);
+
+                // Coordinates are walked rather than divided out per pixel: a block is a
+                // contiguous index range, so this is two divisions per block instead of two per
+                // pixel per sub-step (hundreds of millions of them on a 1080p clip).
+                let (mut x, mut y) = ((base % width) as u16, (base / width) as u16);
+                for (offset, pixel) in state.iter_mut().enumerate() {
+                    let index = base + offset;
+                    let target = prev_log[index] + (log_now[index] - prev_log[index]) * alpha;
+                    let pixel_luma = prev_luma[index] + (luma[index] - prev_luma[index]) * alpha;
+                    integrate_pixel(
+                        pixel, x, y, target, pixel_luma, t_start, t_end, dt_s, config, &noise,
+                        &mut rng, out,
+                    );
+                    x += 1;
+                    if usize::from(x) == width {
+                        x = 0;
+                        y += 1;
+                    }
+                }
             }
+        };
+
+        if pixels < PARALLEL_PIXEL_THRESHOLD {
+            for (block, (state, out)) in self
+                .state
+                .chunks_mut(PIXEL_BLOCK)
+                .zip(self.blocks.iter_mut())
+                .enumerate()
+            {
+                run(block, state, out);
+            }
+        } else {
+            self.state
+                .par_chunks_mut(PIXEL_BLOCK)
+                .zip(self.blocks.par_iter_mut())
+                .enumerate()
+                .for_each(|(block, (state, out))| run(block, state, out));
+        }
+    }
+
+    /// Concatenates the per-block buffers, sorts, and builds the interval's stream.
+    fn collect_interval(&mut self) -> EventStream {
+        self.events.clear();
+        self.events.reserve(self.blocks.iter().map(Vec::len).sum());
+        for block in &self.blocks {
+            self.events.extend_from_slice(block);
         }
 
         // Sorting per interval rather than globally is what keeps this streaming: intervals are
         // produced in time order, so concatenating sorted blocks is already globally sorted, and no
         // sort ever sees more than one interval's events.
-        events.sort_unstable_by_key(|&(_, _, t, _)| t);
+        //
+        // The key is the whole event, not just `t`. An unstable sort leaves ties in an
+        // implementation-defined order, and a *parallel* unstable sort's order also depends on how
+        // the work was split — so with `t` alone the output would shift with the core count.
+        // Ordering ties by position makes the result total and machine-independent.
+        let key = |event: &SimEvent| (event.t, event.y, event.x, event.positive);
+        if self.events.len() >= PARALLEL_SORT_THRESHOLD {
+            self.events.par_sort_unstable_by_key(key);
+        } else {
+            self.events.sort_unstable_by_key(key);
+        }
 
-        self.previous = Some((self.log_now.clone(), self.luma.clone(), t_us));
         let mut builder =
-            EventStreamBuilder::with_capacity(self.width, self.height, 0.001, events.len());
-        for (x, y, t, polarity) in events {
-            builder.push(x, y, t, polarity);
+            EventStreamBuilder::with_capacity(self.width, self.height, 0.001, self.events.len());
+        for event in &self.events {
+            builder.push(event.x, event.y, event.t, event.positive);
         }
         builder.build()
     }
 
-    /// One pixel over one sub-interval: bandwidth, threshold crossings, leak and noise.
-    #[allow(clippy::too_many_arguments)]
-    fn integrate_pixel(
-        &mut self,
-        index: usize,
-        target_log: f32,
-        luma: f32,
-        t_start: i64,
-        t_end: i64,
-        dt_s: f32,
-        events: &mut Vec<(u16, u16, i64, bool)>,
-    ) {
-        // Photoreceptor lowpass: cutoff falls with intensity, floored so dark pixels still track.
-        let filtered = if self.config.cutoff_hz > 0.0 && dt_s > 0.0 {
-            let bandwidth = MIN_BANDWIDTH_FRACTION + (1.0 - MIN_BANDWIDTH_FRACTION) * luma;
-            let tau = 1.0 / (2.0 * std::f32::consts::PI * self.config.cutoff_hz * bandwidth);
-            let epsilon = (dt_s / tau).clamp(0.0, 1.0);
-            self.lowpass[index] += epsilon * (target_log - self.lowpass[index]);
-            self.lowpass[index]
-        } else {
-            self.lowpass[index] = target_log;
-            target_log
-        };
-
-        // Leak: the memorised level decays, so a still scene still emits the occasional ON event.
-        // Per-pixel thresholds decorrelate them, which is what stops leak looking like a metronome.
-        if self.config.leak_rate_hz > 0.0 && dt_s > 0.0 {
-            self.log_ref[index] -= self.thres_pos[index] * self.config.leak_rate_hz * dt_s;
-        }
-
-        let delta = filtered - self.log_ref[index];
-        let positive = delta > 0.0;
-        let threshold = if positive {
-            self.thres_pos[index]
-        } else {
-            self.thres_neg[index]
-        };
-        let crossings = (delta.abs() / threshold).floor() as i64;
-
-        if crossings > 0 {
-            let (x, y) = ((index % self.width) as u16, (index / self.width) as u16);
-            let span = (t_end - t_start) as f64;
-            for k in 1..=crossings {
-                // The k-th crossing happens when the interpolated level reaches k thresholds away,
-                // which under the linear assumption is a fixed fraction of the way through.
-                let fraction = (k as f32 * threshold / delta.abs()).clamp(0.0, 1.0) as f64;
-                let t = t_start + (span * fraction) as i64;
-                if t - self.last_t[index] < self.config.refractory_us {
-                    continue;
-                }
-                self.last_t[index] = t;
-                events.push((x, y, t.max(0), positive));
-            }
-            // Carry the remainder rather than discarding it, so slow ramps still fire eventually.
-            let signed = if positive { 1.0 } else { -1.0 };
-            self.log_ref[index] += signed * crossings as f32 * threshold;
-        }
-
-        // Shot noise: Poisson-thin, quieter where the scene is bright.
-        if self.config.shot_noise_rate_hz > 0.0 && dt_s > 0.0 {
-            let scale = 1.0 - (1.0 - SHOT_NOISE_BRIGHT_FACTOR) * luma;
-            // `1 - exp(-λ)` is the Poisson probability of at least one event, not `λ` itself.
-            // The distinction only shows up once λ approaches 1 — but there a raw `λ` exceeds 1,
-            // the comparison below is always true, and the intensity dependence silently
-            // disappears into saturation. At most one event per polarity per sub-interval is
-            // emitted either way, so a rate high relative to the interval still saturates: that is
-            // a reason to subdivide (see `Upsample`), not something to paper over here.
-            let lambda = self.config.shot_noise_rate_hz * scale * dt_s / 2.0;
-            let probability = 1.0 - (-lambda).exp();
-            for polarity in [true, false] {
-                if self.rng.gen::<f32>() < probability {
-                    let (x, y) = ((index % self.width) as u16, (index / self.width) as u16);
-                    let t = t_start + (self.rng.gen::<f64>() * (t_end - t_start) as f64) as i64;
-                    if t - self.last_t[index] >= self.config.refractory_us {
-                        self.last_t[index] = t;
-                        events.push((x, y, t.max(0), polarity));
-                    }
-                }
-            }
-        }
+    /// Rolls the incoming frame into the "previous" slot. Swapping rather than cloning: the old
+    /// code copied two full-frame `Vec<f32>`s per frame, which is 16 MB of memcpy per 1080p frame.
+    fn advance(&mut self, t_us: i64) {
+        std::mem::swap(&mut self.prev_log, &mut self.log_now);
+        std::mem::swap(&mut self.prev_luma, &mut self.luma);
+        self.t_previous = Some(t_us);
+        self.frame += 1;
     }
 
     /// How many sub-intervals this frame pair needs.
-    fn upsample_steps(&self, previous_log: &[f32], span_us: i64) -> usize {
+    fn upsample_steps(&self, span_us: i64) -> usize {
         if span_us <= 0 {
             return 1;
         }
+        let ceiling = self.config.max_upsample.clamp(1, MAX_UPSAMPLE_CEILING);
         match self.config.upsample {
             Upsample::Off => 1,
-            Upsample::Fixed(n) => n.clamp(1, MAX_UPSAMPLE),
+            Upsample::Fixed(n) => n.clamp(1, ceiling),
             Upsample::Adaptive {
                 max_events_per_pixel,
             } => {
                 let budget = max_events_per_pixel.max(0.1);
-                // The busiest pixel decides: if it would emit n events over the pair, subdivide
-                // until no sub-interval asks for more than `budget` from it.
-                let worst = previous_log
-                    .iter()
-                    .zip(&self.log_now)
-                    .zip(&self.thres_pos)
-                    .map(|((before, after), threshold)| (after - before).abs() / threshold)
-                    .fold(0.0_f32, f32::max);
-                ((worst / budget).ceil() as usize).clamp(1, MAX_UPSAMPLE)
+                ((self.worst_contrast() / budget).ceil() as usize).clamp(1, ceiling)
             }
+        }
+    }
+
+    /// The most events any single pixel would emit over this frame pair.
+    ///
+    /// The busiest pixel decides the subdivision: if it would emit n events over the pair,
+    /// subdivide until no sub-interval asks for more than the budget from it.
+    fn worst_contrast(&self) -> f32 {
+        let contrast = |(pixel, (before, after)): (&PixelState, (&f32, &f32))| {
+            (after - before).abs() / pixel.thres_pos
+        };
+        let pairs = self.prev_log.iter().zip(&self.log_now);
+        if self.state.len() < PARALLEL_PIXEL_THRESHOLD {
+            self.state
+                .iter()
+                .zip(pairs)
+                .map(contrast)
+                .fold(0.0_f32, f32::max)
+        } else {
+            self.state
+                .par_iter()
+                .zip(self.prev_log.par_iter().zip(&self.log_now))
+                .map(contrast)
+                .reduce(|| 0.0_f32, f32::max)
         }
     }
 
     fn empty_stream(&self) -> EventStream {
         EventStreamBuilder::new(self.width, self.height, 0.001).build()
+    }
+}
+
+/// Splits `seed` into an independent RNG stream per (frame, pixel block).
+///
+/// The noise draws happen inside a parallel loop, so they cannot share one generator. What keeps a
+/// run reproducible is that each block's seed is derived from the *configuration* — never from the
+/// thread or the core count — and that [`PIXEL_BLOCK`] is a constant, so the same `seed` always
+/// partitions the sensor the same way. SplitMix64's finaliser does the mixing: cheap, and enough
+/// that neighbouring blocks show no visible correlation in their noise.
+fn block_seed(seed: u64, frame: u64, block: usize) -> u64 {
+    let mut z = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(frame.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        .wrapping_add((block as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The probability that a pixel emits a shot-noise event of one polarity in a sub-interval,
+/// tabulated over luma.
+///
+/// The probability depends on the pixel only through its luma, so evaluating it directly meant one
+/// `exp` per pixel per sub-step — a couple of hundred million of them on a second of 1080p.
+/// Tabulating once per sub-interval turns that into an array lookup.
+struct NoiseTable {
+    table: [f32; NOISE_LUT_LEN],
+    /// False when noise is switched off or the sub-interval has no duration, so the caller skips
+    /// the RNG draws entirely rather than drawing and comparing against zero.
+    enabled: bool,
+}
+
+impl NoiseTable {
+    fn new(rate_hz: f32, dt_s: f32) -> Self {
+        let enabled = rate_hz > 0.0 && dt_s > 0.0;
+        let mut table = [0.0_f32; NOISE_LUT_LEN];
+        if enabled {
+            for (index, slot) in table.iter_mut().enumerate() {
+                let luma = index as f32 / (NOISE_LUT_LEN - 1) as f32;
+                let scale = 1.0 - (1.0 - SHOT_NOISE_BRIGHT_FACTOR) * luma;
+                // `1 - exp(-λ)` is the Poisson probability of at least one event, not `λ` itself.
+                // The distinction only shows up once λ approaches 1 — but there a raw `λ` exceeds
+                // 1, the comparison is always true, and the intensity dependence silently
+                // disappears into saturation. At most one event per polarity per sub-interval is
+                // emitted either way, so a rate high relative to the interval still saturates:
+                // that is a reason to subdivide (see `Upsample`), not something to paper over.
+                let lambda = rate_hz * scale * dt_s / 2.0;
+                *slot = 1.0 - (-lambda).exp();
+            }
+        }
+        Self { table, enabled }
+    }
+
+    #[inline]
+    fn probability(&self, luma: f32) -> f32 {
+        let index = (luma.clamp(0.0, 1.0) * (NOISE_LUT_LEN - 1) as f32) as usize;
+        self.table[index]
+    }
+}
+
+/// One pixel over one sub-interval: bandwidth, threshold crossings, leak and noise.
+///
+/// A free function rather than a method because the parallel loop hands out one `&mut PixelState`
+/// per pixel and one RNG per block; a `&mut self` method could not be called from inside it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn integrate_pixel(
+    pixel: &mut PixelState,
+    x: u16,
+    y: u16,
+    target_log: f32,
+    luma: f32,
+    t_start: i64,
+    t_end: i64,
+    dt_s: f32,
+    config: &SimulatorConfig,
+    noise: &NoiseTable,
+    rng: &mut SmallRng,
+    events: &mut Vec<SimEvent>,
+) {
+    // Photoreceptor lowpass: cutoff falls with intensity, floored so dark pixels still track.
+    let filtered = if config.cutoff_hz > 0.0 && dt_s > 0.0 {
+        let bandwidth = MIN_BANDWIDTH_FRACTION + (1.0 - MIN_BANDWIDTH_FRACTION) * luma;
+        let tau = 1.0 / (2.0 * std::f32::consts::PI * config.cutoff_hz * bandwidth);
+        let epsilon = (dt_s / tau).clamp(0.0, 1.0);
+        pixel.lowpass += epsilon * (target_log - pixel.lowpass);
+        pixel.lowpass
+    } else {
+        pixel.lowpass = target_log;
+        target_log
+    };
+
+    // Leak: the memorised level decays, so a still scene still emits the occasional ON event.
+    // Per-pixel thresholds decorrelate them, which is what stops leak looking like a metronome.
+    if config.leak_rate_hz > 0.0 && dt_s > 0.0 {
+        pixel.log_ref -= pixel.thres_pos * config.leak_rate_hz * dt_s;
+    }
+
+    let delta = filtered - pixel.log_ref;
+    let positive = delta > 0.0;
+    let threshold = if positive {
+        pixel.thres_pos
+    } else {
+        pixel.thres_neg
+    };
+    let crossings = (delta.abs() / threshold).floor() as i64;
+
+    if crossings > 0 {
+        let span = (t_end - t_start) as f64;
+        for k in 1..=crossings {
+            // The k-th crossing happens when the interpolated level reaches k thresholds away,
+            // which under the linear assumption is a fixed fraction of the way through.
+            let fraction = (k as f32 * threshold / delta.abs()).clamp(0.0, 1.0) as f64;
+            let t = t_start + (span * fraction) as i64;
+            if t - pixel.last_t < config.refractory_us {
+                continue;
+            }
+            pixel.last_t = t;
+            events.push(SimEvent {
+                t: t.max(0),
+                x,
+                y,
+                positive,
+            });
+        }
+        // Carry the remainder rather than discarding it, so slow ramps still fire eventually.
+        let signed = if positive { 1.0 } else { -1.0 };
+        pixel.log_ref += signed * crossings as f32 * threshold;
+    }
+
+    // Shot noise: Poisson-thin, quieter where the scene is bright.
+    if noise.enabled {
+        let probability = noise.probability(luma);
+        for polarity in [true, false] {
+            if rng.gen::<f32>() < probability {
+                let t = t_start + (rng.gen::<f64>() * (t_end - t_start) as f64) as i64;
+                if t - pixel.last_t >= config.refractory_us {
+                    pixel.last_t = t;
+                    events.push(SimEvent {
+                        t: t.max(0),
+                        x,
+                        y,
+                        positive: polarity,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -384,30 +641,56 @@ fn lin_log(intensity_255: f32) -> f32 {
     }
 }
 
+/// The sRGB electro-optical transfer function over all 256 8-bit levels.
+///
+/// [`linear_luma`] runs for every pixel of every frame, and the EOTF costs a `powf` per channel —
+/// three per pixel, a quarter of a billion for a couple of seconds of 1080p, and by some margin the
+/// most expensive thing in the decode path. The input is 8-bit, so the whole function fits in a
+/// 1 KiB table and the conversion becomes three loads.
+fn srgb_to_linear() -> &'static [f32; 256] {
+    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|level| {
+            let v = level as f32 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })
+}
+
 /// Rec. 601 luma of an sRGB pixel, linearised, in `[0, 1]`.
 ///
 /// Linearising first matters: contrast is a ratio of *light*, and sRGB stores a gamma-encoded
 /// value. Measuring log contrast on the encoded value bakes the display transfer function into
 /// every threshold.
 pub fn linear_luma(r: u8, g: u8, b: u8) -> f32 {
-    let component = |value: u8| {
-        let v = f32::from(value) / 255.0;
-        if v <= 0.04045 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * component(r) + 0.7152 * component(g) + 0.0722 * component(b)
+    let table = srgb_to_linear();
+    0.2126 * table[usize::from(r)] + 0.7152 * table[usize::from(g)] + 0.0722 * table[usize::from(b)]
 }
 
 /// Converts a decoded RGB frame into the linear luma the simulator consumes.
 pub fn luma_from_rgb(image: &Rgb8Image) -> Vec<f32> {
-    image
-        .pixels
-        .chunks_exact(3)
-        .map(|pixel| linear_luma(pixel[0], pixel[1], pixel[2]))
-        .collect()
+    let convert = |pixel: &[u8]| linear_luma(pixel[0], pixel[1], pixel[2]);
+    if image.pixels.len() / 3 < PARALLEL_PIXEL_THRESHOLD {
+        return image.pixels.chunks_exact(3).map(convert).collect();
+    }
+    // `par_chunks_exact` is indexed, so collecting preserves pixel order.
+    image.pixels.par_chunks_exact(3).map(convert).collect()
+}
+
+/// How far a [`simulate_video_with_progress`] run has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimulateProgress {
+    /// Frames pushed so far.
+    pub frames: usize,
+    /// Frames the source is expected to hold, when `ffprobe` could say — `None` for a stream whose
+    /// length it does not report.
+    pub total_frames: Option<usize>,
+    /// Events emitted so far.
+    pub events: usize,
 }
 
 /// Simulates a whole video file, calling `on_events` with each interval's events as they are
@@ -422,10 +705,31 @@ pub fn simulate_video(
     config: SimulatorConfig,
     scale: Option<(usize, usize)>,
     max_frames: Option<usize>,
+    on_events: impl FnMut(EventStream) -> std::io::Result<()>,
+) -> std::io::Result<(usize, usize)> {
+    simulate_video_with_progress(path, config, scale, max_frames, on_events, |_| Ok(()))
+}
+
+/// [`simulate_video`], reporting after every frame.
+///
+/// Split out rather than folded in because a simulation is long enough that a caller needs to see
+/// it moving, and there is nothing else in the loop that knows the frame count. `on_progress`
+/// returns a `Result` so that the same hook can stop the run — a caller polling for `Ctrl+C` has
+/// nowhere else to do it, since a whole simulation is one uninterruptible call otherwise.
+pub fn simulate_video_with_progress(
+    path: &std::path::Path,
+    config: SimulatorConfig,
+    scale: Option<(usize, usize)>,
+    max_frames: Option<usize>,
     mut on_events: impl FnMut(EventStream) -> std::io::Result<()>,
+    mut on_progress: impl FnMut(SimulateProgress) -> std::io::Result<()>,
 ) -> std::io::Result<(usize, usize)> {
     let mut decoder = crate::video::FfmpegDecoder::open(path, scale)?;
     let info = decoder.info();
+    let total_frames = match (info.frames, max_frames) {
+        (Some(total), Some(limit)) => Some(total.min(limit)),
+        (total, limit) => total.or(limit),
+    };
     let mut simulator = Simulator::new(info.width, info.height, config);
     // Frame index drives the clock rather than any wall time: the source's own frame rate is what
     // the timestamps have to be consistent with.
@@ -442,6 +746,11 @@ pub fn simulate_video(
         if !stream.is_empty() {
             on_events(stream)?;
         }
+        on_progress(SimulateProgress {
+            frames,
+            total_frames,
+            events,
+        })?;
     }
     Ok((frames, events))
 }
@@ -572,6 +881,133 @@ mod tests {
         let (first, second) = (run(), run());
         assert_eq!(first.ts(), second.ts());
         assert_eq!(first.xs(), second.xs());
+    }
+
+    /// A sensor big enough to cross [`PARALLEL_PIXEL_THRESHOLD`], so the tests below exercise the
+    /// rayon path rather than the serial fallback.
+    const PARALLEL_SIDE: usize = 288;
+
+    fn run_parallel_sensor() -> EventStream {
+        assert!(
+            PARALLEL_SIDE * PARALLEL_SIDE >= PARALLEL_PIXEL_THRESHOLD,
+            "the test sensor must be large enough to take the parallel path"
+        );
+        let mut sim = Simulator::new(
+            PARALLEL_SIDE,
+            PARALLEL_SIDE,
+            SimulatorConfig {
+                seed: 12345,
+                ..SimulatorConfig::default()
+            },
+        );
+        let mut last = sim.empty_stream();
+        for step in 0..4 {
+            let brightness = 0.2 + 0.15 * step as f32;
+            last = sim.push_frame(
+                &constant(PARALLEL_SIDE, PARALLEL_SIDE, brightness),
+                step as i64 * 20_000,
+            );
+        }
+        last
+    }
+
+    #[test]
+    fn output_does_not_depend_on_the_thread_count() {
+        // The whole reason the noise RNG is split per pixel block rather than shared: a run has to
+        // be reproducible from its seed, and "reproducible" has to survive being run on a different
+        // machine with a different number of cores. If this fails, `block_seed` or `PIXEL_BLOCK`
+        // has picked up a dependency on the rayon pool.
+        let in_pool = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("building a rayon pool")
+                .install(run_parallel_sensor)
+        };
+        let (one, many) = (in_pool(1), in_pool(8));
+        assert_eq!(one.len(), many.len(), "event counts differ");
+        assert_eq!(one.ts(), many.ts());
+        assert_eq!(one.xs(), many.xs());
+        assert_eq!(one.ys(), many.ys());
+        assert_eq!(one.ps(), many.ps());
+    }
+
+    #[test]
+    fn parallel_output_is_sorted_and_in_bounds() {
+        let events = run_parallel_sensor();
+        assert!(!events.is_empty(), "a brightening sensor must emit");
+        assert!(events.ts().windows(2).all(|w| w[0] <= w[1]));
+        assert!(events
+            .xs()
+            .iter()
+            .all(|&x| usize::from(x) < PARALLEL_SIDE));
+        assert!(events
+            .ys()
+            .iter()
+            .all(|&y| usize::from(y) < PARALLEL_SIDE));
+    }
+
+    #[test]
+    fn every_pixel_block_is_reached() {
+        // A coordinate walked incrementally across a block (rather than divided out per pixel) is
+        // easy to get subtly wrong at a block boundary, and the symptom would be a whole band of
+        // the sensor silently never firing. An ideal ramp fires every pixel exactly the same
+        // number of times, so the coordinates must cover the grid exactly.
+        let (width, height) = (PARALLEL_SIDE, PARALLEL_SIDE);
+        let config = SimulatorConfig {
+            pos_thres: 0.2,
+            ..SimulatorConfig::ideal()
+        };
+        let mut sim = Simulator::new(width, height, config);
+        sim.push_frame(&constant(width, height, 0.2), 0);
+        let events = sim.push_frame(&constant(width, height, 0.8), 10_000);
+
+        let mut seen = vec![0usize; width * height];
+        for index in 0..events.len() {
+            seen[usize::from(events.ys()[index]) * width + usize::from(events.xs()[index])] += 1;
+        }
+        let expected = seen[0];
+        assert!(expected > 0, "an ideal ramp must fire every pixel");
+        assert!(
+            seen.iter().all(|&count| count == expected),
+            "every pixel must fire the same number of times on a uniform ramp"
+        );
+    }
+
+    #[test]
+    fn max_upsample_caps_the_subdivision() {
+        // The knob exists because adaptive upsampling is driven by the busiest pixel, so a single
+        // hard edge can cost the ceiling in full-sensor passes. Asserted on the step count itself
+        // rather than on the events, because a *linear* ramp interpolates to the same timestamps
+        // however finely it is subdivided — the cost is real even where the output barely moves.
+        let steps_for = |max_upsample: usize| {
+            let mut sim = Simulator::new(
+                4,
+                4,
+                SimulatorConfig {
+                    pos_thres: 0.05,
+                    max_upsample,
+                    upsample: Upsample::default(),
+                    ..SimulatorConfig::ideal()
+                },
+            );
+            sim.prev_log.fill(lin_log(0.1 * 255.0));
+            sim.log_now.fill(lin_log(0.9 * 255.0));
+            sim.upsample_steps(10_000)
+        };
+        // The contrast here asks for ~44 sub-steps, so the ceiling is what binds below that.
+        let uncapped = steps_for(MAX_UPSAMPLE);
+        assert!(
+            uncapped > 10,
+            "this contrast should ask for a real subdivision, got {uncapped}"
+        );
+        assert_eq!(steps_for(1), 1, "a ceiling of 1 disables subdivision");
+        assert_eq!(steps_for(10), 10, "the ceiling binds below what is asked");
+        assert_eq!(
+            steps_for(MAX_UPSAMPLE_CEILING),
+            uncapped,
+            "raising the ceiling past the demand changes nothing"
+        );
     }
 
     #[test]

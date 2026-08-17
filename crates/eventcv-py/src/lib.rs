@@ -12,8 +12,8 @@ use eventcv_core::{
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
-        load_rows, open as open_reader, ColumnOrder, EventKeys, IoError, LoadOptions, RawRow,
-        Reader, SaveOptions, TimeUnit,
+        load_rows, open as open_reader, ColumnOrder, Compression, EventKeys, IoError, LoadOptions,
+        RawRow, Reader, SaveOptions, TimeUnit,
     },
     representation::{
         AveragedTimeSurface, Binary, CountMask, EventCount, EventFrame, EventFrameData,
@@ -32,7 +32,7 @@ use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyTuple};
+use pyo3::types::{PyAny, PyBool, PyDict, PyTuple};
 // Only the ONNX path returns a list (a multi-output graph), so the import carries the same gate
 // as the code that uses it — otherwise a default build warns about it being unused.
 #[cfg(feature = "onnx")]
@@ -111,18 +111,21 @@ impl PyEventStream {
 
     /// Saves the stream to `path`, format chosen by extension (`.npz`/`.txt`/`.h5`/`.bag`, or
     /// `.zip` for E2VID) — the counterpart of `eventcv.load`. npz/HDF5/rosbag round-trip exactly;
-    /// `topic` names the rosbag connection; `format` overrides the extension.
-    #[pyo3(signature = (path, *, topic=None, format=None))]
+    /// `topic` names the rosbag connection; `format` overrides the extension; `compression` picks
+    /// the HDF5 filter (default gzip 1, `False` for none).
+    #[pyo3(signature = (path, *, topic=None, format=None, compression=None))]
     fn save(
         &self,
         py: Python<'_>,
         path: &str,
         topic: Option<String>,
         format: Option<String>,
+        compression: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let options = SaveOptions {
             topic,
             format,
+            compression: parse_compression(compression)?,
             ..SaveOptions::default()
         };
         py.detach(|| eventcv_core::io::save_stream(path, &self.inner, &options))
@@ -646,20 +649,199 @@ impl PyEventStream {
     /// to show — `stream.view("flow")`, `stream.view("count")`, `stream.view("voxel")`, … — or
     /// omit it to use the stream's stored representation (from `open(repr=…)`), falling back to
     /// the polarity image. (Equivalent to `stream.<repr>().view()`.)
-    #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=None))]
+    ///
+    /// `stream.view("raw")` shows the events themselves — polarity dots faded by age, the camera
+    /// viewer's own picture — rather than any representation of them.
+    #[pyo3(signature = (representation=None, *, colormap="viridis", normalize=None, decay_ms=None))]
     fn view(
         &self,
         py: Python<'_>,
         representation: Option<&Bound<'_, PyAny>>,
         colormap: &str,
         normalize: Option<bool>,
+        decay_ms: Option<f64>,
     ) -> PyResult<()> {
+        let is_raw = representation
+            .and_then(|value| value.extract::<String>().ok())
+            .is_some_and(|name| name == "raw");
+        if is_raw {
+            let image = self.raw_render(py, decay_ms);
+            return py
+                .detach(|| viewer::view_image(image, "raw".to_owned()))
+                .map_err(PyRuntimeError::new_err);
+        }
         let frame = match representation {
             Some(representation) => self.generate(py, representation, normalize)?,
             None => self.default_frame(py, normalize)?,
         };
         // Rendering always auto-contrasts unless the caller opts out explicitly.
         frame.view(py, colormap, normalize.unwrap_or(true))
+    }
+
+    /// The raw polarity image of this stream as an `(H, W, 3)` `uint8` array — what
+    /// `view("raw")` displays, handed back instead of shown.
+    ///
+    /// Events are coloured by polarity and dimmed by age, measured back from the newest event, so
+    /// the picture reads as "what the sensor just saw" rather than as a flat accumulation.
+    #[pyo3(signature = (*, decay_ms=None))]
+    fn raw_image<'py>(
+        &self,
+        py: Python<'py>,
+        decay_ms: Option<f64>,
+    ) -> Bound<'py, numpy::PyArray3<u8>> {
+        let image = self.raw_render(py, decay_ms);
+        let (height, width) = (image.height, image.width);
+        numpy::ndarray::Array3::from_shape_vec((height, width, 3), image.pixels)
+            .expect("RawSurface renders exactly height·width·3 bytes")
+            .into_pyarray(py)
+    }
+
+    /// Plays this stream in the interactive window, advancing through it in `dt_ms` steps at `fps`.
+    ///
+    /// The in-memory counterpart of `EventReader.play` — same raw polarity-and-decay view, no file
+    /// and no reader needed. `speed` multiplies the rate; `loop_` restarts at the end.
+    #[pyo3(signature = (*, fps=30.0, dt_ms=30.0, decay_ms=None, speed=1.0, loop_=false))]
+    fn play(
+        &self,
+        py: Python<'_>,
+        fps: f64,
+        dt_ms: f64,
+        decay_ms: Option<f64>,
+        speed: f64,
+        loop_: bool,
+    ) -> PyResult<()> {
+        if !(speed.is_finite() && speed > 0.0) {
+            return Err(PyValueError::new_err("speed must be finite and positive"));
+        }
+        let walk = StreamWindows::new(&self.inner, dt_ms)?;
+        let (width, height) = self.inner.sensor_size();
+        let mut surface =
+            eventcv_core::viz::RawSurface::new(width, height, decay_ms.unwrap_or(dt_ms));
+        let mut index = 0usize;
+        let mut done = false;
+        let producer = || -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
+            if done {
+                return Ok(None);
+            }
+            if index >= walk.frames {
+                if !loop_ {
+                    done = true;
+                    return Ok(None);
+                }
+                index = 0;
+                // Without this the trails from the end of the recording keep fading over the first
+                // frames of the next pass.
+                surface.clear();
+            }
+            surface.update(&walk.window(&self.inner, index));
+            index += 1;
+            Ok(Some(surface.render()))
+        };
+        let interval = std::time::Duration::from_secs_f64(1.0 / (fps * speed).clamp(0.1, 1000.0));
+        py.detach(|| {
+            viewer::run_live(
+                producer,
+                width as u32,
+                height as u32,
+                "playback".to_owned(),
+                interval,
+            )
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Renders this stream as an animation, returning the number of frames written.
+    ///
+    /// The in-memory counterpart of `EventReader.save_video`, and raw by default for the same
+    /// reason: looking at a recording should not require first deciding how to represent it.
+    /// `dt_ms` is how much of the stream each frame covers; `fps` is how fast they play back.
+    #[pyo3(signature = (
+        path, *, fps=30.0, dt_ms=30.0, decay_ms=None, repr=None, colormap="viridis", clim=None,
+        max_frames=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn save_video(
+        &self,
+        py: Python<'_>,
+        path: &str,
+        fps: f64,
+        dt_ms: f64,
+        decay_ms: Option<f64>,
+        repr: Option<&str>,
+        colormap: &str,
+        clim: Option<f64>,
+        max_frames: Option<usize>,
+    ) -> PyResult<usize> {
+        use eventcv_core::video::{encoder_for, Fps};
+        use eventcv_core::viz::Scale;
+
+        let walk = StreamWindows::new(&self.inner, dt_ms)?;
+        let frames = max_frames.map_or(walk.frames, |limit| limit.min(walk.frames));
+        let (width, height) = self.inner.sensor_size();
+
+        let spec = match repr {
+            Some("raw") => None,
+            Some(name) => Some(ReprSpec::named(name, None)?),
+            None => self.repr,
+        };
+        let mut view = match spec {
+            None => RenderView::Raw(eventcv_core::viz::RawSurface::new(
+                width,
+                height,
+                decay_ms.unwrap_or(dt_ms),
+            )),
+            Some(spec) => RenderView::Repr {
+                spec,
+                colormap: parse_colormap(colormap)?,
+                // The whole stream is in hand, so the display scale is calibrated from the frames
+                // themselves rather than sampled — no second read to avoid.
+                scale: match clim {
+                    Some(value) if value > 0.0 => Scale::Fixed(value),
+                    Some(_) => Scale::Auto,
+                    None => {
+                        let mut extent = 0.0_f64;
+                        for index in 0..frames.min(CLIM_CALIBRATION_FRAMES) {
+                            let window = walk.window(&self.inner, index);
+                            let frame = py
+                                .detach(|| spec.generate(&window))
+                                .map_err(map_representation_error)?;
+                            extent = extent.max(py.detach(|| eventcv_core::viz::frame_extent(&frame)));
+                        }
+                        if extent > 0.0 {
+                            Scale::Fixed(extent)
+                        } else {
+                            Scale::Auto
+                        }
+                    }
+                },
+            },
+        };
+
+        let mut encoder: Option<Box<dyn eventcv_core::video::AnimationEncoder + Send>> = None;
+        for index in 0..frames {
+            let image = py
+                .detach(|| view.render(&walk.window(&self.inner, index)))
+                .map_err(map_representation_error)?;
+            let encoder = match encoder.as_mut() {
+                Some(encoder) => encoder,
+                None => encoder.insert(
+                    encoder_for(
+                        std::path::Path::new(path),
+                        frames as u32,
+                        image.width,
+                        image.height,
+                        Fps::new(fps),
+                    )
+                    .map_err(map_std_io_error)?,
+                ),
+            };
+            encoder.write_frame(&image).map_err(map_std_io_error)?;
+            py.check_signals()?;
+        }
+        if let Some(encoder) = encoder.take() {
+            py.detach(|| encoder.finish()).map_err(map_std_io_error)?;
+        }
+        Ok(frames)
     }
 
     /// Draws a region of interest over this stream and returns it as an `(H, W)` boolean mask —
@@ -694,6 +876,25 @@ impl PyEventStream {
             inner,
             repr: self.repr,
         }
+    }
+
+    /// Renders the raw polarity-and-decay image of this stream.
+    ///
+    /// The fade defaults to a tenth of the stream's own span, so a window of any duration comes
+    /// out looking like the same picture rather than fully lit or almost empty.
+    fn raw_render(&self, py: Python<'_>, decay_ms: Option<f64>) -> eventcv_core::viz::Rgb8Image {
+        py.detach(|| {
+            let decay = decay_ms.unwrap_or_else(|| {
+                let ts = self.inner.ts();
+                match (ts.first(), ts.last()) {
+                    (Some(&first), Some(&last)) if last > first => {
+                        ((last - first) as f64 * self.inner.timestamp_scale_ms() / 10.0).max(1.0)
+                    }
+                    _ => DEFAULT_SPAN_MS,
+                }
+            });
+            eventcv_core::viz::render_raw(&self.inner, decay)
+        })
     }
 
     /// The frame rendered when no explicit representation is passed: the stream's stored
@@ -1148,6 +1349,52 @@ fn parse_colormap(name: &str) -> PyResult<Colormap> {
         .ok_or_else(|| PyValueError::new_err(format!("unsupported colormap: {name}")))
 }
 
+/// Parses the Python `compression=` argument for the HDF5 writers.
+///
+/// `None` (the default) means "whatever the writer thinks best", which is gzip 1 — chosen so the
+/// common case gets a file a third the size without anyone having to know the option exists.
+/// `False` or `0` stores the columns unfiltered, which is what a live capture wants; `1..=9` picks
+/// a gzip level explicitly.
+fn parse_compression(value: Option<&Bound<'_, PyAny>>) -> PyResult<Compression> {
+    let Some(value) = value.filter(|value| !value.is_none()) else {
+        return Ok(Compression::default());
+    };
+    // Checked before the integer path because Python's `bool` *is* an `int`, and `compression=True`
+    // asking for gzip level 1 would be a trap.
+    if let Ok(flag) = value.cast::<PyBool>() {
+        return Ok(if flag.is_true() {
+            Compression::default()
+        } else {
+            Compression::None
+        });
+    }
+    let invalid = || {
+        PyValueError::new_err(
+            "compression must be None (the default, gzip 1), False or 0 to store uncompressed, \
+             or a gzip level in 1..=9",
+        )
+    };
+    match value.extract::<i64>().map_err(|_| invalid())? {
+        0 => Ok(Compression::None),
+        level @ 1..=9 => Ok(Compression::Gzip(level as u8)),
+        _ => Err(invalid()),
+    }
+}
+
+/// The live-capture spelling of `compression`: an optional gzip level where omitting it means
+/// uncompressed.
+///
+/// Deliberately the opposite default to [`parse_compression`]. A capture is racing a sensor that
+/// does not wait, so it would rather spend disk than risk falling behind; a `save` has already
+/// finished computing and only has to be small.
+#[cfg(all(feature = "camera", feature = "hdf5"))]
+fn capture_compression(level: Option<u8>) -> Compression {
+    match level {
+        None | Some(0) => Compression::None,
+        Some(level) => Compression::Gzip(level),
+    }
+}
+
 fn parse_order(order: &str) -> PyResult<ColumnOrder> {
     Ok(match order {
         "txyp" => ColumnOrder::Txyp,
@@ -1500,6 +1747,80 @@ enum SliceMode {
 enum SliceWindow {
     Time(i64, i64),
     Index(usize, usize),
+}
+
+/// Fixed-duration windows over an in-memory stream — what a reader's `SliceMode::Duration` is for
+/// a file, for the paths that render a stream directly rather than through a reader.
+#[derive(Clone, Copy)]
+struct StreamWindows {
+    start: i64,
+    step: i64,
+    frames: usize,
+}
+
+impl StreamWindows {
+    fn new(stream: &EventStream, dt_ms: f64) -> PyResult<Self> {
+        if !(dt_ms.is_finite() && dt_ms > 0.0) {
+            return Err(PyValueError::new_err("dt_ms must be finite and positive"));
+        }
+        let ts = stream.ts();
+        let (Some(&start), Some(&last)) = (ts.first(), ts.last()) else {
+            return Err(PyValueError::new_err("nothing to render: the stream is empty"));
+        };
+        // The step is in the stream's own raw units, which `dt_ms` is stated in milliseconds
+        // against — the same conversion `open(dt_ms=…)` makes.
+        let step = (dt_ms / stream.timestamp_scale_ms()).round().max(1.0) as i64;
+        Ok(Self {
+            start,
+            step,
+            // Half-open windows, so the last event needs one more frame than the span divides into.
+            frames: ((last - start) / step + 1) as usize,
+        })
+    }
+
+    fn window(&self, stream: &EventStream, index: usize) -> EventStream {
+        let t0 = self.start + index as i64 * self.step;
+        stream.time_window(t0, t0 + self.step)
+    }
+}
+
+/// How a sequence of slices is turned into displayable frames, shared by `save_video` and `play`.
+///
+/// The two differ only in where the frames go, so the rendering — including the awkward parts, the
+/// held display scale and the decay that has to survive a window boundary — lives here once.
+enum RenderView {
+    /// The raw event stream: each event lights its pixel in its polarity colour and fades. The
+    /// surface is **stateful on purpose** — decay carries across window boundaries, which is what
+    /// makes a moving edge leave a trail rather than blink once per frame.
+    Raw(eventcv_core::viz::RawSurface),
+    /// A representation, colour-mapped at a scale fixed for the whole sequence so the brightness
+    /// does not pump from frame to frame.
+    Repr {
+        spec: ReprSpec,
+        colormap: Colormap,
+        scale: eventcv_core::viz::Scale,
+    },
+}
+
+impl RenderView {
+    fn render(
+        &mut self,
+        stream: &EventStream,
+    ) -> Result<eventcv_core::viz::Rgb8Image, RepresentationError> {
+        match self {
+            Self::Raw(surface) => {
+                surface.update(stream);
+                Ok(surface.render())
+            }
+            Self::Repr {
+                spec,
+                colormap,
+                scale,
+            } => spec
+                .generate(stream)
+                .map(|frame| eventcv_core::viz::render_frame_scaled(&frame, *colormap, *scale)),
+        }
+    }
 }
 
 /// Reads `window` from the shared reader off-GIL, dropping the whole-recording hot pixels (if
@@ -1909,7 +2230,17 @@ impl PyEventReader {
     /// as `None`, it is calibrated from the first few slices and then held, because auto-contrast
     /// computed per frame makes the brightness pump visibly over a sequence. Pass `clim=0` to get
     /// the per-frame behaviour back, or an explicit value to match two videos to the same scale.
-    #[pyo3(signature = (path, *, fps=30.0, colormap="viridis", clim=None, max_frames=None))]
+    /// **The raw stream.** With no representation — neither `open(repr=…)` nor `repr=` here — the
+    /// events are drawn directly: each one lights its pixel in its polarity colour and fades over
+    /// `decay_ms`, which is the view a camera's own viewer shows and the one that needs no choice
+    /// of representation to look at a recording. `repr="raw"` asks for it explicitly even when the
+    /// reader carries a representation. `dt_ms` sets the window here rather than at `open`, so the
+    /// playback rate is a property of the video and not of the reader.
+    #[pyo3(signature = (
+        path, *, fps=30.0, colormap="viridis", clim=None, max_frames=None, repr=None,
+        dt_ms=None, decay_ms=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn save_video(
         &self,
         py: Python<'_>,
@@ -1918,17 +2249,13 @@ impl PyEventReader {
         colormap: &str,
         clim: Option<f64>,
         max_frames: Option<usize>,
+        repr: Option<&str>,
+        dt_ms: Option<f64>,
+        decay_ms: Option<f64>,
     ) -> PyResult<usize> {
         use eventcv_core::video::{encoder_for, Fps};
-        use eventcv_core::viz::{frame_extent, render_frame_scaled, Scale};
 
-        let spec = self.repr.ok_or_else(|| {
-            PyValueError::new_err(
-                "save_video needs a representation; open(repr=…) or reader.with_repr(…)",
-            )
-        })?;
-        let colormap = parse_colormap(colormap)?;
-        let mode = self.require_mode()?;
+        let mode = self.render_mode(dt_ms)?;
         let total = self.frame_count(mode);
         let frames = max_frames.map_or(total, |limit| limit.min(total));
         if frames == 0 {
@@ -1936,52 +2263,20 @@ impl PyEventReader {
                 "nothing to render: the reader has no slices",
             ));
         }
-
-        // Calibrate one display scale for the whole sequence. Bounded to a handful of slices so a
-        // multi-GB recording doesn't get read twice; the extent is a robust percentile, so a short
-        // sample is representative unless the scene changes completely.
-        let scale = match clim {
-            Some(value) if value > 0.0 => Scale::Fixed(value),
-            Some(_) => Scale::Auto, // clim=0 opts back in to per-frame auto-contrast
-            None => {
-                let mut extent = 0.0_f64;
-                for index in 0..frames.min(CLIM_CALIBRATION_FRAMES) {
-                    let stream = fetch_window(
-                        py,
-                        &self.inner,
-                        self.window_for_index(index as i64)?,
-                        index,
-                        self.slice_ops.clone(),
-                        self.hot_pixel_mask.clone(),
-                    )?;
-                    let frame = py
-                        .detach(|| spec.generate(&stream))
-                        .map_err(map_representation_error)?;
-                    extent = extent.max(py.detach(|| frame_extent(&frame)));
-                }
-                if extent > 0.0 {
-                    Scale::Fixed(extent)
-                } else {
-                    Scale::Auto
-                }
-            }
-        };
+        let mut view = self.render_view(py, repr, colormap, clim, decay_ms, mode, frames)?;
 
         let mut encoder: Option<Box<dyn eventcv_core::video::AnimationEncoder + Send>> = None;
         for index in 0..frames {
             let stream = fetch_window(
                 py,
                 &self.inner,
-                self.window_for_index(index as i64)?,
+                self.window_for_index_in(mode, index as i64)?,
                 index,
                 self.slice_ops.clone(),
                 self.hot_pixel_mask.clone(),
             )?;
             let image = py
-                .detach(|| {
-                    spec.generate(&stream)
-                        .map(|frame| render_frame_scaled(&frame, colormap, scale))
-                })
+                .detach(|| view.render(&stream))
                 .map_err(map_representation_error)?;
             // Opened on the first frame so the encoder learns the dimensions from real output
             // rather than from the sensor size, which a crop or resize op may have changed.
@@ -2005,6 +2300,93 @@ impl PyEventReader {
             py.detach(|| encoder.finish()).map_err(map_std_io_error)?;
         }
         Ok(frames)
+    }
+
+    /// Plays the recording back in an interactive window — the offline twin of `camera.show()`.
+    ///
+    /// With no representation this is the **raw** view: polarity dots fading over `decay_ms`, the
+    /// same [`RawSurface`](eventcv_core::viz::RawSurface) the live viewer draws, so watching a file
+    /// needs no more setup than watching a camera. Pass `repr="count"` (or any representation name)
+    /// to play that instead. `speed` multiplies the playback rate — `0.25` for a quarter-speed
+    /// look at a fast scene — and `dt_ms` sets the window without reopening the reader.
+    ///
+    /// Blocks on the main thread until the window is closed (Esc or the close button). `loop_`
+    /// restarts at the end instead of closing.
+    #[pyo3(signature = (
+        *, fps=30.0, dt_ms=None, decay_ms=None, repr=None, colormap="viridis", clim=None,
+        speed=1.0, loop_=false, max_frames=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn play(
+        &self,
+        py: Python<'_>,
+        fps: f64,
+        dt_ms: Option<f64>,
+        decay_ms: Option<f64>,
+        repr: Option<&str>,
+        colormap: &str,
+        clim: Option<f64>,
+        speed: f64,
+        loop_: bool,
+        max_frames: Option<usize>,
+    ) -> PyResult<()> {
+        if !(speed.is_finite() && speed > 0.0) {
+            return Err(PyValueError::new_err("speed must be finite and positive"));
+        }
+        let mode = self.render_mode(dt_ms)?;
+        let total = self.frame_count(mode);
+        let frames = max_frames.map_or(total, |limit| limit.min(total));
+        if frames == 0 {
+            return Err(PyValueError::new_err(
+                "nothing to play: the reader has no slices",
+            ));
+        }
+        let mut view = self.render_view(py, repr, colormap, clim, decay_ms, mode, frames)?;
+        let (width, height) = {
+            let guard = self.inner.lock().unwrap();
+            guard.sensor_size()
+        };
+
+        // Frames are fetched and rendered inside the producer, on the viewer's own thread. Unlike
+        // the camera path there is no device to starve if this falls behind: a file has no ring
+        // buffer to overflow, so a slow decode just plays slower rather than losing events.
+        let mut index = 0usize;
+        let mut done = false;
+        let producer = || -> Result<Option<eventcv_core::viz::Rgb8Image>, String> {
+            if done {
+                return Ok(None);
+            }
+            if index >= frames {
+                if !loop_ {
+                    done = true;
+                    return Ok(None);
+                }
+                index = 0;
+            }
+            let window = self
+                .window_for_index_in(mode, index as i64)
+                .map_err(|error| error.to_string())?;
+            let stream = Python::attach(|py| {
+                fetch_window(
+                    py,
+                    &self.inner,
+                    window,
+                    index,
+                    self.slice_ops.clone(),
+                    self.hot_pixel_mask.clone(),
+                )
+            })
+            .map_err(|error| error.to_string())?;
+            index += 1;
+            view.render(&stream)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        };
+
+        let interval = std::time::Duration::from_secs_f64(1.0 / (fps * speed).clamp(0.1, 1000.0));
+        let title = format!("playback ({}×{})", width, height);
+        viewer::run_live(producer, width as u32, height as u32, title, interval)
+            .map_err(PyRuntimeError::new_err)
     }
 
     // --- Random augmentations -------------------------------------------------------------
@@ -2377,11 +2759,114 @@ impl PyEventReader {
         usize::try_from(resolved).unwrap_or(0)
     }
 
+    /// The slicing mode a render should use: an explicit `dt_ms` at the call site, else the
+    /// reader's own.
+    ///
+    /// Taking it per call is what frees a raw render from `open(dt_ms=…)`. The window is a
+    /// property of the *view* — how much activity each displayed frame accumulates — and forcing
+    /// it to be fixed when the file was opened is exactly what made looking at a recording feel
+    /// like a configuration exercise.
+    fn render_mode(&self, dt_ms: Option<f64>) -> PyResult<SliceMode> {
+        match dt_ms {
+            Some(dt) if dt.is_finite() && dt > 0.0 => {
+                Ok(SliceMode::Duration((dt * 1000.0).round().max(1.0) as i64))
+            }
+            Some(_) => Err(PyValueError::new_err("dt_ms must be finite and positive")),
+            None => self.mode.ok_or_else(|| {
+                PyValueError::new_err(
+                    "no window to render: pass dt_ms= here, or open(path, dt_ms=…) / \
+                     open(path, max_events=…)",
+                )
+            }),
+        }
+    }
+
+    /// Builds the view a video or playback renders through: the raw polarity surface, or a
+    /// representation with one display scale calibrated for the whole sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn render_view(
+        &self,
+        py: Python<'_>,
+        repr: Option<&str>,
+        colormap: &str,
+        clim: Option<f64>,
+        decay_ms: Option<f64>,
+        mode: SliceMode,
+        frames: usize,
+    ) -> PyResult<RenderView> {
+        use eventcv_core::viz::{frame_extent, Scale};
+
+        let spec = match repr {
+            Some("raw") => None,
+            Some(name) => Some(ReprSpec::named(name, None)?),
+            // No explicit choice: the reader's own representation if it has one, else raw. A
+            // reader opened without `repr=` used to be an error here; showing the events
+            // themselves is a better answer than refusing to show anything.
+            None => self.repr,
+        };
+        let Some(spec) = spec else {
+            let (width, height) = {
+                let guard = self.inner.lock().unwrap();
+                guard.sensor_size()
+            };
+            // Default the fade to the window: one window's worth of trail is what makes motion
+            // legible without smearing the whole frame into a blur.
+            let decay = decay_ms.unwrap_or(match mode {
+                SliceMode::Duration(dt) => (dt as f64 / 1000.0).max(1.0),
+                SliceMode::Count(_) => DEFAULT_SPAN_MS,
+            });
+            return Ok(RenderView::Raw(eventcv_core::viz::RawSurface::new(
+                width, height, decay,
+            )));
+        };
+
+        // Calibrate one display scale for the whole sequence. Bounded to a handful of slices so a
+        // multi-GB recording doesn't get read twice; the extent is a robust percentile, so a short
+        // sample is representative unless the scene changes completely.
+        let scale = match clim {
+            Some(value) if value > 0.0 => Scale::Fixed(value),
+            Some(_) => Scale::Auto, // clim=0 opts back in to per-frame auto-contrast
+            None => {
+                let mut extent = 0.0_f64;
+                for index in 0..frames.min(CLIM_CALIBRATION_FRAMES) {
+                    let stream = fetch_window(
+                        py,
+                        &self.inner,
+                        self.window_for_index_in(mode, index as i64)?,
+                        index,
+                        self.slice_ops.clone(),
+                        self.hot_pixel_mask.clone(),
+                    )?;
+                    let frame = py
+                        .detach(|| spec.generate(&stream))
+                        .map_err(map_representation_error)?;
+                    extent = extent.max(py.detach(|| frame_extent(&frame)));
+                }
+                if extent > 0.0 {
+                    Scale::Fixed(extent)
+                } else {
+                    Scale::Auto
+                }
+            }
+        };
+        Ok(RenderView::Repr {
+            spec,
+            colormap: parse_colormap(colormap)?,
+            scale,
+        })
+    }
+
     /// The window for the `index`-th slice under the reader's mode, validating the range
     /// (negative indices count back from the end). Framing starts at the offset origin
     /// (`t_min + offset` for duration mode, `base_index` for count mode).
     fn window_for_index(&self, index: i64) -> PyResult<SliceWindow> {
-        let mode = self.require_mode()?;
+        self.window_for_index_in(self.require_mode()?, index)
+    }
+
+    /// [`window_for_index`](Self::window_for_index) under an explicitly chosen mode, so a render
+    /// given `dt_ms=` at the call site frames the recording its own way without mutating the
+    /// reader.
+    fn window_for_index_in(&self, mode: SliceMode, index: i64) -> PyResult<SliceWindow> {
         let guard = self.inner.lock().unwrap();
         let (n_events, (lo, _)) = (guard.n_events(), guard.time_span());
         drop(guard);
@@ -2523,8 +3008,13 @@ impl PyWindowIterator {
 ///
 /// An `EventReader` is converted **window by window**, so a recording far larger than memory can
 /// be re-exported without loading it.
+///
+/// `compression` applies to `.h5` and defaults to gzip 1; pass `False` for the fastest possible
+/// write at roughly three times the size.
 #[pyfunction]
-#[pyo3(signature = (obj, path, *, topic=None, colormap="viridis", normalize=true, format=None))]
+#[pyo3(signature = (
+    obj, path, *, topic=None, colormap="viridis", normalize=true, format=None, compression=None
+))]
 fn save(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
@@ -2533,11 +3023,14 @@ fn save(
     colormap: &str,
     normalize: bool,
     format: Option<String>,
+    compression: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
+    let compression = parse_compression(compression)?;
     if let Ok(stream) = obj.extract::<PyRef<PyEventStream>>() {
         let options = SaveOptions {
             topic,
             format,
+            compression,
             ..SaveOptions::default()
         };
         let inner = &stream.inner; // capture a plain &EventStream, not the GIL-bound PyRef
@@ -2572,11 +3065,15 @@ fn save(
 /// `source` is a video file path, or an array of intensity frames — `[N, H, W]` greyscale or
 /// `[N, H, W, 3]` RGB, any dtype, with values read as `[0, 255]` for integers and `[0, 1]` for
 /// floats. Frames need an explicit `fps`; a video file carries its own.
+///
+/// With `out=` the events are written as they are produced and a `SimulationResult` is returned
+/// instead of an `EventStream`, so a simulation far larger than memory still completes.
 #[pyfunction]
 #[pyo3(signature = (
     source, *, pos_thres=0.2, neg_thres=0.2, sigma_thres=0.03, refractory_us=100,
     cutoff_hz=200.0, leak_rate_hz=1.0, shot_noise_rate_hz=10.0, seed=0,
-    upsample=None, max_events_per_pixel=1.0, fps=None, scale=None, max_frames=None
+    upsample=None, max_events_per_pixel=1.0, max_upsample=None, fps=None, scale=None,
+    max_frames=None, out=None, compression=None, progress=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn simulate(
@@ -2592,11 +3089,17 @@ fn simulate(
     seed: u64,
     upsample: Option<&str>,
     max_events_per_pixel: f32,
+    max_upsample: Option<usize>,
     fps: Option<f64>,
     scale: Option<(usize, usize)>,
     max_frames: Option<usize>,
-) -> PyResult<PyEventStream> {
-    use eventcv_core::simulate::{simulate_video, Simulator, SimulatorConfig, Upsample};
+    out: Option<String>,
+    compression: Option<&Bound<'_, PyAny>>,
+    progress: bool,
+) -> PyResult<Py<PyAny>> {
+    use eventcv_core::simulate::{
+        simulate_video_with_progress, Simulator, SimulatorConfig, Upsample, MAX_UPSAMPLE,
+    };
 
     let upsample = match upsample {
         None | Some("adaptive") => Upsample::Adaptive {
@@ -2622,29 +3125,49 @@ fn simulate(
         shot_noise_rate_hz,
         seed,
         upsample,
+        max_upsample: max_upsample.unwrap_or(MAX_UPSAMPLE),
     };
 
-    // Collecting the per-interval streams and concatenating once at the end keeps the simulator
-    // itself streaming; only this convenience wrapper materialises the whole recording, which is
-    // what a caller asking for one EventStream has asked for.
-    let mut chunks: Vec<EventStream> = Vec::new();
+    let mut sink = SimulationSink::open(out.as_deref(), parse_compression(compression)?)?;
+    let mut reporter = ProgressReporter::new(progress);
+    // A simulation is one long call with the GIL released, so `Ctrl+C` has nowhere to land unless
+    // the frame hook goes back for it. The error is stashed rather than converted, so what
+    // surfaces is a real `KeyboardInterrupt` and not an `OSError` describing one.
+    let mut interrupt: Option<PyErr> = None;
+    let mut frames = 0usize;
 
     if let Ok(path) = source.extract::<String>() {
-        py.detach(|| {
-            simulate_video(
+        let result = py.detach(|| {
+            simulate_video_with_progress(
                 std::path::Path::new(&path),
                 config,
                 scale,
                 max_frames,
                 |stream| {
-                    chunks.push(stream);
+                    sink.push(&stream)
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                },
+                |progress| {
+                    frames = progress.frames;
+                    if let Err(error) = Python::attach(|py| py.check_signals()) {
+                        interrupt = Some(error);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "interrupted",
+                        ));
+                    }
+                    reporter.report(progress);
                     Ok(())
                 },
             )
-        })
-        .map_err(map_std_io_error)?;
+        });
+        reporter.finish();
+        if let Some(error) = interrupt {
+            return Err(error);
+        }
+        result.map_err(map_std_io_error)?;
     } else {
-        let frames = source
+        let readonly = source
             .call_method1("astype", ("float32",))
             .unwrap_or_else(|_| source.clone())
             .extract::<numpy::PyReadonlyArrayDyn<f32>>()
@@ -2653,7 +3176,7 @@ fn simulate(
                     "simulate takes a video path or an array of frames ([N,H,W] or [N,H,W,3])",
                 )
             })?;
-        let array = frames.as_array();
+        let array = readonly.as_array();
         let shape = array.shape().to_vec();
         let (count, height, width, channels) = match shape.as_slice() {
             [n, h, w] => (*n, *h, *w, 1),
@@ -2675,16 +3198,23 @@ fn simulate(
         let peak = array.iter().copied().fold(0.0_f32, f32::max);
         let divisor = if peak > 1.0 { 255.0 } else { 1.0 };
         let us_per_frame = (1_000_000.0 / fps).round() as i64;
-        let values: Vec<f32> = array.iter().copied().collect();
-        drop(frames);
+        // The array is read frame by frame through the numpy view. Copying the whole stack into a
+        // `Vec<f32>` first — which is what this used to do — doubled the caller's memory before the
+        // simulation had produced a single event.
+        let array = array.to_owned();
+        drop(readonly);
 
-        py.detach(|| {
-            let mut simulator = Simulator::new(width, height, config);
-            let plane = width * height;
-            let mut luma = vec![0.0_f32; plane];
-            let limit = max_frames.map_or(count, |limit| limit.min(count));
-            for index in 0..limit {
-                let base = index * plane * channels;
+        let plane = width * height;
+        let limit = max_frames.map_or(count, |limit| limit.min(count));
+        let mut simulator = Simulator::new(width, height, config);
+        let mut luma = vec![0.0_f32; plane];
+        let values = array.as_slice().ok_or_else(|| {
+            PyValueError::new_err("frames must be a contiguous array; pass np.ascontiguousarray(…)")
+        })?;
+
+        for index in 0..limit {
+            let base = index * plane * channels;
+            py.detach(|| {
                 for pixel in 0..plane {
                     luma[pixel] = if channels == 3 {
                         let offset = base + pixel * 3;
@@ -2703,25 +3233,249 @@ fn simulate(
                     };
                 }
                 let stream = simulator.push_frame(&luma, index as i64 * us_per_frame);
-                if !stream.is_empty() {
-                    chunks.push(stream);
-                }
-            }
-        });
+                sink.push(&stream)
+            })
+            .map_err(map_io_error)?;
+            frames = index + 1;
+            py.check_signals()?;
+            reporter.report(eventcv_core::simulate::SimulateProgress {
+                frames,
+                total_frames: Some(limit),
+                events: sink.n_events(),
+            });
+        }
+        reporter.finish();
     }
 
-    // `concat` takes references and preserves order, so the globally-sorted invariant the simulator
-    // guarantees per interval survives the join.
-    let inner = py.detach(|| match chunks.split_first() {
-        Some((first, rest)) => first.concat(&rest.iter().collect::<Vec<_>>()),
-        None => EventStreamBuilder::new(
-            scale.map_or(0, |(w, _)| w),
-            scale.map_or(0, |(_, h)| h),
-            0.001,
+    match out {
+        Some(path) => {
+            let events = sink.n_events();
+            py.detach(|| sink.finish()).map_err(map_io_error)?;
+            Py::new(
+                py,
+                PySimulationResult {
+                    path,
+                    frames,
+                    events,
+                },
+            )
+            .map(|result| result.into_any())
+        }
+        None => {
+            let inner = py.detach(|| sink.into_stream());
+            Py::new(py, PyEventStream { inner, repr: None }).map(|stream| stream.into_any())
+        }
+    }
+}
+
+/// What `simulate(..., out=…)` returns in place of an `EventStream`: the file it wrote and what
+/// went into it. `len(result)` is the event count.
+#[pyclass(name = "SimulationResult", frozen, get_all)]
+struct PySimulationResult {
+    /// The file that was written.
+    path: String,
+    /// Source frames processed.
+    frames: usize,
+    /// Events written.
+    events: usize,
+}
+
+#[pymethods]
+impl PySimulationResult {
+    fn __len__(&self) -> usize {
+        self.events
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SimulationResult(path={:?}, frames={}, events={})",
+            self.path, self.frames, self.events
         )
-        .build(),
-    });
-    Ok(PyEventStream { inner, repr: None })
+    }
+}
+
+/// How often a streaming simulation is forced out to disk, so a crash keeps everything written up
+/// to about a second ago. Matches the live recorder's cadence.
+#[cfg(feature = "hdf5")]
+const SIMULATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Where a simulation's events go as they are produced.
+///
+/// The simulator itself has always streamed — it holds one frame pair and hands each interval
+/// straight on. What did not stream was this binding, which collected every interval and
+/// concatenated at the end, so a run peaked at twice the whole recording. `out=` to an appendable
+/// format now writes through, and memory stays proportional to one frame interval.
+enum SimulationSink {
+    /// Accumulated in memory, either to be returned as an `EventStream` (`out` is `None`) or
+    /// written in one go at the end (a format that cannot be appended to).
+    Buffered {
+        builder: Option<EventStreamBuilder>,
+        out: Option<(String, SaveOptions)>,
+    },
+    /// Appended window by window. Only HDF5 supports this today.
+    #[cfg(feature = "hdf5")]
+    Streaming {
+        sink: eventcv_core::io::Hdf5EventSink,
+        last_flush: std::time::Instant,
+    },
+}
+
+impl SimulationSink {
+    fn open(out: Option<&str>, compression: Compression) -> PyResult<Self> {
+        let Some(path) = out else {
+            return Ok(Self::Buffered {
+                builder: None,
+                out: None,
+            });
+        };
+        // Reject a path whose format cannot be written at all now, rather than after the user has
+        // waited out the whole simulation.
+        let options = SaveOptions {
+            compression,
+            ..SaveOptions::default()
+        };
+        if eventcv_core::io::supports_event_append(path) {
+            #[cfg(feature = "hdf5")]
+            {
+                return Ok(Self::Streaming {
+                    sink: eventcv_core::io::Hdf5EventSink::open(path, compression)
+                        .map_err(map_io_error)?,
+                    last_flush: std::time::Instant::now(),
+                });
+            }
+            #[cfg(not(feature = "hdf5"))]
+            {
+                return Err(PyValueError::new_err(
+                    "this build has no HDF5 support, so out= cannot stream to .h5; rebuild with \
+                     --features hdf5, or simulate to memory and save a .npz",
+                ));
+            }
+        }
+        Ok(Self::Buffered {
+            builder: None,
+            out: Some((path.to_owned(), options)),
+        })
+    }
+
+    /// Takes one interval's events. Empty intervals are a no-op.
+    fn push(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::Buffered { builder, .. } => {
+                let (width, height) = stream.sensor_size();
+                builder
+                    .get_or_insert_with(|| {
+                        EventStreamBuilder::new(width, height, stream.timestamp_scale_ms())
+                    })
+                    .extend_from_stream(stream);
+                Ok(())
+            }
+            #[cfg(feature = "hdf5")]
+            Self::Streaming { sink, last_flush } => {
+                sink.append(stream)?;
+                if last_flush.elapsed() >= SIMULATE_FLUSH_INTERVAL {
+                    sink.flush()?;
+                    *last_flush = std::time::Instant::now();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn n_events(&self) -> usize {
+        match self {
+            Self::Buffered { builder, .. } => builder.as_ref().map_or(0, EventStreamBuilder::len),
+            #[cfg(feature = "hdf5")]
+            Self::Streaming { sink, .. } => sink.n_events(),
+        }
+    }
+
+    /// Closes an `out=` sink, writing anything still buffered.
+    fn finish(self) -> Result<(), IoError> {
+        match self {
+            Self::Buffered { builder, out } => {
+                let Some((path, options)) = out else {
+                    return Ok(());
+                };
+                let stream = builder.map_or_else(
+                    || EventStreamBuilder::new(0, 0, 0.001).build(),
+                    EventStreamBuilder::build,
+                );
+                eventcv_core::io::save_stream(path, &stream, &options)
+            }
+            #[cfg(feature = "hdf5")]
+            Self::Streaming { sink, .. } => sink.finish(),
+        }
+    }
+
+    /// The accumulated stream, for the `out=None` case. A sensor size of `0 × 0` is what an empty
+    /// simulation reports, matching what the old concatenation produced.
+    fn into_stream(self) -> EventStream {
+        match self {
+            Self::Buffered { builder, .. } => builder.map_or_else(
+                || EventStreamBuilder::new(0, 0, 0.001).build(),
+                EventStreamBuilder::build,
+            ),
+            #[cfg(feature = "hdf5")]
+            Self::Streaming { .. } => unreachable!("a streaming sink is only built for out="),
+        }
+    }
+}
+
+/// Prints a simulation's progress to stderr, rate-limited so a fast clip does not spend its time
+/// on terminal writes.
+///
+/// Writes with Rust's `eprint!` rather than through `sys.stderr`, because the whole simulation runs
+/// with the GIL released and reacquiring it every frame purely to print would serialise the run
+/// against any other Python thread.
+struct ProgressReporter {
+    enabled: bool,
+    last: std::time::Instant,
+    printed: bool,
+}
+
+impl ProgressReporter {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            // Back-dated so the first frame reports immediately: on a slow clip the first frame is
+            // exactly when the user most needs to see that something is happening.
+            last: std::time::Instant::now() - Self::INTERVAL,
+            printed: false,
+        }
+    }
+
+    fn report(&mut self, progress: eventcv_core::simulate::SimulateProgress) {
+        if !self.enabled {
+            return;
+        }
+        let done = progress.total_frames == Some(progress.frames);
+        if !done && self.last.elapsed() < Self::INTERVAL {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        self.printed = true;
+        let of = match progress.total_frames {
+            Some(total) => format!("/{total}"),
+            None => String::new(),
+        };
+        eprint!(
+            "\rsimulating: {}{of} frames, {:.1}M events",
+            progress.frames,
+            progress.events as f64 / 1e6
+        );
+    }
+
+    /// Closes the progress line, so whatever is printed next starts on its own row.
+    fn finish(&mut self) {
+        if self.enabled && self.printed {
+            eprintln!();
+        }
+    }
 }
 
 /// Reconstructs an intensity video from events by running a trained model over each slice.
@@ -3083,18 +3837,12 @@ struct PyEventSink {
 #[cfg(feature = "hdf5")]
 #[pymethods]
 impl PyEventSink {
-    /// Opens `path` for writing. `compression` is an optional gzip level (`0..=9`); omit it (the
-    /// default) for uncompressed columns and the fastest writes.
+    /// Opens `path` for writing. `compression` matches `eventcv.save`: gzip 1 by default, `False`
+    /// for uncompressed columns and the fastest writes.
     #[new]
     #[pyo3(signature = (path, *, compression=None))]
-    fn new(path: &str, compression: Option<u8>) -> PyResult<Self> {
-        if let Some(level) = compression {
-            if level > 9 {
-                return Err(PyValueError::new_err(
-                    "compression must be a gzip level in 0..=9",
-                ));
-            }
-        }
+    fn new(path: &str, compression: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let compression = parse_compression(compression)?;
         let inner =
             eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
         Ok(Self { inner: Some(inner) })
@@ -3779,6 +4527,17 @@ fn to_f32_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<numpy::ndar
     Ok(readonly.as_array().to_owned())
 }
 
+/// The ONNX Runtime this build would run on, e.g. `"1.28.0"`, or `None` if none can be loaded.
+///
+/// Opening the library is the only way to learn its version, so the first call costs a `dlopen` —
+/// which is why `eventcv --version` asks and nothing else does. Never raises: "there is no
+/// runtime here" is the answer, not an error.
+#[cfg(feature = "onnx")]
+#[pyfunction]
+fn onnx_runtime_version() -> Option<String> {
+    eventcv_core::model::runtime_version()
+}
+
 #[cfg(feature = "onnx")]
 fn map_model_error(error: eventcv_core::model::ModelError) -> PyErr {
     use eventcv_core::model::ModelError;
@@ -3794,6 +4553,10 @@ fn map_model_error(error: eventcv_core::model::ModelError) -> PyErr {
         ModelError::Load(message)
         | ModelError::Run(message)
         | ModelError::UnsupportedOutput(message) => PyValueError::new_err(message),
+        // Nothing is wrong with the model or the call: the machine has no ONNX Runtime to open.
+        // RuntimeError matches what a build without the `onnx` feature raises (`_MissingModel` in
+        // `load.py`), so "eventcv cannot run models here" is one exception type either way.
+        ModelError::RuntimeMissing(message) => PyRuntimeError::new_err(message),
     }
 }
 
@@ -4141,7 +4904,14 @@ fn run_live_threaded(
     };
 
     let result = match mode {
-        LiveMode::Show => viewer::run_live(producer, width, height, title).map(|()| None),
+        LiveMode::Show => viewer::run_live(
+            producer,
+            width,
+            height,
+            title,
+            std::time::Duration::from_millis(LIVE_RENDER_INTERVAL_MS),
+        )
+        .map(|()| None),
         LiveMode::Draw => viewer::draw_mask(producer, width as usize, height as usize, title),
     };
 
@@ -4231,7 +5001,8 @@ impl Recorder {
 
     fn open(path: &str, compression: Option<u8>) -> PyResult<Self> {
         Ok(Self {
-            sink: eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?,
+            sink: eventcv_core::io::Hdf5EventSink::open(path, capture_compression(compression))
+                .map_err(map_io_error)?,
             last_flush: std::time::Instant::now(),
         })
     }
@@ -4993,7 +5764,8 @@ impl PyEventCamera {
     ) -> PyResult<usize> {
         let capture = self.parked_capture()?;
         let mut sink =
-            eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
+            eventcv_core::io::Hdf5EventSink::open(path, capture_compression(compression))
+                .map_err(map_io_error)?;
         // The loop is kept separate so the sink is flushed and closed on *both* exits: a write
         // error used to return through `?` and drop it unfinished, losing the last second.
         let result = Self::fill_sink(py, capture, &mut sink, seconds);
@@ -5560,7 +6332,10 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUdpSender>()?;
     m.add_class::<PyUdpReceiver>()?;
     #[cfg(feature = "onnx")]
-    m.add_class::<PyModel>()?;
+    {
+        m.add_class::<PyModel>()?;
+        m.add_function(wrap_pyfunction!(onnx_runtime_version, m)?)?;
+    }
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
@@ -5571,6 +6346,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_imu, m)?)?;
     m.add_function(wrap_pyfunction!(read_camera_info, m)?)?;
     m.add_function(wrap_pyfunction!(simulate, m)?)?;
+    m.add_class::<PySimulationResult>()?;
     #[cfg(feature = "onnx")]
     m.add_function(wrap_pyfunction!(reconstruct, m)?)?;
     m.add_function(wrap_pyfunction!(rect_mask, m)?)?;

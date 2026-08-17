@@ -74,7 +74,19 @@ class CommandLineTests(unittest.TestCase):
         lines = self._run("--version").stdout.splitlines()
         for feature in eventcv._rust.__features__:
             self.assertIn(feature, lines[0], "the build's features belong on the version line")
-        self.assertTrue(lines[1].startswith("Python "), lines[1])
+        self.assertTrue(lines[-1].startswith("Python "), lines[-1])
+
+    @unittest.skipUnless(
+        "onnx" in eventcv._rust.__features__, "needs a build with the onnx feature"
+    )
+    def test_version_reports_which_onnx_runtime_was_loaded(self):
+        # Which library `Model` opened, and where it came from, is decided at run time — the one
+        # thing about a model bug report that a build-time feature list cannot answer.
+        lines = self._run("--version").stdout.splitlines()
+        self.assertTrue(
+            any(line.startswith("ONNX Runtime") for line in lines[1:-1]),
+            f"no ONNX Runtime line in {lines}",
+        )
 
     def test_bare_invocation_prints_help_and_succeeds(self):
         result = self._run()

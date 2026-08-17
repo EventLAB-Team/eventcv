@@ -6,9 +6,13 @@ no binary blob in the repository. `onnx` is only needed to *write* it; eventcv r
 own runtime.
 """
 
+import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import numpy as np
 
@@ -121,6 +125,95 @@ class ModelTests(unittest.TestCase):
         model = eventcv.Model(str(self.path))
         with self.assertRaises(ValueError):
             model("not an array")
+
+
+@unittest.skipUnless(HAVE_ONNX_RUNTIME, "needs a build with the onnx feature")
+class RuntimeDiscoveryTests(unittest.TestCase):
+    """ONNX Runtime is opened at run time, not linked in, so finding it is part of the job.
+
+    The wheels carry a copy, but a source build, a conda environment and an explicit
+    `ORT_DYLIB_PATH` are all supported ways to supply one — which makes the search order a
+    contract, not an implementation detail.
+    """
+
+    def setUp(self):
+        # `configure()` caches what it chose, and some tests here call it; put the module back
+        # the way it was so a later test's `describe()` still reports the truth.
+        resolved = eventcv._ort._resolved
+        self.addCleanup(setattr, eventcv._ort, "_resolved", resolved)
+
+    def test_a_runtime_is_found_and_its_origin_named(self):
+        found = eventcv._ort.find_runtime()
+        self.assertIsNotNone(found, "no ONNX Runtime anywhere — see scripts/fetch_onnxruntime.py")
+        path, origin = found
+        self.assertTrue(Path(path).is_file())
+        self.assertIn(origin, [name for name, _ in eventcv._ort._SOURCES])
+
+    def test_the_search_order_is_the_documented_one(self):
+        # Ordering is what makes the behaviour predictable: an explicit choice beats a runtime the
+        # process already holds, which beats the bundled copy, which beats the environment's.
+        self.assertEqual(
+            [name for name, _ in eventcv._ort._SOURCES],
+            [
+                "ORT_DYLIB_PATH",
+                "imported onnxruntime",
+                "bundled",
+                "environment",
+                "onnxruntime package",
+            ],
+        )
+
+    def test_the_first_source_with_an_answer_wins(self):
+        sources = (
+            ("nothing here", lambda: None),
+            ("second", lambda: "/second/libonnxruntime.so"),
+            ("third", lambda: "/third/libonnxruntime.so"),
+        )
+        with mock.patch.object(eventcv._ort, "_SOURCES", sources):
+            self.assertEqual(
+                eventcv._ort.find_runtime(), ("/second/libonnxruntime.so", "second")
+            )
+
+    def test_the_bundled_copy_is_what_a_wheel_uses(self):
+        bundled = eventcv._ort._bundled()
+        if bundled is None:
+            self.skipTest("source build without scripts/fetch_onnxruntime.py")
+        # Neither an explicit path nor an already-imported onnxruntime, which both outrank it.
+        with mock.patch.dict(os.environ), mock.patch.dict(sys.modules):
+            os.environ.pop("ORT_DYLIB_PATH", None)
+            sys.modules.pop("onnxruntime", None)
+            self.assertEqual(eventcv._ort.find_runtime(), (bundled, "bundled"))
+
+    def test_an_explicit_path_is_never_overridden(self):
+        chosen = "/somewhere/of/my/own/libonnxruntime.so"
+        with mock.patch.dict(os.environ, {"ORT_DYLIB_PATH": chosen}):
+            eventcv._ort.configure()
+            self.assertEqual(os.environ["ORT_DYLIB_PATH"], chosen)
+            self.assertEqual(eventcv._ort.describe(), f"{chosen} (ORT_DYLIB_PATH)")
+
+    def test_a_missing_runtime_is_reported_with_the_fix(self):
+        # In a subprocess because the probe is cached for the life of the process: by the time
+        # this runs, the tests above have already loaded a runtime successfully. The subprocess
+        # also proves the failure is an exception rather than the panic ort raises on its own.
+        result = self._load_with_runtime("/nonexistent/libonnxruntime.so")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RuntimeError", result.stderr)
+        self.assertIn("eventcv[onnx]", result.stderr)
+
+    def test_a_library_that_is_not_onnx_runtime_says_so(self):
+        # The extension itself: a perfectly good shared library with none of the right symbols,
+        # which is what a wrong `ORT_DYLIB_PATH` usually points at.
+        result = self._load_with_runtime(eventcv._rust.__file__)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not ONNX Runtime", result.stderr)
+
+    def _load_with_runtime(self, path):
+        return subprocess.run(
+            [sys.executable, "-c", "import eventcv; eventcv.Model('anything.onnx')"],
+            env={**os.environ, "ORT_DYLIB_PATH": str(path)},
+            capture_output=True,
+            text=True,
+        )
 
 
 @unittest.skipIf(HAVE_ONNX_RUNTIME, "this build has the onnx feature")

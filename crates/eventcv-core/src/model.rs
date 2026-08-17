@@ -12,11 +12,23 @@
 //! surface is already a dense `f32` tensor in the layout ONNX wants, so feeding one to a network is
 //! a shape check and a pointer, not a conversion.
 
+use std::ffi::CStr;
 use std::fmt;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use ndarray::{ArrayD, IxDyn};
 use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::sys;
 use ort::value::{Tensor, Value};
+
+/// What the platform's dynamic loader calls the ONNX Runtime when `ORT_DYLIB_PATH` names nothing.
+#[cfg(target_os = "windows")]
+const DEFAULT_DYLIB: &str = "onnxruntime.dll";
+#[cfg(target_vendor = "apple")]
+const DEFAULT_DYLIB: &str = "libonnxruntime.dylib";
+#[cfg(not(any(target_os = "windows", target_vendor = "apple")))]
+const DEFAULT_DYLIB: &str = "libonnxruntime.so";
 
 /// What went wrong loading or running a model.
 #[derive(Debug)]
@@ -27,6 +39,9 @@ pub enum ModelError {
     Run(String),
     /// The graph produced an output this crate cannot represent as an `f32` array.
     UnsupportedOutput(String),
+    /// No ONNX Runtime library could be opened. Separate from `Load` because nothing is wrong
+    /// with the model or the call — the environment is missing a piece, and the fix is an install.
+    RuntimeMissing(String),
 }
 
 impl fmt::Display for ModelError {
@@ -37,6 +52,7 @@ impl fmt::Display for ModelError {
             Self::UnsupportedOutput(message) => {
                 write!(f, "unsupported model output: {message}")
             }
+            Self::RuntimeMissing(message) => write!(f, "ONNX Runtime is unavailable: {message}"),
         }
     }
 }
@@ -68,6 +84,9 @@ impl Model {
     /// loaded once and then run per slice, so paying the graph-rewrite cost up front is always the
     /// right trade here.
     pub fn load(path: &str) -> Result<Self, ModelError> {
+        // Before the first ort call, because that is where a missing runtime would otherwise
+        // abort the process rather than return.
+        ensure_runtime()?;
         // Stepwise rather than a combinator chain: ort's error type is generic over the stage, so
         // the intermediate results don't share one `Result` type to chain through.
         let builder = Session::builder().map_err(|error| ModelError::Load(error.to_string()))?;
@@ -197,6 +216,89 @@ fn extract_f32(value: &Value, name: &str) -> Result<ArrayD<f32>, ModelError> {
     })
 }
 
+/// Opens the ONNX Runtime library and checks it is usable, once per process.
+///
+/// The runtime is loaded at run time rather than linked in (see the `ort` entry in this crate's
+/// `Cargo.toml` for why), which moves three failures out of build time and into the user's
+/// machine: no runtime at all, a file that is not ONNX Runtime, and an ONNX Runtime older than
+/// the API level compiled in. `ort` meets all three the same way — a panic inside its lazy
+/// initialiser, reaching Python as a `PanicException` with no advice in it — so they are
+/// diagnosed here instead, before the first ort call. The library stays resident afterwards, so
+/// ort's own load finds it already open.
+///
+/// Returns the runtime's version string, which `eventcv --version` reports.
+fn probe_runtime() -> &'static Result<String, String> {
+    static PROBE: OnceLock<Result<String, String>> = OnceLock::new();
+    PROBE.get_or_init(|| {
+        // The same resolution order ort itself uses, so the probe cannot succeed where the real
+        // load would fail: an explicit `ORT_DYLIB_PATH` (set by `python/eventcv/_ort.py` from
+        // whatever the installation provides), else the platform's default name, which the
+        // loader looks for on the usual search path.
+        let target = std::env::var_os("ORT_DYLIB_PATH")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_DYLIB.into());
+        let target = Path::new(&target);
+
+        // SAFETY: loading a library runs its initialisers, which is exactly what ort would do a
+        // moment later; there is no way to check one without opening it.
+        let library = unsafe { libloading::Library::new(target) }
+            .map_err(|error| format!("could not open {} ({error})", target.display()))?;
+        let version = {
+            // SAFETY: `OrtGetApiBase` is ONNX Runtime's documented entry point and has had this
+            // signature since 1.0; a library without it is rejected below rather than called.
+            let entry: libloading::Symbol<unsafe extern "system" fn() -> *const sys::OrtApiBase> =
+                unsafe { library.get("OrtGetApiBase") }.map_err(|_| {
+                    format!(
+                        "{} is a library, but not ONNX Runtime — it exports no OrtGetApiBase",
+                        target.display()
+                    )
+                })?;
+            // SAFETY: the pointer comes from ONNX Runtime's own entry point and points at static
+            // storage inside it; the library outlives this scope (it is leaked below).
+            let base = unsafe { entry() };
+            if base.is_null() {
+                return Err(format!("{}: OrtGetApiBase returned null", target.display()));
+            }
+            let version = unsafe { CStr::from_ptr(((*base).GetVersionString)()) }
+                .to_string_lossy()
+                .into_owned();
+            if unsafe { ((*base).GetApi)(sys::ORT_API_VERSION) }.is_null() {
+                return Err(format!(
+                    "{} is ONNX Runtime {version}, which is too old: EventCV needs API level {} \
+                     (ONNX Runtime 1.{} or newer)",
+                    target.display(),
+                    sys::ORT_API_VERSION,
+                    sys::ORT_API_VERSION
+                ));
+            }
+            version
+        };
+        // Deliberately never unloaded: ort is about to open the same file, and dropping it here
+        // would only unmap it in between.
+        std::mem::forget(library);
+        Ok(version)
+    })
+}
+
+/// The ONNX Runtime version in use, or `None` if there is none to load. Never fails — it is for
+/// `eventcv --version`, which has to print something useful either way.
+pub fn runtime_version() -> Option<String> {
+    probe_runtime().as_ref().ok().cloned()
+}
+
+/// [`probe_runtime`] as a precondition, with the message a user can act on.
+fn ensure_runtime() -> Result<(), ModelError> {
+    match probe_runtime() {
+        Ok(_) => Ok(()),
+        Err(reason) => Err(ModelError::RuntimeMissing(format!(
+            "{reason}. EventCV loads ONNX Runtime at run time instead of compiling it in, and the \
+             wheels ship a copy — reinstall from PyPI (`pip install --force-reinstall eventcv`), \
+             install one alongside (`pip install eventcv[onnx]`, or conda's `onnxruntime-cpp`), or \
+             point ORT_DYLIB_PATH at a libonnxruntime you already have"
+        ))),
+    }
+}
+
 /// The declared shape of a tensor port, with `-1` for free dimensions. Non-tensor ports (sequences,
 /// maps) report an empty shape rather than failing the whole load — the graph may still be usable.
 fn tensor_shape(value_type: &ort::value::ValueType) -> Vec<i64> {
@@ -217,8 +319,24 @@ fn type_name(value_type: &ort::value::ValueType) -> String {
 mod tests {
     use super::*;
 
+    /// Whether this machine has an ONNX Runtime to open at all.
+    ///
+    /// The runtime is installed rather than linked in, so these tests would otherwise fail on a
+    /// machine that simply hasn't got one — a false alarm about the library. They return early
+    /// instead; the Python suite (`tests/test_model.py`) runs with the `onnxruntime` wheel
+    /// installed and covers the same paths, plus the missing-runtime message itself.
+    fn runtime_available() -> bool {
+        !matches!(
+            Model::load("/nonexistent/model.onnx"),
+            Err(ModelError::RuntimeMissing(_))
+        )
+    }
+
     #[test]
     fn a_missing_file_is_a_load_error() {
+        if !runtime_available() {
+            return;
+        }
         let error = Model::load("/nonexistent/model.onnx")
             .err()
             .expect("loading a missing file must fail");
@@ -228,6 +346,9 @@ mod tests {
 
     #[test]
     fn a_non_onnx_file_is_a_load_error() {
+        if !runtime_available() {
+            return;
+        }
         let mut path = std::env::temp_dir();
         path.push(format!("eventcv-not-a-model-{}.onnx", std::process::id()));
         std::fs::write(&path, b"this is not a protobuf").unwrap();

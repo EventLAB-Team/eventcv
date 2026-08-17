@@ -70,10 +70,11 @@ jobs:
         shell: bash
       - name: Install eventcv and test dependencies
         # Builds with the same features as the published wheels, so CI tests what users get.
-        # `onnx` is the writer used to build the tiny model fixture in tests/test_model.py.
+        # The `test` extra carries `onnx` (the writer for the tiny model fixture in
+        # tests/test_model.py) and `onnxruntime` (the library `Model` opens at run time).
         run: |
           python -m pip install --upgrade pip
-          pip install maturin pytest onnx
+          pip install maturin pytest
           pip install -e '.[test]'
         shell: bash
       - name: Run tests

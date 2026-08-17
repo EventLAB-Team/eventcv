@@ -73,14 +73,53 @@ Useful flags:
 - `--dt-ms` — time per frame; controls how much motion each frame accumulates.
 - `--fps` — playback rate. Independent of `--dt-ms`: setting `--dt-ms 10 --fps 100` plays back in
   real time, while `--fps 10` makes the same recording a slow-motion clip.
-- `--repr` — representation to render (default `tencode`, which is designed for viewing).
+- `--repr` — what to draw. The default `raw` is the event stream itself (polarity dots fading by
+  age), which needs no choice of representation to be meaningful; pass a representation name
+  (`tencode`, `count`, `tsurf`, …) to render that instead.
+- `--decay-ms` — raw view only: how long an event's trail takes to fade.
 - `--clim` — fix the brightness scale, so two renders are comparable.
 - `--max-frames` — stop early, to check a long recording before committing to all of it.
+
+## `eventcv play`
+
+```console
+$ eventcv play recording.h5 --dt-ms 5
+```
+
+Opens an interactive window and plays the recording — the offline twin of a camera's live view, and
+raw by default for the same reason `render` is. It blocks until the window is closed (`Esc` or the
+close button).
+
+Takes `--dt-ms`, `--fps`, `--repr`, `--decay-ms` and `--colormap` exactly as `render` does, plus:
+
+- `--speed` — playback rate multiplier; `--speed 0.25` for a slow look at a fast scene.
+- `--loop` — restart at the end instead of closing.
+
+## `eventcv simulate`
+
+```console
+$ eventcv simulate clip.mp4 events.h5 --scale 960 540
+simulating: 39/39 frames, 18.7M events
+wrote events.h5 (18,742,110 events from 39 frames)
+```
+
+Turns a video into synthetic events (needs `ffmpeg` on `PATH`). The events are written as they are
+produced, so memory stays flat however long the clip is, and progress is shown when stderr is a
+terminal. See [Simulation](simulation.md) for the pixel model.
+
+Beyond the model parameters (`--threshold`, `--sigma-thres`, `--cutoff-hz`, `--leak-rate-hz`,
+`--shot-noise-rate-hz`, `--refractory-us`, `--seed`):
+
+- `--scale W H` — decode at a smaller size. The most effective lever on both time and file size:
+  halving each side quarters the pixels and roughly quarters the output.
+- `--upsample`, `--max-upsample` — how finely each frame interval is subdivided, and a ceiling on
+  it. Each sub-step is a full pass over every pixel.
+- `--compression` — HDF5 gzip level `0..9`, `0` for uncompressed (default `1`).
 
 ## Reading text and rosbag sources
 
 Text formats carry no timestamp unit or column order, and a rosbag has no single obvious
-connection, so `info`, `convert` and `render` all accept:
+connection, so `info`, `convert`, `render` and `play` all accept:
 
 - `--time-unit {s,ms,us,ns}` — without this, a `.txt` recording can report a duration off by a
   factor of a thousand.

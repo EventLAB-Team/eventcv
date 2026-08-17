@@ -16,16 +16,33 @@ import argparse
 import platform
 import sys
 
-from . import __version__, _rust
+from . import __version__, _ort, _rust
+
+
+def _onnx_runtime_line() -> str | None:
+    """``ONNX Runtime 1.28.0 — /…/libonnxruntime.so.1.28.0 (bundled)``, when this build has ONNX.
+
+    Which runtime got loaded, and which of the five places it came from, is the first question a
+    bug report about `Model` raises — and the one thing nothing else in `--version` can answer,
+    since it is decided at run time rather than at build time.
+    """
+    if "onnx" not in getattr(_rust, "__features__", ()):
+        return None
+    version = _rust.onnx_runtime_version()
+    if version is None:
+        return "ONNX Runtime: not found (reinstall eventcv, or `pip install eventcv[onnx]`)"
+    return f"ONNX Runtime {version} — {_ort.describe()}"
 
 
 def version_text() -> str:
-    """``eventcv 1.0.5 (hdf5, camera)`` plus the interpreter it is installed under."""
+    """``eventcv 1.0.5 (hdf5, camera)`` plus the runtime and the interpreter it is installed under."""
     features = ", ".join(getattr(_rust, "__features__", ())) or "no optional features"
-    return (
-        f"eventcv {__version__} ({features})\n"
-        f"Python {platform.python_version()} on {platform.platform()}"
-    )
+    lines = [
+        f"eventcv {__version__} ({features})",
+        _onnx_runtime_line(),
+        f"Python {platform.python_version()} on {platform.platform()}",
+    ]
+    return "\n".join(line for line in lines if line)
 
 
 def _format_count(value: int) -> str:
@@ -134,27 +151,52 @@ def _cmd_render(args: argparse.Namespace) -> int:
     """Render a recording to an animation (.gif / .apng / .mp4)."""
     from . import open as open_reader
 
-    reader = open_reader(args.input, dt_ms=args.dt_ms, **_source_options(args)).with_repr(
-        args.repr
-    )
+    reader = open_reader(args.input, dt_ms=args.dt_ms, **_source_options(args))
+    # "raw" is not a representation — it draws the events themselves — so it stays out of
+    # `with_repr`, which only knows about the dense ones.
+    if args.repr != "raw":
+        reader = reader.with_repr(args.repr)
     frames = reader.save_video(
         args.output,
         fps=args.fps,
         colormap=args.colormap,
         clim=args.clim,
         max_frames=args.max_frames,
+        repr=args.repr,
+        decay_ms=args.decay_ms,
     )
     if not args.quiet:
         print(f"wrote {args.output} ({frames} frames at {args.fps:g} fps)")
     return 0
 
 
+def _cmd_play(args: argparse.Namespace) -> int:
+    """Play a recording in an interactive window."""
+    from . import open as open_reader
+
+    reader = open_reader(args.input, **_source_options(args))
+    reader.play(
+        fps=args.fps,
+        dt_ms=args.dt_ms,
+        decay_ms=args.decay_ms,
+        repr=args.repr,
+        colormap=args.colormap,
+        speed=args.speed,
+        loop_=args.loop,
+        max_frames=args.max_frames,
+    )
+    return 0
+
+
 def _cmd_simulate(args: argparse.Namespace) -> int:
     """Turn a video into the events a DVS would have produced watching it."""
-    from . import save, simulate
+    from . import simulate
 
-    events = simulate(
+    # `out=` streams the events to disk as they are produced. A realistic sensor emits far more
+    # than fits in memory at any real resolution, so the CLI never materialises the whole run.
+    result = simulate(
         args.input,
+        out=args.output,
         pos_thres=args.threshold,
         neg_thres=args.threshold,
         sigma_thres=args.sigma_thres,
@@ -164,12 +206,19 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         refractory_us=args.refractory_us,
         seed=args.seed,
         upsample=args.upsample,
+        max_upsample=args.max_upsample,
         scale=tuple(args.scale) if args.scale else None,
         max_frames=args.max_frames,
+        compression=args.compression,
+        # Progress goes to stderr, so it stays out of a redirected stdout; `-q` silences it along
+        # with the summary.
+        progress=not args.quiet and sys.stderr.isatty(),
     )
-    save(events, args.output)
     if not args.quiet:
-        print(f"wrote {args.output} ({_format_count(len(events))} events)")
+        print(
+            f"wrote {args.output} "
+            f"({_format_count(result.events)} events from {result.frames} frames)"
+        )
     return 0
 
 
@@ -243,7 +292,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--fps", type=float, default=30.0, help="playback frame rate (default: 30)"
     )
     render.add_argument(
-        "--repr", default="tencode", help="representation to render (default: tencode)"
+        "--repr",
+        default="raw",
+        help='what to draw: "raw" for the event stream itself (default), or a representation '
+        "name (tencode, count, tsurf, voxel, …)",
+    )
+    render.add_argument(
+        "--decay-ms",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="raw view only: fade time for an event's trail (default: one frame's worth)",
     )
     render.add_argument(
         "--colormap", default="viridis", help="colormap for scalar representations"
@@ -261,6 +320,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
     render.set_defaults(func=_cmd_render)
+
+    play = subparsers.add_parser(
+        "play", help="play a recording in an interactive window"
+    )
+    play.add_argument("input", help="source recording")
+    _add_source_options(play)
+    play.add_argument(
+        "--dt-ms", type=float, default=30.0, metavar="MS", help="time per frame (default: 30)"
+    )
+    play.add_argument("--fps", type=float, default=30.0, help="display frame rate (default: 30)")
+    play.add_argument(
+        "--repr",
+        default="raw",
+        help='what to draw: "raw" for the event stream itself (default), or a representation name',
+    )
+    play.add_argument(
+        "--decay-ms", type=float, default=None, metavar="MS",
+        help="raw view only: fade time for an event's trail (default: one frame's worth)",
+    )
+    play.add_argument("--colormap", default="viridis", help="colormap for scalar representations")
+    play.add_argument(
+        "--speed", type=float, default=1.0, help="playback rate multiplier (default: 1)"
+    )
+    play.add_argument("--loop", action="store_true", help="restart at the end instead of closing")
+    play.add_argument(
+        "--max-frames", type=int, default=None, metavar="N", help="stop after N frames"
+    )
+    play.set_defaults(func=_cmd_play)
 
     simulate = subparsers.add_parser(
         "simulate", help="turn a video into synthetic events (needs ffmpeg on PATH)"
@@ -301,6 +388,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     simulate.add_argument("--max-frames", type=int, default=None, metavar="N",
                           help="stop after N frames")
+    simulate.add_argument(
+        "--max-upsample", type=int, default=None, metavar="N",
+        help="cap the sub-steps any frame pair is split into (default: 64). Each costs a full "
+        "pass over every pixel and the busiest pixel sets the factor, so lowering this bounds "
+        "the worst case at some cost in timestamp accuracy",
+    )
+    simulate.add_argument(
+        "--compression", type=int, default=None, metavar="LEVEL",
+        help="HDF5 gzip level 0..9; 0 stores uncompressed (default: 1)",
+    )
     simulate.add_argument("--seed", type=int, default=0, help="seed for mismatch and noise")
     simulate.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
     simulate.set_defaults(func=_cmd_simulate)

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from . import _rust
+from . import _ort, _rust
+
+# `Model` opens ONNX Runtime at run time, so settle which library that is — bundled, conda's,
+# pip's — before anything can ask for a model. Cheap, and a no-op when the user chose one.
+_ort.configure()
 
 EventStream = _rust.EventStream
 EventFrame = _rust.EventFrame
@@ -288,6 +292,10 @@ def open(
 # keep the import resilient otherwise.
 FrameSink = getattr(_rust, "FrameSink", None)
 EventSink = getattr(_rust, "EventSink", None)
+
+# What `simulate(..., out=…)` hands back in place of an EventStream. Exported so it can be type-
+# checked and referenced, not because it is meant to be constructed.
+SimulationResult = _rust.SimulationResult
 
 # `EventCamera` and the live-streaming functions are only built when the extension includes
 # USB camera support (the published wheels do); keep imports resilient otherwise.
@@ -648,7 +656,12 @@ def record(
 
 
 def save(
-    obj, path: str, *, topic: str | None = None, format: str | None = None
+    obj,
+    path: str,
+    *,
+    topic: str | None = None,
+    format: str | None = None,
+    compression: int | bool | None = None,
 ) -> None:
     """Save an :class:`EventStream`, :class:`EventFrame`, :class:`EventReader`, or :class:`FEAST`
     model to ``path``.
@@ -673,6 +686,15 @@ def save(
     than memory re-exports without being loaded, and any deferred ops on the reader (``crop``,
     ``mask``, ``hot_pixel_filter``, …) apply to what is written. eventcv does not read the E2VID
     layout back — keep an ``.npz``/``.h5`` if you need the recording itself.
+
+    **HDF5 compression.** Events are stored as four columns — ``x``/``y`` (``uint16``), ``t``
+    (``int64``) and ``p`` (``uint8``) — which is 13 raw bytes an event, so a large recording is
+    enormous stored plainly. ``.h5`` is therefore chunked, byte-shuffled and gzipped by default,
+    which typically cuts it by more than half at some cost in write speed. Pass
+    ``compression=False`` for the fastest possible write, or ``1``–``9`` to pick a level::
+
+        ecv.save(events, "rec.h5")                     # gzip 1, the default
+        ecv.save(events, "rec.h5", compression=False)  # fastest, largest
     """
     if isinstance(obj, FEAST):
         import numpy as np
@@ -684,7 +706,7 @@ def save(
             **obj.get_params(),
         )
         return
-    return _rust.save(obj, path, topic=topic, format=format)
+    return _rust.save(obj, path, topic=topic, format=format, compression=compression)
 
 
 def load_feast(path: str) -> FEAST:
@@ -732,10 +754,14 @@ def simulate(
     seed: int = 0,
     upsample: str | None = None,
     max_events_per_pixel: float = 1.0,
+    max_upsample: int | None = None,
     fps: float | None = None,
     scale: tuple[int, int] | None = None,
     max_frames: int | None = None,
-) -> EventStream:
+    out: str | None = None,
+    compression: int | bool | None = None,
+    progress: bool = False,
+):
     """Simulate a DVS camera watching ``source``, returning the events it would have produced.
 
     ``source`` is a **video file path** (which carries its own frame rate) or an **array of
@@ -752,6 +778,19 @@ def simulate(
         events = ecv.simulate("clip.mp4", sigma_thres=0.0, leak_rate_hz=0,
                               shot_noise_rate_hz=0)        # an ideal, noiseless sensor
 
+    **Writing straight to a file.** A realistic sensor emits a *lot* — a second of 1080p is on the
+    order of a hundred million events, which is many gigabytes held in RAM before you can save any
+    of it. ``out=`` writes each frame interval as it is produced and returns a
+    :class:`SimulationResult` (``.path``, ``.frames``, ``.events``; ``len()`` is the event count)
+    instead of an :class:`EventStream`, so memory stays flat at one interval::
+
+        result = ecv.simulate("clip.mp4", out="events.h5", progress=True)
+        reader = ecv.open(result.path, dt_ms=20)
+
+    ``.h5`` streams; other formats are buffered and written once at the end. ``compression`` picks
+    the HDF5 filter (gzip 1 by default, ``False`` for none), and ``progress=True`` prints frames
+    and event counts to stderr as it runs.
+
     Parameters mirror the sensor: ``pos_thres``/``neg_thres`` are the log-contrast thresholds,
     ``sigma_thres`` their per-pixel spread, ``cutoff_hz`` the photoreceptor bandwidth for a white
     pixel, ``leak_rate_hz`` spontaneous ON events, ``shot_noise_rate_hz`` the noise floor in dark
@@ -761,10 +800,15 @@ def simulate(
     ``upsample`` subdivides each frame interval before simulating, which is what keeps timestamps
     accurate when a lot happens between two frames: ``"adaptive"`` (the default) subdivides until
     no pixel would emit more than ``max_events_per_pixel`` per sub-interval, ``"off"`` disables it,
-    and an integer string is a fixed factor.
+    and an integer string is a fixed factor. Each sub-step is a full pass over every pixel and the
+    *busiest* pixel sets the factor, so one hard edge can cost the maximum on an otherwise quiet
+    frame — ``max_upsample`` (default 64) caps that, trading timestamp accuracy for time.
 
-    ``scale`` decodes video at a different resolution (much cheaper than resizing afterwards),
-    ``max_frames`` stops early, and ``seed`` makes a run reproducible from its configuration.
+    ``scale`` decodes video at a different resolution, which is both much cheaper than resizing
+    afterwards and the most effective way to cut the event count — halving each side quarters the
+    pixels and roughly quarters the output. ``max_frames`` stops early, and ``seed`` makes a run
+    reproducible from its configuration (including across machines: the simulation runs on every
+    core, but its noise is seeded so that the result does not depend on how many there are).
     """
     return _rust.simulate(
         source,
@@ -778,10 +822,85 @@ def simulate(
         seed=seed,
         upsample=upsample,
         max_events_per_pixel=max_events_per_pixel,
+        max_upsample=max_upsample,
         fps=fps,
         scale=scale,
         max_frames=max_frames,
+        out=out,
+        compression=compression,
+        progress=progress,
     )
+
+
+def save_video(
+    source,
+    path: str,
+    *,
+    fps: float = 30.0,
+    repr: str | None = None,
+    dt_ms: float | None = None,
+    decay_ms: float | None = None,
+    colormap: str = "viridis",
+    clim: float | None = None,
+    max_frames: int | None = None,
+) -> int:
+    """Render ``source`` as an animation, returning the number of frames written.
+
+    ``source`` is an :class:`EventReader` or an :class:`EventStream`; the container comes from
+    ``path``'s extension (``.gif``, ``.apng``, ``.mp4`` — the last needs ``ffmpeg`` on ``PATH``).
+
+    With no ``repr`` this writes the **raw stream**: every event lights its pixel in its polarity
+    colour and fades over ``decay_ms``, which is the picture a camera's own viewer shows and needs
+    no choice of representation to be meaningful::
+
+        ecv.save_video(ecv.open("rec.h5"), "raw.mp4", dt_ms=5)
+        ecv.save_video(events, "raw.gif", dt_ms=5, decay_ms=20)
+
+    ``dt_ms`` is how much of the recording each rendered frame covers — the shutter, not the
+    playback rate, which is ``fps``. Together they set the speed: ``dt_ms=5, fps=30`` plays six
+    times slower than real time. Passing it here rather than at :func:`open` is deliberate; it is
+    a property of the view, and a reader is often opened for something else entirely.
+
+    Pass ``repr="count"`` (or any representation name) to render that instead, with ``colormap``
+    and ``clim`` as in :meth:`EventReader.save_video`. A reader opened with ``repr=`` uses it
+    unless ``repr="raw"`` overrides.
+    """
+    if isinstance(source, str):
+        source = open(source)
+    kwargs = dict(
+        fps=fps,
+        colormap=colormap,
+        clim=clim,
+        max_frames=max_frames,
+        repr=repr,
+        decay_ms=decay_ms,
+    )
+    # A stream always needs a window (it has no opened-with default to fall back on), so it takes
+    # the argument's own default rather than `None`.
+    if dt_ms is not None:
+        kwargs["dt_ms"] = dt_ms
+    return source.save_video(path, **kwargs)
+
+
+def play(source, **kwargs) -> None:
+    """Open an interactive window playing ``source`` — an :class:`EventReader`, an
+    :class:`EventStream`, or a path.
+
+    The offline twin of :meth:`EventCamera.show`: with no ``repr`` it shows the raw event stream,
+    polarity dots fading by age, so watching a recording takes no more setup than watching a
+    camera::
+
+        ecv.play("rec.h5", dt_ms=5)             # raw, six times slower than real time at 30 fps
+        ecv.play("rec.h5", repr="count", dt_ms=20)
+        ecv.play(events, speed=0.25)
+
+    Blocks on the main thread until the window is closed (``Esc`` or the close button). Keyword
+    arguments are those of :meth:`EventReader.play` / :meth:`EventStream.play` — ``fps``,
+    ``dt_ms``, ``decay_ms``, ``speed``, ``loop_``, and for a reader also ``repr``/``colormap``.
+    """
+    if isinstance(source, str):
+        source = open(source)
+    return source.play(**kwargs)
 
 
 def reconstruct(
@@ -1126,6 +1245,7 @@ __all__ = [
     "FrameSink",
     "Model",
     "Polarity",
+    "SimulationResult",
     "StatefulModel",
     "Tracker",
     "UdpReceiver",
@@ -1142,6 +1262,7 @@ __all__ = [
     "load_frame",
     "load_mask",
     "open",
+    "play",
     "polygon_mask",
     "read_camera_info",
     "read_frames",
@@ -1151,6 +1272,7 @@ __all__ = [
     "rect_mask",
     "save",
     "save_mask",
+    "save_video",
     "simulate",
     "stream",
 ]

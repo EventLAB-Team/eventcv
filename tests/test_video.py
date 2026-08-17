@@ -101,10 +101,33 @@ class SaveVideoTests(unittest.TestCase):
         path = self.dir / "short.gif"
         self.assertEqual(_reader().save_video(str(path), max_frames=3), 3)
 
-    def test_a_representation_is_required(self):
+    def test_no_representation_renders_the_raw_stream(self):
+        # A reader opened without repr= used to refuse to render. Showing the events themselves is
+        # a better answer than showing nothing, and it is the view a camera's own viewer gives.
+        path = self.dir / "raw.gif"
+        frames = eventcv.open(str(EXAMPLE_NPZ), dt_ms=5).save_video(str(path))
+        self.assertGreater(frames, 0)
+        self.assertTrue(path.exists() and path.stat().st_size > 0)
+
+    def test_raw_overrides_a_stored_representation(self):
+        # `repr="raw"` has to win over `open(repr=…)`, or a reader built for training could never
+        # be looked at as a stream.
+        raw, count = self.dir / "raw.gif", self.dir / "count.gif"
+        _reader().save_video(str(raw), repr="raw")
+        _reader().save_video(str(count))
+        self.assertNotEqual(raw.read_bytes(), count.read_bytes())
+
+    def test_dt_ms_at_the_call_site_sets_the_window(self):
+        # The window is a property of the view, so it must not have to be fixed at open().
+        reader = eventcv.open(str(EXAMPLE_NPZ))
+        coarse = reader.save_video(str(self.dir / "coarse.gif"), dt_ms=20)
+        fine = reader.save_video(str(self.dir / "fine.gif"), dt_ms=5)
+        self.assertGreater(fine, coarse)
+
+    def test_a_window_is_required_from_somewhere(self):
         with self.assertRaises(ValueError) as caught:
-            eventcv.open(str(EXAMPLE_NPZ), dt_ms=5).save_video(str(self.dir / "x.gif"))
-        self.assertIn("representation", str(caught.exception))
+            eventcv.open(str(EXAMPLE_NPZ)).save_video(str(self.dir / "x.gif"))
+        self.assertIn("dt_ms", str(caught.exception))
 
     def test_an_unknown_extension_names_the_supported_ones(self):
         with self.assertRaises(ValueError) as caught:
@@ -149,6 +172,70 @@ class SaveVideoTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("ffmpeg", message)
         self.assertIn(".gif", message)  # points at the dependency-free alternative
+
+
+class RawViewTests(unittest.TestCase):
+    """The raw stream as a first-class view: rendered without choosing a representation.
+
+    A representation answers "what shape do I feed a model"; looking at a recording is a different
+    question, and forcing one to answer the other is what made a quick look at a file awkward.
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="eventcv-raw-"))
+        self.stream = eventcv.load(str(EXAMPLE_NPZ))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_raw_image_is_an_rgb_frame_of_the_sensor(self):
+        image = self.stream.raw_image()
+        width, height = self.stream.sensor_size
+        self.assertEqual(image.shape, (height, width, 3))
+        self.assertEqual(image.dtype, np.uint8)
+        self.assertGreater(int(image.sum()), 0, "some events should be lit")
+
+    def test_polarities_get_different_colours(self):
+        # The whole point of the raw view is that ON and OFF are distinguishable; a single-colour
+        # render would pass every shape check above.
+        image = self.stream.raw_image()
+        lit = image.reshape(-1, 3)
+        lit = lit[lit.sum(axis=1) > 0]
+        self.assertGreater(len(np.unique(lit[:, 0])), 1)
+        reddish = int(np.sum(lit[:, 0] > lit[:, 2]))
+        bluish = int(np.sum(lit[:, 2] > lit[:, 0]))
+        self.assertGreater(reddish, 0)
+        self.assertGreater(bluish, 0)
+
+    def test_decay_controls_how_much_stays_lit(self):
+        # A longer fade keeps older events visible, so total brightness must rise with it.
+        faint = int(self.stream.raw_image(decay_ms=0.5).sum())
+        bright = int(self.stream.raw_image(decay_ms=500.0).sum())
+        self.assertGreater(bright, faint)
+
+    def test_a_stream_renders_a_video_without_a_reader(self):
+        path = self.dir / "raw.gif"
+        frames = self.stream.save_video(str(path), dt_ms=5)
+        self.assertGreater(frames, 0)
+        self.assertEqual(path.read_bytes()[:6], b"GIF89a")
+
+    def test_dt_ms_sets_how_many_frames_a_stream_makes(self):
+        coarse = self.stream.save_video(str(self.dir / "a.gif"), dt_ms=20)
+        fine = self.stream.save_video(str(self.dir / "b.gif"), dt_ms=5)
+        self.assertGreater(fine, coarse)
+
+    def test_the_functional_form_takes_a_reader_or_a_stream(self):
+        from_stream = eventcv.save_video(self.stream, str(self.dir / "s.gif"), dt_ms=5)
+        from_reader = eventcv.save_video(
+            eventcv.open(str(EXAMPLE_NPZ)), str(self.dir / "r.gif"), dt_ms=5
+        )
+        self.assertEqual(from_stream, from_reader)
+
+    def test_an_empty_stream_is_rejected_rather_than_writing_nothing(self):
+        empty = self.stream.time_window(-10, -5)
+        self.assertEqual(len(empty), 0)
+        with self.assertRaises(ValueError):
+            empty.save_video(str(self.dir / "empty.gif"), dt_ms=5)
 
 
 if __name__ == "__main__":

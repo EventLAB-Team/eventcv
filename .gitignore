@@ -229,6 +229,11 @@ TASKS.md
 *.DS_Store
 tests/quickview.py
 
+# The ONNX Runtime the wheels bundle. Fetched per build by scripts/fetch_onnxruntime.py — a
+# 24 MB binary that belongs in the wheel, never in the history. (`*.so` above does not match a
+# version-suffixed `libonnxruntime.so.1.28.0`, hence the explicit entry.)
+python/eventcv/_libs/
+
 # Large local development fixtures (multi-GB; keep local, never commit)
 data/development/
 # ...and as a symlink, which the trailing-slash pattern above does not match. Development

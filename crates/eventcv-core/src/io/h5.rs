@@ -14,7 +14,8 @@ use hdf5_sys::h5s::{H5Sclose, H5Screate_simple, H5Sselect_hyperslab};
 use ndarray::Array1;
 
 use super::{
-    role_of, role_rank, EventKeys, IoError, LoadOptions, SliceSource, TimeUnit, P, T, X, Y,
+    role_of, role_rank, Compression, EventKeys, IoError, LoadOptions, SliceSource, TimeUnit, P, T,
+    X, Y,
 };
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
 use crate::{EventStream, EventStreamBuilder};
@@ -1019,18 +1020,58 @@ impl_into_i64!(u8, u16, u32, u64, i8, i16, i32, i64);
 /// Persists a stream as `events/{x,y,t,p}` datasets plus `width`/`height`/`timestamp_scale_ms`
 /// root attributes, so the reader reconstructs the sensor size and time scale exactly (the `t`
 /// column is stored in the stream's own raw units — microseconds for the usual `0.001` scale).
-pub fn write_hdf5_stream(path: impl AsRef<Path>, stream: &EventStream) -> Result<(), IoError> {
+///
+/// The columns are chunked at [`EVENT_CHUNK`] and, by default, byte-shuffled and deflated. That
+/// costs write throughput and buys a great deal of disk: the raw layout is 13 bytes per event
+/// (`u16` + `u16` + `i64` + `u8`), and a monotonic `t` under a byte shuffle is mostly runs of equal
+/// high bytes. Chunking matters on its own too — the slicing reader is built around chunk-sized
+/// reads, and a contiguous dataset gives it nothing to cache.
+pub fn write_hdf5_stream(
+    path: impl AsRef<Path>,
+    stream: &EventStream,
+    compression: Compression,
+) -> Result<(), IoError> {
     let file = File::create(path.as_ref()).map_err(map_hdf5_error)?;
     let events = file.create_group("events").map_err(map_hdf5_error)?;
-    write_dataset(&events, "x", stream.xs())?;
-    write_dataset(&events, "y", stream.ys())?;
-    write_dataset(&events, "t", stream.ts())?;
+    write_event_column(&events, "x", stream.xs(), compression)?;
+    write_event_column(&events, "y", stream.ys(), compression)?;
+    write_event_column(&events, "t", stream.ts(), compression)?;
     let polarities: Vec<u8> = stream.ps().iter().map(|&p| u8::from(p)).collect();
-    write_dataset(&events, "p", &polarities)?;
+    write_event_column(&events, "p", &polarities, compression)?;
     let (width, height) = stream.sensor_size();
     write_scalar_attr(&file, "width", width as u64)?;
     write_scalar_attr(&file, "height", height as u64)?;
     write_scalar_attr(&file, "timestamp_scale_ms", stream.timestamp_scale_ms())?;
+    Ok(())
+}
+
+/// Writes one event column, chunked and optionally shuffled + deflated.
+///
+/// Borrows the data rather than copying it: the previous `to_vec()` doubled peak memory for the
+/// duration of the save, which on a multi-gigabyte recording is the difference between saving and
+/// not. An empty column keeps a chunked, resizable shape so the file still round-trips.
+fn write_event_column<T: H5Type>(
+    group: &Group,
+    name: &str,
+    data: &[T],
+    compression: Compression,
+) -> Result<(), IoError> {
+    let mut builder = group.new_dataset::<T>().chunk(EVENT_CHUNK.min(data.len().max(1)));
+    if let Some(level) = compression.level() {
+        // Shuffle before deflate, not instead of it: on its own the shuffle changes nothing about
+        // the size, but grouping like-significance bytes together is what gives deflate the long
+        // runs it needs on `t` and `p`.
+        builder = builder.shuffle().deflate(level);
+    }
+    let dataset = builder
+        .shape((data.len(),))
+        .create(name)
+        .map_err(map_hdf5_error)?;
+    if !data.is_empty() {
+        dataset
+            .write_raw(data)
+            .map_err(map_hdf5_error)?;
+    }
     Ok(())
 }
 
@@ -1197,11 +1238,12 @@ struct SinkColumns {
 ///
 /// The sensor size and time base are taken from the first appended window (mirroring how
 /// [`Hdf5FrameSink`] takes its shape from the first frame), so no dimensions are needed up front.
-/// The datasets are chunked (required for the unlimited append axis) and, by default, uncompressed
-/// for maximum write throughput; pass a gzip level to [`open`](Self::open) to trade CPU for size.
+/// The datasets are always chunked (required for the unlimited append axis); `compression` decides
+/// whether they are also shuffled and deflated, trading write throughput for size exactly as
+/// [`write_hdf5_stream`] does.
 pub struct Hdf5EventSink {
     file: File,
-    compression: Option<u8>,
+    compression: Compression,
     // `None` until the first non-empty append creates the group, datasets, and metadata attributes.
     columns: Option<SinkColumns>,
     count: usize,
@@ -1210,9 +1252,7 @@ pub struct Hdf5EventSink {
 impl Hdf5EventSink {
     /// Creates the output file; the `events` group and its column datasets are created lazily on the
     /// first non-empty [`append`](Self::append), which also stamps the sensor size and time base.
-    /// `compression` is an optional gzip level (`0..=9`); `None` leaves the columns uncompressed
-    /// (the default — fastest to write).
-    pub fn open(path: impl AsRef<Path>, compression: Option<u8>) -> Result<Self, IoError> {
+    pub fn open(path: impl AsRef<Path>, compression: Compression) -> Result<Self, IoError> {
         let file = File::create(path.as_ref()).map_err(map_hdf5_error)?;
         Ok(Self {
             file,
@@ -1275,15 +1315,15 @@ impl Hdf5EventSink {
 }
 
 /// Creates one empty, extendable (`0..` on the append axis), chunked column dataset, optionally
-/// gzip-compressed.
+/// shuffled and gzip-compressed.
 fn new_event_column<T: H5Type>(
     group: &Group,
     name: &str,
-    compression: Option<u8>,
+    compression: Compression,
 ) -> Result<Dataset, IoError> {
     let mut builder = group.new_dataset::<T>().chunk(EVENT_CHUNK);
-    if let Some(level) = compression {
-        builder = builder.deflate(level);
+    if let Some(level) = compression.level() {
+        builder = builder.shuffle().deflate(level);
     }
     builder
         .shape((0usize..,))
@@ -1302,16 +1342,6 @@ fn append_column<T: H5Type + Clone>(
     let array = Array1::from_vec(values.to_vec());
     dataset
         .write_slice(&array, ndarray::s![start..end])
-        .map_err(map_hdf5_error)
-}
-
-fn write_dataset<T: H5Type + Clone>(group: &Group, name: &str, data: &[T]) -> Result<(), IoError> {
-    let array = Array1::from_vec(data.to_vec());
-    group
-        .new_dataset_builder()
-        .with_data(&array)
-        .create(name)
-        .map(|_| ())
         .map_err(map_hdf5_error)
 }
 
@@ -1896,7 +1926,7 @@ mod tests {
 
         let dir = temp_dir("h5streamrt");
         let path = dir.join("stream.h5");
-        write_hdf5_stream(&path, &stream).unwrap();
+        write_hdf5_stream(&path, &stream, Compression::default()).unwrap();
 
         // No options: the size and unit come from the saved attributes, not inference.
         let loaded = read_hdf5(&path, &LoadOptions::default()).unwrap();
@@ -1969,7 +1999,7 @@ mod tests {
 
         let dir = temp_dir("h5eventsink");
         let path = dir.join("live.h5");
-        let mut sink = Hdf5EventSink::open(&path, None).unwrap();
+        let mut sink = Hdf5EventSink::open(&path, Compression::None).unwrap();
         sink.append(&first).unwrap();
         sink.append(&window(&[])).unwrap(); // empty window is a no-op
         sink.flush().unwrap();
@@ -1988,6 +2018,60 @@ mod tests {
     }
 
     #[test]
+    fn compression_shrinks_a_stream_and_still_round_trips() {
+        // The reason the writer defaults to compressed at all: uncompressed events cost 13 bytes
+        // each, which is how a couple of seconds of 1080p simulation reached 2.2 GB. The reader is
+        // filter-agnostic, so the only thing that could break is the writer itself.
+        let mut builder = EventStreamBuilder::new(640, 480, 0.001);
+        for index in 0..200_000i64 {
+            builder.push(
+                (index % 640) as u16,
+                ((index / 640) % 480) as u16,
+                index * 7,
+                index % 3 == 0,
+            );
+        }
+        let stream = builder.build();
+
+        let dir = temp_dir("h5compress");
+        let (plain, packed) = (dir.join("plain.h5"), dir.join("packed.h5"));
+        write_hdf5_stream(&plain, &stream, Compression::None).unwrap();
+        write_hdf5_stream(&packed, &stream, Compression::default()).unwrap();
+
+        let size = |path: &std::path::Path| std::fs::metadata(path).unwrap().len();
+        assert!(
+            size(&packed) * 2 < size(&plain),
+            "compression should more than halve this: {} vs {}",
+            size(&packed),
+            size(&plain)
+        );
+
+        for path in [&plain, &packed] {
+            let loaded = read_hdf5(path, &LoadOptions::default()).unwrap();
+            assert_eq!(loaded.sensor_size(), (640, 480));
+            assert_eq!(loaded.xs(), stream.xs());
+            assert_eq!(loaded.ys(), stream.ys());
+            assert_eq!(loaded.ts(), stream.ts());
+            assert_eq!(loaded.ps(), stream.ps());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_stream_still_round_trips() {
+        // The chunk size is clamped to the data length, so a zero-length column is the edge case
+        // that clamp has to survive.
+        let stream = EventStreamBuilder::new(4, 4, 0.001).build();
+        let dir = temp_dir("h5empty");
+        let path = dir.join("empty.h5");
+        write_hdf5_stream(&path, &stream, Compression::default()).unwrap();
+        let loaded = read_hdf5(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(loaded.len(), 0);
+        assert_eq!(loaded.sensor_size(), (4, 4));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn event_sink_compressed_round_trips() {
         let mut builder = EventStreamBuilder::new(6, 6, 0.001);
         for t in 0..1000i64 {
@@ -1997,7 +2081,7 @@ mod tests {
 
         let dir = temp_dir("h5eventsinkgz");
         let path = dir.join("live-gz.h5");
-        let mut sink = Hdf5EventSink::open(&path, Some(4)).unwrap();
+        let mut sink = Hdf5EventSink::open(&path, Compression::Gzip(4)).unwrap();
         sink.append(&stream).unwrap();
         sink.finish().unwrap();
 

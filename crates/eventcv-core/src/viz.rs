@@ -502,6 +502,16 @@ impl RawSurface {
         (self.width, self.height)
     }
 
+    /// Forgets every stamped event, returning the surface to black.
+    ///
+    /// What a looping playback needs at the wrap point: without it the trails from the end of the
+    /// recording are still fading over the first frames of the next pass.
+    pub fn clear(&mut self) {
+        self.last_t_ms.fill(f64::NEG_INFINITY);
+        self.last_positive.fill(false);
+        self.latest_ms = 0.0;
+    }
+
     /// Stamps every event in `stream` onto the surface, keeping the most recent event per pixel.
     /// Events outside the surface are ignored. Call repeatedly to build up a live view.
     pub fn update(&mut self, stream: &EventStream) {

@@ -14,6 +14,14 @@ The result is an ordinary {class}`~eventcv.EventStream` — save it, slice it, b
 from it, feed it to a `DataLoader`. Reading video goes through `ffmpeg`, so a video source needs it
 on `PATH`; simulating from an array of frames needs nothing.
 
+At any real resolution you want `out=` instead, which writes the events as they are produced rather
+than accumulating them (see [Writing straight to a file](#writing-straight-to-a-file)):
+
+```python
+result = ecv.simulate("clip.mp4", out="events.h5", progress=True)
+reader = ecv.open(result.path, dt_ms=20)
+```
+
 ## The pixel model
 
 The model follows [v2e](https://arxiv.org/abs/2006.07722) (Hu et al., CVPRW 2021). Each part exists
@@ -85,14 +93,65 @@ Upsampling also matters for the noise model. At most one noise event per polarit
 sub-interval, so a very high `shot_noise_rate_hz` relative to the frame interval saturates;
 subdividing is the fix.
 
+Every sub-step is a full pass over every pixel, and the **busiest** pixel sets the factor — so one
+hard edge can push an otherwise quiet 1080p frame to the maximum, 64 passes over two million pixels
+for that pair. `max_upsample` caps it:
+
+```python
+ecv.simulate("clip.mp4", max_upsample=8)        # bound the worst case
+```
+
+Lowering it trades timestamp accuracy on the fastest content for time, and does nothing at all to
+frames that were not asking for that many sub-steps.
+
+## Writing straight to a file
+
+A realistic sensor emits a *lot*. A 1.6-second 1080p clip at the defaults produces about **167
+million events** — roughly 5 GB as an in-memory stream, before you have saved any of it. `out=`
+writes each frame interval as it is produced, so memory stays flat at one interval's worth however
+long the clip is:
+
+```python
+result = ecv.simulate("clip.mp4", out="events.h5", progress=True)
+result.frames, result.events, result.path
+len(result)                    # the event count
+```
+
+With `out=` the return value is a `SimulationResult` rather than an `EventStream`; open the file to
+work with the events. `.h5` is written incrementally; other formats are buffered and written once at
+the end, so they still cost the memory `out=` exists to avoid.
+
+`compression` picks the HDF5 filter — gzip 1 by default, `False` for none. Events compress far
+better than their 13 raw bytes suggests, because `t` is monotonic and `p` is one bit in a whole
+byte; on the clip above the default brings 2.2 GB down to about 410 MB.
+
+`progress=True` prints frames and running event counts to stderr, and `Ctrl+C` stops a run and
+raises `KeyboardInterrupt` with the file keeping everything written so far.
+
 ## Reproducibility and cost
 
 `seed` makes a run a pure function of its configuration — the same seed gives byte-identical events,
-so a training run is reproducible from its config alone.
+so a training run is reproducible from its config alone. That holds across machines as well as
+across runs: the simulation uses every core, but each block of pixels draws its noise from a stream
+seeded from the configuration rather than from the thread that happens to run it, so the result does
+not depend on how many cores there are.
 
 Simulation streams: only the current frame pair is held, so a long clip costs memory proportional to
-one frame interval rather than to the whole output. `scale=(w, h)` decodes at a smaller size, which
-is much cheaper than decoding full-size and downsampling afterwards, and `max_frames` stops early.
+one frame interval rather than to the whole output.
+
+**The event count is the cost.** Time and disk both scale with it, and the most effective lever on
+it is resolution: `scale=(w, h)` decodes at a smaller size, which is both much cheaper than decoding
+full-size and downsampling afterwards, and quarters the output for each halving of the sides.
+`max_frames` stops early.
+
+```python
+ecv.simulate("clip.mp4", scale=(960, 540), out="events.h5")   # ~4x less of everything
+```
+
+Note that the noise floor is charged per pixel per second regardless of what is happening: at the
+default rates, a 1080p sensor emits about 23 M events a second before the scene contributes
+anything. Setting `shot_noise_rate_hz=0, leak_rate_hz=0` removes that, at the cost of the realism it
+buys.
 
 ## Calibration against a real recording
 
@@ -118,8 +177,20 @@ number fitted to someone else's.
 
 ```console
 $ eventcv simulate clip.mp4 events.h5
-wrote events.h5 (2,481,003 events)
+simulating: 39/39 frames, 167.3M events
+wrote events.h5 (167,275,281 events from 39 frames)
 ```
 
+The CLI always streams to the output file, and shows progress when stderr is a terminal (`-q`
+silences both that and the summary).
+
 `--threshold`, `--sigma-thres`, `--cutoff-hz`, `--leak-rate-hz`, `--shot-noise-rate-hz`,
-`--refractory-us`, `--upsample`, `--scale`, `--max-frames` and `--seed` map to the arguments above.
+`--refractory-us`, `--upsample`, `--max-upsample`, `--compression`, `--scale`, `--max-frames` and
+`--seed` map to the arguments above.
+
+Then look at what you made, without picking a representation first:
+
+```console
+$ eventcv play events.h5 --dt-ms 5
+$ eventcv render events.h5 raw.mp4 --dt-ms 5 --fps 20
+```

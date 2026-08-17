@@ -52,10 +52,11 @@ api
 pip install eventcv
 ```
 
-The wheel bundles its own libhdf5, so `.h5`/`.hdf5` support works with no extra installs, and its
-own ONNX Runtime for {class}`~eventcv.Model`. Writing `.mp4` is the one thing that expects
-something on your system — `ffmpeg` on `PATH`; `.gif` and `.apng` need nothing. Run
-`eventcv --version` to see which optional features a build has.
+The wheel bundles its own libhdf5 and its own ONNX Runtime, so `.h5`/`.hdf5` reading and
+{class}`~eventcv.Model` inference work with no extra installs. Writing `.mp4` is the one thing
+that expects something on your system — `ffmpeg` on your `PATH`; `.gif` and `.apng` need nothing.
+Run `eventcv --version` to see which optional features a build has, and which ONNX Runtime it
+found ([where that comes from](models.md)).
 
 The Rust core's API is documented separately on [docs.rs](https://docs.rs/eventcv-core).
 

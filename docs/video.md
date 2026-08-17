@@ -2,14 +2,13 @@
 
 ## Exporting an animation
 
-{meth}`~eventcv.EventReader.save_video` renders every slice of a recording and writes them as one
-animation. The container comes from the file extension:
+{func}`eventcv.save_video` renders a recording and writes it as one animation. The container comes
+from the file extension:
 
 ```python
 import eventcv as ecv
 
-reader = ecv.open("recording.h5", dt_ms=30, repr="tencode")
-reader.save_video("out.gif", fps=30)
+ecv.save_video(ecv.open("recording.h5"), "out.mp4", dt_ms=5, fps=30)
 ```
 
 | Extension | Encoder | Needs |
@@ -21,10 +20,35 @@ reader.save_video("out.gif", fps=30)
 A `.png` path means an *animated* PNG — a caller asking `save_video` for a `.png` wants a moving
 one. For a single still frame, use {meth}`~eventcv.EventFrame.save`.
 
-`save_video` needs a representation, since a video is a sequence of rendered frames; pass
-`repr=` to {func}`eventcv.open` or use `with_repr`. It returns the number of frames written, and
-`max_frames=` stops early — useful for checking a long recording renders sensibly before committing
-to all of it.
+It takes an {class}`~eventcv.EventReader` or an {class}`~eventcv.EventStream`, returns the number of
+frames written, and `max_frames=` stops early — useful for checking a long recording renders
+sensibly before committing to all of it. The same thing is available as a method on both
+({meth}`~eventcv.EventReader.save_video`).
+
+### The raw stream
+
+With no `repr`, this writes the events **themselves**: each one lights its pixel in its polarity
+colour and fades over `decay_ms`, which is the picture a camera's own viewer shows. It needs no
+choice of representation to be meaningful, which is what makes it the right default for *looking at*
+a recording rather than training on one.
+
+```python
+ecv.save_video(reader, "raw.mp4", dt_ms=5)                 # raw, the default
+ecv.save_video(reader, "raw.mp4", dt_ms=5, decay_ms=20)    # longer trails
+ecv.save_video(reader, "count.mp4", dt_ms=5, repr="count") # a representation instead
+```
+
+A reader opened with `repr=` uses that representation unless `repr="raw"` overrides it.
+
+### `dt_ms` and `fps` are different things
+
+`dt_ms` is how much of the recording each rendered frame covers — the shutter. `fps` is how fast
+those frames play back. Together they set the apparent speed: `dt_ms=5, fps=30` plays six times
+slower than real time, `dt_ms=33, fps=30` is roughly real time.
+
+`dt_ms` is passed to `save_video` rather than to {func}`eventcv.open` because it is a property of
+the view, not of the data — and a reader is usually opened for something else. Passing it at
+`open` still works and is used when `save_video` is not given one.
 
 ### Choosing a format
 
@@ -83,6 +107,37 @@ pipeline is feeding a model:
 
 For a directory of numbered PNGs instead — to assemble externally, or to drop individual frames
 into a paper — use {func}`eventcv.export_png`.
+
+## Playing a recording
+
+{func}`eventcv.play` opens an interactive window on a recording — the offline twin of
+{meth}`~eventcv.EventCamera.show`, and the same raw polarity-and-decay view by default:
+
+```python
+ecv.play("recording.h5", dt_ms=5)                    # raw
+ecv.play("recording.h5", dt_ms=20, repr="count")     # a representation
+ecv.play(events, speed=0.25)                         # an in-memory stream, quarter speed
+```
+
+It blocks on the main thread until the window is closed (`Esc` or the close button). `speed`
+multiplies the playback rate and `loop_=True` restarts at the end instead of closing. Frames are
+decoded and rendered as they are shown, so a file larger than memory plays without being loaded —
+and unlike the live camera viewer, nothing is dropped to keep up: a slow decode plays slower rather
+than skipping events, because a file has no ring buffer to overflow.
+
+A single still image of the raw view, without a window:
+
+```python
+image = events.raw_image(decay_ms=20)   # (H, W, 3) uint8
+events.view("raw")                      # or show it
+```
+
+From the command line:
+
+```console
+$ eventcv play recording.h5 --dt-ms 5
+$ eventcv play recording.h5 --dt-ms 5 --speed 0.25 --loop
+```
 
 ## Event-rate analytics
 

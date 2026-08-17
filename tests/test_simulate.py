@@ -273,5 +273,77 @@ class FromVideoTests(unittest.TestCase):
         self.assertEqual(np.asarray(reader[0]).shape, (5, 48, 64))
 
 
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
+class SimulateToFileTests(unittest.TestCase):
+    """`out=` — writing the events as they are produced instead of accumulating them.
+
+    A realistic sensor emits far more than fits in memory at any real resolution (a second of
+    1080p is ~167 M events, several GB as an in-memory stream), so streaming to disk is what makes
+    the simulator usable at all above toy sizes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp(prefix="eventcv-simout-"))
+        cls.video = cls.dir / "clip.mp4"
+        _make_video(cls.video)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_streaming_to_hdf5_matches_the_in_memory_run(self):
+        if not _hdf5_supported():
+            self.skipTest("built without the hdf5 feature")
+        path = self.dir / "events.h5"
+        result = eventcv.simulate(str(self.video), out=str(path))
+        self.assertEqual(result.path, str(path))
+        self.assertGreater(result.events, 0)
+        self.assertEqual(len(result), result.events)
+
+        # Same seed, same events — the file is not a lossy shortcut, it is the same simulation.
+        memory = eventcv.simulate(str(self.video))
+        self.assertEqual(result.events, len(memory))
+        reloaded = eventcv.load(str(path))
+        np.testing.assert_array_equal(reloaded.numpy(), memory.numpy())
+
+    def test_streaming_to_a_buffered_format_still_writes(self):
+        # `.npz` cannot be appended to, so it is buffered and written once — the caller should not
+        # have to know which formats stream.
+        path = self.dir / "events.npz"
+        result = eventcv.simulate(str(self.video), out=str(path), max_frames=5)
+        self.assertTrue(path.exists())
+        self.assertEqual(len(eventcv.load(str(path))), result.events)
+
+    def test_compression_shrinks_the_file_and_round_trips(self):
+        if not _hdf5_supported():
+            self.skipTest("built without the hdf5 feature")
+        packed, plain = self.dir / "packed.h5", self.dir / "plain.h5"
+        eventcv.simulate(str(self.video), out=str(packed))
+        eventcv.simulate(str(self.video), out=str(plain), compression=False)
+        self.assertLess(packed.stat().st_size, plain.stat().st_size)
+        np.testing.assert_array_equal(
+            eventcv.load(str(packed)).numpy(), eventcv.load(str(plain)).numpy()
+        )
+
+    def test_max_upsample_caps_the_work(self):
+        # Capping the subdivision must not change what the simulator *is*, only how finely it
+        # resolves time — so the events stay well-formed and ordered.
+        events = eventcv.simulate(str(self.video), max_upsample=1, max_frames=5)
+        self.assertGreater(len(events), 0)
+        self.assertTrue(np.all(np.diff(events.numpy()[:, 2]) >= 0))
+
+
+def _hdf5_supported() -> bool:
+    """True if the extension was built with the `hdf5` feature."""
+    try:
+        eventcv.load("___eventcv_no_such_file___.h5", sensor_size=(1, 1))
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
 if __name__ == "__main__":
     unittest.main()

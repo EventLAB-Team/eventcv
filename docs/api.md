@@ -22,6 +22,15 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: collate
 ```
 
+## Viewing
+
+```{eval-rst}
+.. autofunction:: play
+.. autofunction:: save_video
+```
+
+See :doc:`video` for the raw view, and how ``dt_ms`` and ``fps`` combine into playback speed.
+
 ## Simulation and reconstruction
 
 ```{eval-rst}
@@ -271,5 +280,6 @@ with `slice`/`windows`/`with_repr` without loading the file.
    :exclude-members: EventStream, EventFrame, EventReader, EventPointSet, Camera,
       Polarity, FrameSink, EventSink, EventCamera, FEAST, load, from_numpy, open, save,
       load_frame, load_feast, export_png, collate, stream, list_cameras, Model,
-      simulate, reconstruct, StatefulModel, Tracker, UdpSender, UdpReceiver
+      simulate, reconstruct, StatefulModel, Tracker, UdpSender, UdpReceiver,
+      play, save_video
 ```

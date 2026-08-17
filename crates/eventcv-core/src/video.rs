@@ -295,6 +295,9 @@ pub struct VideoInfo {
     pub width: usize,
     pub height: usize,
     pub fps: f64,
+    /// Frames in the stream, when the container records one. Absent for formats that do not (and
+    /// for pipes), so it is only ever good enough to drive a progress bar — never to size a buffer.
+    pub frames: Option<usize>,
 }
 
 impl VideoInfo {
@@ -302,7 +305,7 @@ impl VideoInfo {
     pub fn probe(path: &Path) -> std::io::Result<Self> {
         let output = Command::new("ffprobe")
             .args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-show_entries", "stream=width,height,r_frame_rate"])
+            .args(["-show_entries", "stream=width,height,r_frame_rate,nb_frames"])
             .args(["-of", "csv=p=0"])
             .arg(path)
             .output()
@@ -353,10 +356,21 @@ impl VideoInfo {
         } else {
             30.0
         };
+        // `nb_frames` is optional and reported as `N/A` by containers that do not index frames, so
+        // an unparseable field is a missing count rather than a malformed stream.
+        let frames = fields
+            .next()
+            .and_then(|field| field.trim().parse::<usize>().ok())
+            .filter(|&frames| frames > 0);
         if width == 0 || height == 0 {
             return Err(malformed());
         }
-        Ok(Self { width, height, fps })
+        Ok(Self {
+            width,
+            height,
+            fps,
+            frames,
+        })
     }
 }
 
@@ -382,6 +396,7 @@ impl FfmpegDecoder {
                 width,
                 height,
                 fps: probed.fps,
+                frames: probed.frames,
             },
             _ => probed,
         };

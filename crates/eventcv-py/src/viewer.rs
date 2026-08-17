@@ -33,22 +33,27 @@ pub(crate) enum Scene {
     },
 }
 
-/// Runs the interactive viewer against a live stream, sizing the window for a `width` × `height`
-/// sensor and pulling each frame from `producer` on the calling (main) thread. Blocks until the
-/// window is closed or `producer` returns an error. Frames are RGB images the producer renders
-/// upstream (e.g. a [`RawSurface`](eventcv_core::viz::RawSurface) for the raw view, or a
-/// colour-mapped representation), so the viewer just uploads and displays the latest.
-#[cfg(feature = "camera")]
+/// Runs the interactive viewer against a stream of frames, sizing the window for a `width` ×
+/// `height` sensor and pulling each frame from `producer` on the calling (main) thread every
+/// `interval`. Blocks until the window is closed or `producer` returns an error. Frames are RGB
+/// images the producer renders upstream (e.g. a [`RawSurface`](eventcv_core::viz::RawSurface) for
+/// the raw view, or a colour-mapped representation), so the viewer just uploads and displays the
+/// latest.
+///
+/// The producer is the only thing that knows where the frames come from, so a live camera and a
+/// recording played back from disk both run through here — the latter simply asks for a different
+/// `interval`.
 pub(crate) fn run_live<P>(
     producer: P,
     width: u32,
     height: u32,
     title: String,
+    interval: std::time::Duration,
 ) -> Result<(), String>
 where
     P: FnMut() -> Result<Option<Rgb8Image>, String>,
 {
-    gpu::run_live(producer, width, height, title)
+    gpu::run_live(producer, width, height, title, interval)
 }
 
 /// Opens the ROI editor over the frames `producer` hands back, and returns the mask the user drew
@@ -98,6 +103,12 @@ pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> R
         },
     };
     gpu::run(scene)
+}
+
+/// Displays an already-rendered RGB image. The raw polarity view produces one of these directly
+/// rather than an [`EventFrame`], so it has no representation kind for [`view`] to dispatch on.
+pub(crate) fn view_image(image: Rgb8Image, _name: String) -> Result<(), String> {
+    gpu::run(Scene::Image(image))
 }
 
 pub(crate) fn view_point_set(points: &EventPointSet) -> Result<(), String> {
