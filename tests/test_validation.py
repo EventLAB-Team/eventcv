@@ -21,6 +21,8 @@ import eventcv
 ROOT = Path(__file__).resolve().parent.parent
 BAG = ROOT / "data" / "development" / "dvs_vpr_2020-04-21-17-03-03.bag"
 EVT2 = ROOT / "data" / "development" / "spinner.raw"
+# Whichever DAVIS346 AEDAT 2.0 recording is on this machine; the names differ between checkouts.
+AEDAT = next(iter(sorted((ROOT / "data" / "development").glob("*.aedat"))), None)
 
 # A window where the car is turning: the IMU shows sustained yaw of about -0.56 rad/s, which is far
 # enough above the recording's median (0.12 rad/s) for the motion to be unambiguous. Offsets are
@@ -75,6 +77,74 @@ class Evt2RealFileTests(unittest.TestCase):
         np.testing.assert_array_equal(
             reader.slice_count(30_000, 40_000).numpy(), bulk[30_000:40_000]
         )
+
+
+@unittest.skipUnless(AEDAT is not None, "no DAVIS346 .aedat recording is present")
+class AedatAuxiliaryStreamTests(unittest.TestCase):
+    """The same frames and IMU out of an AEDAT 2.0 recording, held to the same physics.
+
+    The bag reader has always returned these; the point of the checks here is that a second,
+    completely different container decodes to the same quantities in the same units.
+    """
+
+    def _reader(self):
+        return eventcv.open(str(AEDAT))
+
+    def test_aps_frames_are_correlated_double_sampled(self):
+        reader = self._reader()
+        t0 = int(reader.time_span("us")[0])
+        frames = eventcv.read_frames(reader, t0_us=t0, t1_us=t0 + 2_000_000)
+        self.assertGreater(len(frames), 2)
+        image = frames[0][1].numpy()
+        self.assertEqual(image.shape, (1, 260, 346), "a DAVIS346 APS frame")
+        # Reset minus signal, both 10-bit. A sign error or a swapped pair would pin the
+        # difference at zero; this is a night drive, so even a correct frame is mostly dark —
+        # measured across the recording, 40% to 46% of pixels are lit and the brightest
+        # saturates. The bound is set below that, not at it.
+        self.assertLessEqual(int(image.max()), 1023)
+        self.assertGreater(int(image.max()), 100)
+        self.assertGreater(float((image > 0).mean()), 0.2)
+        # ~9 fps in this recording; assert the order of magnitude, not the exact rate.
+        rate = 1e6 / np.diff([t for t, _ in frames]).mean()
+        self.assertGreater(rate, 1)
+        self.assertLess(rate, 100)
+
+    def test_imu_decodes_to_physical_units(self):
+        # Same check as the bag's, and the one that catches a wrong full-scale setting: jAER
+        # writes every chip's preferences into the header, and reading another camera's would
+        # scale these by a factor of four.
+        reader = self._reader()
+        t0 = int(reader.time_span("us")[0])
+        imu = eventcv.read_imu(reader, t0_us=t0, t1_us=t0 + 1_000_000)
+        self.assertGreater(len(imu["t"]), 100)
+        magnitude = np.linalg.norm(imu["linear_acceleration"], axis=1).mean()
+        self.assertGreater(magnitude, 8.0)
+        self.assertLess(magnitude, 12.0)
+        # A car drive: no sustained rotation anywhere near the sensor's ±250 °/s full scale.
+        self.assertLess(np.abs(imu["angular_velocity"]).mean(), 1.0)
+
+    def test_the_streams_share_one_clock(self):
+        reader = self._reader()
+        t0 = int(reader.time_span("us")[0])
+        t1 = t0 + 2_000_000
+        events = reader.slice(t0_us=t0, t1_us=t1).numpy()
+        frames = eventcv.read_frames(reader, t0_us=t0, t1_us=t1)
+        imu = eventcv.read_imu(reader, t0_us=t0, t1_us=t1)
+        for label, times in (
+            ("events", events[:, 2].astype(np.int64)),
+            ("frames", np.array([t for t, _ in frames])),
+            ("imu", np.asarray(imu["t"])),
+        ):
+            self.assertGreaterEqual(times.min(), t0, label)
+            self.assertLess(times.max(), t1, label)
+
+    def test_the_index_is_exact(self):
+        # `n_events` comes from a parallel index pass, and the slices come from replaying it;
+        # they have to agree with each other or a dataset built on the reader silently truncates.
+        reader = self._reader()
+        total = reader.n_events
+        self.assertEqual(len(reader.slice_count(total - 1_000, total).numpy()), 1_000)
+        self.assertEqual(len(reader.slice_count(total - 10, total + 10_000).numpy()), 10)
 
 
 @unittest.skipUnless(BAG.exists(), "the DAVIS346 bag is not present")

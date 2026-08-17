@@ -239,4 +239,4 @@ data/development/
 # ...and as a symlink, which the trailing-slash pattern above does not match. Development
 # recordings are hundreds of megabytes to tens of gigabytes and live outside the repository.
 data/development
-data/test/sunset2.hdf5
+data/test

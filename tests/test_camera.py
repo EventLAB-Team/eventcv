@@ -248,6 +248,19 @@ class CameraApiTests(unittest.TestCase):
         for name in ("stream", "record", "list_cameras", "EventCamera"):
             self.assertIn(name, eventcv.__all__)
 
+    def test_auxiliary_streams_are_on_the_camera_surface(self):
+        # A DAVIS's frames and IMU reach Python under the same names, and in the same shapes, as
+        # they do from a file — so code written against a recording runs on a live camera. The
+        # decode paths need hardware; the surface does not.
+        import inspect
+
+        for name in ("read_frames", "read_imu", "n_frames", "n_imu"):
+            self.assertTrue(hasattr(eventcv.EventCamera, name), name)
+        parameters = inspect.signature(eventcv.stream).parameters
+        for name in ("frames", "imu"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].default, False, f"{name} must be opt-in")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

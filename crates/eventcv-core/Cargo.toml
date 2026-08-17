@@ -26,6 +26,16 @@ zip = { version = "0.6", default-features = false }
 # Pure-Rust PNG encoder for colormapped frame export (`.png`) — no system deps, keeps wheels easy.
 # Also writes animated PNG (`acTL`/`fcTL`), so `.apng` export costs no extra dependency.
 png = "0.17"
+# AEDAT 4 packet decompression. iniVation's DV compresses every packet, choosing per file between
+# LZ4 in its *frame* format (the C library's `LZ4F_decompress`, not raw blocks) and Zstd. `lz4` is
+# named here rather than a pure-Rust decoder because `rosbag` already pulls it in and builds it —
+# a second LZ4 implementation would be new code compiled to do what the tree already does. `zstd`
+# builds the reference C library from source, the same story libhdf5 and libusb already have, and
+# shares its `zstd-sys` with the copy `zip` depends on. Neither is behind a feature flag: a
+# `.aedat4` whose compression this build could not decode would be a file eventcv claims to read
+# and then does not.
+lz4 = "1.28"
+zstd = { version = "0.13", default-features = false }
 # Pure-Rust GIF encoder for animated export. Same no-system-deps story as `png`; `color_quant`
 # (pulled in by default) builds the 256-colour palette each frame needs. MP4 deliberately has no
 # crate here — it is piped to a system ffmpeg, see `video.rs` for why.

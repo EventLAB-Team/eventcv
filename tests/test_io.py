@@ -9,7 +9,8 @@ import numpy as np
 import eventcv
 
 _MVSEC_BAG = "data/development/outdoor_day1_data.bag"
-_AEDAT2 = "data/development/+0+2+0_l_qry.aedat"
+# Whichever DAVIS346 recording is on this machine; the names differ between checkouts.
+_AEDAT2 = next((str(p) for p in sorted(Path("data/development").glob("*.aedat"))), "")
 
 try:
     import h5py
@@ -632,6 +633,96 @@ class Aedat2Tests(unittest.TestCase):
         self.assertTrue((events[:, 1] < 260).all())
         self.assertTrue(set(np.unique(events[:, 3])).issubset({0, 1}))
         self.assertTrue((np.diff(events[:, 2].astype(np.int64)) >= 0).all())  # µs, monotonic
+
+    def test_open_slices_in_place_rather_than_loading_the_file(self):
+        # These recordings are gigabytes; `open` must index them, not materialise them.
+        reader = eventcv.open(_AEDAT2)
+        self.assertEqual(reader.sensor_size, (346, 260))
+        self.assertGreater(reader.n_events, 1_000_000)
+
+        t0 = int(reader.time_span("us")[0])
+        window = reader.slice(t0_us=t0, t1_us=t0 + 100_000).numpy()
+        self.assertGreater(len(window), 0)
+        self.assertTrue((window[:, 2] >= t0).all())
+        self.assertTrue((window[:, 2] < t0 + 100_000).all())
+
+        # A mid-file index slice has to replay from a checkpoint, not from the start.
+        middle = reader.slice_count(reader.n_events // 2, reader.n_events // 2 + 1_000).numpy()
+        self.assertEqual(len(middle), 1_000)
+        self.assertTrue((np.diff(middle[:, 2].astype(np.int64)) >= 0).all())
+        self.assertGreater(middle[0, 2], window[-1, 2])
+
+    def test_reader_slices_match_a_whole_file_read(self):
+        reader = eventcv.open(_AEDAT2)
+        t0 = int(reader.time_span("us")[0])
+        sliced = reader.slice(t0_us=t0, t1_us=t0 + 200_000).numpy()
+        loaded = eventcv.load(_AEDAT2, max_events=len(sliced)).numpy()
+        np.testing.assert_array_equal(sliced, loaded)
+
+    def test_aps_frames_are_reassembled(self):
+        reader = eventcv.open(_AEDAT2)
+        t0 = int(reader.time_span("us")[0])
+        frames = eventcv.read_frames(reader, t0_us=t0, t1_us=t0 + 2_000_000)
+        self.assertGreater(len(frames), 2)
+        image = frames[0][1].numpy()
+        self.assertEqual(image.shape, (1, 260, 346))
+        # The APS ADC is 10-bit, so frames keep uint16 rather than being squeezed into uint8.
+        self.assertEqual(image.dtype, np.uint16)
+        self.assertLessEqual(int(image.max()), 1023)
+        self.assertTrue((np.diff([t for t, _ in frames]) > 0).all())
+
+    def test_imu_samples_are_reassembled(self):
+        reader = eventcv.open(_AEDAT2)
+        t0 = int(reader.time_span("us")[0])
+        imu = eventcv.read_imu(reader, t0_us=t0, t1_us=t0 + 1_000_000)
+        self.assertGreater(len(imu["t"]), 100)
+        self.assertEqual(imu["angular_velocity"].shape, (len(imu["t"]), 3))
+        self.assertEqual(imu["linear_acceleration"].shape, (len(imu["t"]), 3))
+
+    def test_aedat_carries_no_intrinsics(self):
+        self.assertIsNone(eventcv.read_camera_info(eventcv.open(_AEDAT2)))
+
+
+class Aedat4Tests(unittest.TestCase):
+    """AEDAT 4 against `data/test/sample.aedat4`, written by iniVation's own DV."""
+
+    PATH = str(Path(__file__).resolve().parent.parent / "data" / "test" / "sample.aedat4")
+
+    def test_reads_events_frames_and_imu(self):
+        reader = eventcv.open(self.PATH)
+        self.assertEqual(reader.sensor_size, (64, 48))  # from the header's infoNode
+        self.assertEqual(reader.n_events, 64)
+
+        events = eventcv.load(self.PATH).numpy()
+        np.testing.assert_array_equal(events[0], [0, 0, 1_000_000, 0])
+        np.testing.assert_array_equal(events[-1], [63, 45, 1_063_000, 1])
+
+        frames = eventcv.read_frames(reader)
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0][1].numpy().shape, (1, 48, 64))
+        self.assertEqual(frames[0][1].numpy().dtype, np.uint8)
+
+        imu = eventcv.read_imu(reader)
+        self.assertEqual(len(imu["t"]), 8)
+        # The recording says -1 g on Y; the file stores g and °/s, this API is SI.
+        self.assertAlmostEqual(imu["linear_acceleration"][0][1], -9.80665, places=5)
+
+    def test_slices_match_a_whole_file_read(self):
+        reader = eventcv.open(self.PATH)
+        whole = eventcv.load(self.PATH).numpy()
+        np.testing.assert_array_equal(reader.slice_count(0, 10).numpy(), whole[:10])
+        window = reader.slice(t0_us=1_010_000, t1_us=1_015_000).numpy()
+        np.testing.assert_array_equal(window[:, 2], np.arange(1_010_000, 1_015_000, 1000))
+
+
+class AuxiliaryStreamDefaultTests(unittest.TestCase):
+    """A format without frames or an IMU answers "none", rather than raising."""
+
+    def test_a_plain_event_file_has_empty_auxiliary_streams(self):
+        reader = eventcv.open(str(Path(__file__).resolve().parent.parent / "data/test/example.npz"))
+        self.assertEqual(eventcv.read_frames(reader), [])
+        self.assertEqual(len(eventcv.read_imu(reader)["t"]), 0)
+        self.assertIsNone(eventcv.read_camera_info(reader))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ use std::{error::Error, fmt, io, path::Path};
 use crate::{EventStream, EventStreamBuilder};
 
 mod aedat;
+mod aedat4;
 mod bag;
 mod e2vid;
 #[cfg(feature = "hdf5")]
@@ -12,7 +13,8 @@ mod prophesee;
 mod prophesee_raw;
 mod text;
 
-pub use aedat::read_aedat;
+pub use aedat::{open_aedat_slice, read_aedat};
+pub use aedat4::{open_aedat4_slice, read_aedat4};
 pub use bag::{
     bag_topics, open_bag_slice, read_bag, read_bag_camera_info, read_bag_frames, read_bag_imu,
     write_bag, BagSliceSource, ImuSample,
@@ -241,7 +243,7 @@ pub fn is_e2vid_target(path: impl AsRef<Path>, format: Option<&str>) -> bool {
 
 /// Loads events from any supported file, detected by extension — the OpenCV-style
 /// single entry point. Supported today: `.npz`, `.txt`/`.csv`, `.bag`, `.h5`/`.hdf5`,
-/// `.aedat` (AEDAT 2.0), and `.dat` (Prophesee CD).
+/// `.aedat` (AEDAT 2.0), `.aedat4` (AEDAT 4.0), and `.dat` (Prophesee CD).
 pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream, IoError> {
     let path = path.as_ref();
     let Some(cutoff) = options.offset.filter(|&offset| offset > 0) else {
@@ -289,10 +291,7 @@ fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoErro
             }
         }
         Format::Aedat => aedat::read_aedat(path, options),
-        Format::Aedat4 => Err(IoError::Unsupported(
-            "AEDAT4 (.aedat4, iniVation DV FlatBuffer/LZ4) reading is not implemented yet"
-                .to_owned(),
-        )),
+        Format::Aedat4 => aedat4::read_aedat4(path, options),
         Format::PropheseeDat => prophesee::read_dat(path, options),
         Format::PropheseeRaw => prophesee_raw::read_raw(path, options),
         Format::Png => Err(IoError::Unsupported(
@@ -320,6 +319,26 @@ pub trait SliceSource: Send {
     fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError>;
     /// Events whose timestamp (µs) lies in the half-open window `[t0, t1)`.
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError>;
+
+    /// The intensity (APS) frames a DAVIS recorded alongside its events, those whose timestamp
+    /// lies in the half-open window `[t0, t1)` (µs), paired with that timestamp.
+    ///
+    /// Frames, IMU and intrinsics default to empty rather than to an error: most formats carry
+    /// events and nothing else, and a caller asking a `.npz` for its IMU wants "there isn't
+    /// any", not a failure it has to match on per format.
+    fn frames(&self, _t0: i64, _t1: i64) -> Result<Vec<(i64, EventFrame)>, IoError> {
+        Ok(Vec::new())
+    }
+
+    /// The IMU samples in `[t0, t1)` (µs).
+    fn imu(&self, _t0: i64, _t1: i64) -> Result<Vec<ImuSample>, IoError> {
+        Ok(Vec::new())
+    }
+
+    /// The camera intrinsics the recording carries, if it carries any.
+    fn camera(&self) -> Result<Option<crate::camera::Camera>, IoError> {
+        Ok(None)
+    }
 
     /// Per-pixel event counts over the whole file (row-major `width·height`), out-of-bounds
     /// events dropped — what the reader's hot-pixel pre-scan needs. The default tallies through
@@ -413,9 +432,10 @@ impl SliceSource for MemorySliceSource {
 pub type Reader = Box<dyn SliceSource>;
 
 /// Opens a file for lazy slicing, detected by extension (the `VideoCapture` analogue to
-/// [`load`]'s `imread`). HDF5 is sliced in place by binary-searching its timestamp
-/// dataset; every other format is loaded once and sliced in memory. Same `LoadOptions`
-/// as [`load`] (`max_events` is ignored — slicing supersedes it).
+/// [`load`]'s `imread`). HDF5 is sliced in place by binary-searching its timestamp dataset,
+/// text and AEDAT 2.0 build a sparse index, rosbags use their own chunk index; formats
+/// without random access are loaded once and sliced in memory. Same `LoadOptions` as [`load`]
+/// (`max_events` is ignored — slicing supersedes it).
 pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoError> {
     let path = path.as_ref();
     match detect_format(path)? {
@@ -433,6 +453,8 @@ pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoEr
         }
         Format::Text => Ok(Box::new(text::open_text_slice(path, &options)?)),
         Format::Rosbag => Ok(Box::new(bag::open_bag_slice(path, &options)?)),
+        Format::Aedat => Ok(Box::new(aedat::open_aedat_slice(path, &options)?)),
+        Format::Aedat4 => Ok(Box::new(aedat4::open_aedat4_slice(path, &options)?)),
         Format::PropheseeRaw => Ok(Box::new(prophesee_raw::open_raw_slice(path, &options)?)),
         _ => Ok(Box::new(MemorySliceSource::new(load(path, options)?))),
     }
@@ -836,15 +858,14 @@ mod tests {
     }
 
     #[test]
-    fn aedat4_is_unsupported_and_raw_dispatches() {
-        match load("recording.aedat4", LoadOptions::default()) {
-            Err(IoError::Unsupported(_)) => {}
-            other => panic!("expected unsupported for recording.aedat4, got {other:?}"),
+    fn aedat4_and_raw_dispatch_to_their_readers() {
+        // Both reach a reader, so the failure is the missing file rather than the format.
+        for path in ["recording.aedat4", "recording.raw"] {
+            assert!(
+                matches!(load(path, LoadOptions::default()), Err(IoError::Io(_))),
+                "{path} should dispatch into its reader"
+            );
         }
-        assert!(matches!(
-            load("recording.raw", LoadOptions::default()),
-            Err(IoError::Io(_))
-        ));
     }
 
     fn sample_source() -> MemorySliceSource {

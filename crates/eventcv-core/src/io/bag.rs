@@ -341,6 +341,9 @@ struct ChunkMeta {
 /// once and cache the per-chunk cumulative counts; time slicing never triggers that.
 pub struct BagSliceSource {
     bag: RosBag,
+    /// Kept so the auxiliary streams (APS frames, IMU, intrinsics) can be read on demand —
+    /// those live on other topics and need their own pass over the file.
+    path: std::path::PathBuf,
     conn_ids: Vec<u32>,
     chunks: Vec<ChunkMeta>,
     sensor: (usize, usize),
@@ -356,6 +359,7 @@ pub fn open_bag_slice(
     options: &LoadOptions,
 ) -> Result<BagSliceSource, IoError> {
     let topic = options.topic.as_deref().unwrap_or(DEFAULT_TOPIC);
+    let path = path.as_ref();
     let bag = RosBag::new(path).map_err(IoError::Io)?;
 
     let mut conn_ids: Vec<u32> = Vec::new();
@@ -403,6 +407,7 @@ pub fn open_bag_slice(
 
     Ok(BagSliceSource {
         bag,
+        path: path.to_path_buf(),
         conn_ids,
         chunks,
         sensor,
@@ -518,6 +523,21 @@ impl SliceSource for BagSliceSource {
 
     fn time_span(&self) -> (i64, i64) {
         self.span_us
+    }
+
+    // The auxiliary streams live on their own topics, so they get their own pass over the file
+    // rather than sharing the event chunk index. Topic selection stays automatic (the sole
+    // topic of the right type), which is what the free functions already do.
+    fn frames(&self, t0: i64, t1: i64) -> Result<Vec<(i64, EventFrame)>, IoError> {
+        read_bag_frames(&self.path, None, t0, t1)
+    }
+
+    fn imu(&self, t0: i64, t1: i64) -> Result<Vec<ImuSample>, IoError> {
+        read_bag_imu(&self.path, None, t0, t1)
+    }
+
+    fn camera(&self) -> Result<Option<crate::camera::Camera>, IoError> {
+        read_bag_camera_info(&self.path, None)
     }
 
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {

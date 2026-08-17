@@ -57,13 +57,19 @@ def load(
 
     Supported today: ``.npz`` (N-ImageNet), ``.txt``/``.csv`` (e.g. EV-IMO
     ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), ``.hdf5``/``.h5``,
-    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), ``.dat`` (Prophesee CD events), and
-    Prophesee EVT2 and EVT3 ``.raw`` recordings.
+    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), ``.aedat4`` (AEDAT 4.0, iniVation DV),
+    ``.dat`` (Prophesee CD events), and Prophesee EVT2 and EVT3 ``.raw`` recordings.
 
     A `.raw` file's encoding comes from its header, and its sensor size from ``% geometry`` when
     present — some recorders omit it, and the size is then derived from the events themselves,
     which is a tight bound on what fired rather than the physical sensor. Pass ``sensor_size``
     to override.
+
+    An ``.aedat`` file's geometry comes from the chip named in its header (the DAVIS family;
+    DVS128 and older chips use a different address layout and are refused rather than misread);
+    an ``.aedat4`` file's comes from the stream description DV writes into its header. In both,
+    the APS frames and IMU samples are not events and so are not returned here — read them with
+    :func:`read_frames` and :func:`read_imu`.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted and only act
     as overrides: rosbags carry both in the message; HDF5/text infer the time unit
@@ -369,6 +375,8 @@ def stream(
     decay_s: float | None = None,
     decay_us: float | None = None,
     decay_ns: float | None = None,
+    frames: bool = False,
+    imu: bool = False,
 ) -> EventCamera:
     """Open a live USB event camera — the streaming twin of :func:`open`.
 
@@ -558,6 +566,24 @@ def stream(
                 sink.append(events)         # to disk
                 track(events)               # ...and process the same window live
 
+    **APS frames and IMU.** A DAVIS produces a greyscale video and an IMU stream alongside its
+    events. Pass ``frames=True`` / ``imu=True`` to collect them, then take them with
+    :meth:`EventCamera.read_frames` and :meth:`EventCamera.read_imu` — the same shapes
+    :func:`read_frames` and :func:`read_imu` return for a recording, so code written against a
+    file works unchanged on a live camera::
+
+        with ecv.stream(dt_ms=50, frames=True, imu=True) as cam:
+            for events in cam:
+                for t_us, frame in cam.read_frames():   # EventFrame, uint16 greyscale
+                    show(frame.numpy())
+                gyro = cam.read_imu()["angular_velocity"]
+
+        ecv.stream(frames=True).show("aps")             # watch the APS video live
+
+    Both are off by default: copying a frame out of every decode buffer is not free, and other
+    sensors have neither stream. Collect them as you read — only the most recent few dozen frames
+    and a few thousand samples are held, and the oldest are dropped rather than buffered forever.
+
     Requires a build with camera support and, on Linux, udev rules for USB access.
     """
     if not hasattr(_rust, "stream"):
@@ -598,6 +624,8 @@ def stream(
         decay_s=decay_s,
         decay_us=decay_us,
         decay_ns=decay_ns,
+        frames=frames,
+        imu=imu,
     )
 
 
@@ -1039,35 +1067,42 @@ def bag_topics(path: str) -> list[tuple[str, str]]:
 
 
 def read_frames(
-    path: str,
+    source,
     *,
     topic: str | None = None,
     t0_us: int = 0,
     t1_us: int | None = None,
 ) -> list[tuple[int, EventFrame]]:
-    """Read DAVIS APS frames from a bag as ``[(t_us, EventFrame), …]``.
+    """Read DAVIS APS frames as ``[(t_us, EventFrame), …]``.
 
     The greyscale images a DAVIS captures alongside its events — the reference the simulator is
     calibrated against, since the frames and the events see the same scene through the same lens.
 
-    ``topic`` defaults to the bag's only ``sensor_msgs/Image`` topic when there is exactly one.
-    The time window matters: these recordings run to tens of gigabytes, and whole chunks outside it
-    are skipped without being decoded. Only ``mono8`` is supported; any other encoding raises rather
-    than being misread.
+    ``source`` is a path or an open :class:`EventReader`; ROS bags and AEDAT 2.0 recordings carry
+    frames, and any other format returns an empty list. Frames come back at the sensor's own
+    precision, so ``frame.numpy()`` is ``uint8`` from a bag (ROS ``mono8``) and ``uint16`` from
+    AEDAT (a 10-bit ADC).
+
+    ``topic`` selects the bag topic and defaults to its only ``sensor_msgs/Image`` topic when
+    there is exactly one; it does not apply to other formats. The time window matters: these
+    recordings run to tens of gigabytes, and whole chunks outside it are skipped without being
+    decoded. From a bag only ``mono8``/``rgb8``/``bgr8`` are supported; any other encoding raises
+    rather than being misread.
     """
-    return _rust.read_frames(
-        path, topic=topic, t0_us=t0_us, t1_us=_MAX_US if t1_us is None else t1_us
-    )
+    t1_us = _MAX_US if t1_us is None else t1_us
+    if isinstance(source, EventReader):
+        return source.read_frames(t0_us=t0_us, t1_us=t1_us)
+    return _rust.read_frames(source, topic=topic, t0_us=t0_us, t1_us=t1_us)
 
 
 def read_imu(
-    path: str,
+    source,
     *,
     topic: str | None = None,
     t0_us: int = 0,
     t1_us: int | None = None,
 ) -> dict:
-    """Read IMU samples from a bag as a dict of arrays.
+    """Read IMU samples as a dict of arrays.
 
     Keys are ``t`` (µs), ``angular_velocity`` and ``linear_acceleration``, the latter two ``[N, 3]``
     in rad/s and m/s². On a DAVIS this is the only independent measurement of how the camera moved,
@@ -1076,23 +1111,30 @@ def read_imu(
         imu = ecv.read_imu("recording.bag", t0_us=t0, t1_us=t1)
         truth = imu["angular_velocity"].mean(axis=0)
 
-    Orientation is in the message but not returned: on a DAVIS it is dead-reckoned from this same
-    gyro, so it is not an independent quantity.
+    ``source`` is a path or an open :class:`EventReader`; ROS bags and AEDAT 2.0 recordings carry
+    an IMU, and any other format returns empty arrays.
+
+    Orientation is not returned: on a DAVIS it is dead-reckoned from this same gyro, so it is not
+    an independent quantity. Temperature is not returned either.
     """
-    return _rust.read_imu(
-        path, topic=topic, t0_us=t0_us, t1_us=_MAX_US if t1_us is None else t1_us
-    )
+    t1_us = _MAX_US if t1_us is None else t1_us
+    if isinstance(source, EventReader):
+        return source.read_imu(t0_us=t0_us, t1_us=t1_us)
+    return _rust.read_imu(source, topic=topic, t0_us=t0_us, t1_us=t1_us)
 
 
-def read_camera_info(path: str, *, topic: str | None = None):
-    """Read camera intrinsics from a bag's ``sensor_msgs/CameraInfo``, or ``None`` if absent.
+def read_camera_info(source, *, topic: str | None = None):
+    """Read camera intrinsics from a recording, or ``None`` if it carries none.
 
     Returns a :class:`Camera` ready to pass to
     ``contrast_maximise(model="rotation", camera=…)``, which needs intrinsics to map pixels onto
-    rays. Distortion coefficients are not applied — build a :class:`Camera` yourself from the bag's
-    ``D`` if you need undistortion.
+    rays. ``source`` is a path or an open :class:`EventReader`; only ROS bags
+    (``sensor_msgs/CameraInfo``) record intrinsics today. Distortion coefficients are not applied
+    — build a :class:`Camera` yourself from the bag's ``D`` if you need undistortion.
     """
-    return _rust.read_camera_info(path, topic=topic)
+    if isinstance(source, EventReader):
+        return source.read_camera_info()
+    return _rust.read_camera_info(source, topic=topic)
 
 
 def circle_mask(sensor_size: tuple[int, int], cx: float, cy: float, r: float):

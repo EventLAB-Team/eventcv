@@ -1931,6 +1931,53 @@ impl PyEventReader {
         us_to_ms(hi - lo)
     }
 
+    /// The intensity (APS) frames recorded alongside the events, as `[(t_us, EventFrame), …]`.
+    ///
+    /// A DAVIS records a greyscale video beside its event stream; this is that video. Sources
+    /// without one (`.npz`, Prophesee, HDF5, …) return an empty list rather than an error. The
+    /// window defaults to the whole recording, which on a multi-gigabyte file is a great many
+    /// frames — pass `t0_us`/`t1_us` for anything larger than a demo.
+    #[pyo3(signature = (*, t0_us=0, t1_us=i64::MAX))]
+    fn read_frames(
+        &self,
+        py: Python<'_>,
+        t0_us: i64,
+        t1_us: i64,
+    ) -> PyResult<Vec<(i64, PyEventFrame)>> {
+        py.detach(|| self.inner.lock().unwrap().frames(t0_us, t1_us))
+            .map_err(map_io_error)
+            .map(|frames| {
+                frames
+                    .into_iter()
+                    .map(|(t, inner)| (t, PyEventFrame { inner }))
+                    .collect()
+            })
+    }
+
+    /// The IMU samples recorded alongside the events, as a dict of numpy arrays: `t` (µs),
+    /// `angular_velocity` (rad/s) and `linear_acceleration` (m/s², gravity included), both
+    /// `[N, 3]`. Empty for sources without an IMU.
+    #[pyo3(signature = (*, t0_us=0, t1_us=i64::MAX))]
+    fn read_imu<'py>(
+        &self,
+        py: Python<'py>,
+        t0_us: i64,
+        t1_us: i64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let samples = py
+            .detach(|| self.inner.lock().unwrap().imu(t0_us, t1_us))
+            .map_err(map_io_error)?;
+        imu_dict(py, &samples)
+    }
+
+    /// The camera intrinsics the recording carries, or `None` when it carries none. Only ROS
+    /// bags record them today; AEDAT does not.
+    fn read_camera_info(&self, py: Python<'_>) -> PyResult<Option<PyCamera>> {
+        py.detach(|| self.inner.lock().unwrap().camera())
+            .map_err(map_io_error)
+            .map(|camera| camera.map(|inner| PyCamera { inner }))
+    }
+
     /// How long the recording runs, in `unit` (`"s"`, `"ms"`, `"us"`, `"ns"`).
     #[pyo3(signature = (unit="ms"))]
     fn duration(&self, unit: &str) -> PyResult<f64> {
@@ -3659,6 +3706,15 @@ fn read_imu<'py>(
     let samples = py
         .detach(|| eventcv_core::io::read_bag_imu(path, topic, t0_us, t1_us))
         .map_err(map_io_error)?;
+    imu_dict(py, &samples)
+}
+
+/// IMU samples as the dict of numpy arrays every source returns them in: `t` (µs),
+/// `angular_velocity` and `linear_acceleration`, both `[N, 3]`.
+fn imu_dict<'py>(
+    py: Python<'py>,
+    samples: &[eventcv_core::io::ImuSample],
+) -> PyResult<Bound<'py, PyDict>> {
     let times: Vec<i64> = samples.iter().map(|sample| sample.t_us).collect();
     let flatten = |pick: fn(&eventcv_core::io::ImuSample) -> [f64; 3]| {
         numpy::ndarray::Array2::from_shape_vec(
@@ -4753,6 +4809,13 @@ enum LiveRenderer {
         builder: EventStreamBuilder,
         last_render: std::time::Instant,
     },
+    /// The sensor's own APS video (DAVIS only). Nothing accumulates: the newest frame the
+    /// camera produced is the picture, so the display just shows whichever arrived last.
+    Aps {
+        colormap: Colormap,
+        normalize: bool,
+        latest: Option<EventFrame>,
+    },
 }
 
 #[cfg(feature = "camera")]
@@ -4780,6 +4843,16 @@ impl LiveRenderer {
                     lit = true;
                     builder.push(x, y, t_us, positive);
                 })?
+            }
+            LiveRenderer::Aps { latest, .. } => {
+                // The ring still has to be drained or the driver stalls; the events themselves
+                // are what this view is not showing.
+                let overflow = capture.drain_events_budgeted(budget, |_, _, _, _| {})?;
+                if let Some((_, frame)) = capture.take_aux().0.pop() {
+                    *latest = Some(frame);
+                    lit = true;
+                }
+                overflow
             }
         };
         if overflow {
@@ -4817,6 +4890,15 @@ impl LiveRenderer {
                     &frame, *colormap, *normalize,
                 )))
             }
+            // Rendered once per arrival, then cleared: the APS array runs at tens of frames a
+            // second, far below the display, so re-rendering an unchanged frame is pure waste.
+            LiveRenderer::Aps {
+                colormap,
+                normalize,
+                latest,
+            } => Ok(latest
+                .take()
+                .map(|frame| eventcv_core::viz::render_frame(&frame, *colormap, *normalize))),
         }
     }
 }
@@ -5075,11 +5157,64 @@ struct PyEventCamera {
     // Skips and overflows from pumps already stopped, so the counters survive a `show()` round trip.
     skipped: usize,
     overflows: usize,
+    // What `stream(frames=…, imu=…)` asked the capture to collect, mirrored so `show("aps")` can
+    // turn frames on for the viewer and put the setting back afterwards.
+    collects_frames: bool,
+    collects_imu: bool,
+    // Auxiliary streams from windows already delivered, waiting to be collected. Bounded: a
+    // caller who asked for frames and then never reads them is not a reason to grow without
+    // limit, so the oldest are dropped once the backlog is full.
+    frames: std::collections::VecDeque<(i64, EventFrame)>,
+    imu: std::collections::VecDeque<eventcv_core::io::ImuSample>,
+    n_frames: usize,
+    n_imu: usize,
 }
+
+/// How much of the live auxiliary streams is held for `read_frames()` / `read_imu()`. At a
+/// DAVIS346's ~40 fps and 1 kHz IMU these are a second or two of backlog, and about 12 MB of
+/// frames — enough for a loop that collects every window, bounded for one that never does.
+#[cfg(feature = "camera")]
+const AUX_FRAME_BACKLOG: usize = 64;
+#[cfg(feature = "camera")]
+const AUX_IMU_BACKLOG: usize = 4096;
 
 #[cfg(feature = "camera")]
 #[pymethods]
 impl PyEventCamera {
+    /// The APS frames the sensor produced alongside the windows read so far, as
+    /// `[(t_us, EventFrame), …]`, and clears them. Needs `stream(frames=True)` and a DAVIS;
+    /// anything else returns an empty list.
+    ///
+    /// Frames arrive with the window that covers them, so collect after each `read()`. Only the
+    /// most recent few dozen are kept: an uncollected backlog is dropped rather than grown, the
+    /// same trade `stream(latest=True)` makes for events.
+    fn read_frames(&mut self) -> Vec<(i64, PyEventFrame)> {
+        self.frames
+            .drain(..)
+            .map(|(t, inner)| (t, PyEventFrame { inner }))
+            .collect()
+    }
+
+    /// The IMU samples alongside the windows read so far, as a dict of numpy arrays — `t` (µs),
+    /// `angular_velocity` (rad/s) and `linear_acceleration` (m/s²), both `[N, 3]` — and clears
+    /// them. Same shape `eventcv.read_imu` returns for a file. Needs `stream(imu=True)`.
+    fn read_imu<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let samples: Vec<_> = self.imu.drain(..).collect();
+        imu_dict(py, &samples)
+    }
+
+    /// How many APS frames this camera has decoded, including any dropped from the backlog.
+    #[getter]
+    fn n_frames(&self) -> usize {
+        self.n_frames
+    }
+
+    /// How many IMU samples this camera has decoded, including any dropped from the backlog.
+    #[getter]
+    fn n_imu(&self) -> usize {
+        self.n_imu
+    }
+
     #[getter]
     fn sensor_size(&self) -> PyResult<(usize, usize)> {
         self.open_check()?;
@@ -5278,9 +5413,11 @@ impl PyEventCamera {
 
     /// Opens the interactive live viewer. With no `representation`, shows the **raw** event stream
     /// (polarity dots with exponential decay — the default view). Pass a representation name
-    /// (`"count"`, `"tencode"`, `"voxel"`, …) to render that live instead, or `"raw"` to force the
-    /// raw view. Blocks on the main thread until the window is closed. `decay_ms` tunes the raw
-    /// fade; `colormap` / `normalize` apply to representations.
+    /// (`"count"`, `"tencode"`, `"voxel"`, …) to render that live instead, `"raw"` to force the
+    /// raw view, or `"aps"` to watch the sensor's own greyscale video (DAVIS only — every other
+    /// camera shows nothing, having no APS array). Blocks on the main thread until the window is
+    /// closed. `decay_ms` tunes the raw fade; `colormap` / `normalize` apply to representations
+    /// and to the APS view.
     #[pyo3(signature = (representation=None, *, decay_ms=None, colormap="viridis", normalize=true))]
     fn show(
         &mut self,
@@ -5681,12 +5818,23 @@ impl PyEventCamera {
         };
         let renderer = match representation.as_deref() {
             Some("raw") => raw(decay_ms),
+            Some("aps") => LiveRenderer::Aps {
+                colormap: colormap_value,
+                normalize,
+                latest: None,
+            },
             Some(name) => repr(ReprSpec::named(name, Some(normalize))?),
             None => match stored_repr {
                 Some(spec) => repr(spec),
                 None => raw(decay_ms),
             },
         };
+        // The APS view needs the frames the capture is otherwise told not to collect; leave the
+        // IMU alone so `read_imu()` keeps whatever the caller asked `stream()` for.
+        let mut capture = capture;
+        if matches!(renderer, LiveRenderer::Aps { .. }) {
+            capture.collect_aux(true, self.collects_imu);
+        }
 
         // Draining runs on a dedicated thread that owns the capture, decoupled from the GPU thread's
         // vsync-bound present loop (see `run_live_threaded`). The camera is reclaimed and restored
@@ -5694,10 +5842,34 @@ impl PyEventCamera {
         let (capture, result) =
             py.detach(move || run_live_threaded(capture, renderer, width, height, title, mode));
         self.state = match capture {
-            Some(capture) => CameraState::Idle { capture, recorder },
+            Some(mut capture) => {
+                // Put back whatever `stream()` asked for: the APS view may have turned frame
+                // collection on for itself, and the caller did not ask to keep paying for it.
+                capture.collect_aux(self.collects_frames, self.collects_imu);
+                CameraState::Idle { capture, recorder }
+            }
             None => CameraState::Closed,
         };
         result.map_err(PyRuntimeError::new_err)
+    }
+
+    /// Files a window's auxiliary streams for `read_frames()` / `read_imu()`, dropping the oldest
+    /// once the backlog is full.
+    fn stage_aux(
+        &mut self,
+        frames: Vec<(i64, EventFrame)>,
+        imu: Vec<eventcv_core::io::ImuSample>,
+    ) {
+        self.n_frames += frames.len();
+        self.n_imu += imu.len();
+        self.frames.extend(frames);
+        self.imu.extend(imu);
+        while self.frames.len() > AUX_FRAME_BACKLOG {
+            self.frames.pop_front();
+        }
+        while self.imu.len() > AUX_IMU_BACKLOG {
+            self.imu.pop_front();
+        }
     }
 
     /// Puts `mask` on the capture — parking the pump, which owns it, first — and mirrors it here so
@@ -5730,14 +5902,17 @@ impl PyEventCamera {
         let repr = self.repr;
         // Decoding, archiving, and the `latest=` skip policy all run on the pump thread; this loop
         // only collects finished windows and renders them.
-        let pump = self.pumping()?;
+        self.pumping()?;
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
         loop {
+            // Re-borrowed each turn so staging a window's frames can take `self` mutably.
+            let pump = self.pumping()?;
             match py.detach(|| pump.next_window(READ_SLICE)) {
                 Ok(Some(window)) => {
                     if window.first_after_overflow {
                         note_overflow();
                     }
+                    self.stage_aux(window.frames, window.imu);
                     return render_slice(py, repr, window.stream).map(Some);
                 }
                 Ok(None) => {} // nothing decoded yet — keep waiting
@@ -6056,7 +6231,9 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
 /// data by handing back the newest window instead of the oldest. `max_event_rate` and `roi` cap what
 /// the sensor emits, in hardware. `adaptive_bias` holds the event rate steady across changing light
 /// by retuning the sensor's biases as it runs. `decay_ms` is the default fade for the raw `show()`
-/// view.
+/// view. `frames` and `imu` turn on the streams a DAVIS produces alongside its events, collected
+/// with `read_frames()` / `read_imu()`; both are off by default because copying an APS frame out
+/// of every decode buffer is not free and most captures only want events.
 #[cfg(feature = "camera")]
 #[pyfunction]
 #[pyo3(signature = (
@@ -6066,7 +6243,7 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None,
     window=None, normalize=None, pct=None, white_frame=None, record=None,
     compression=None, latest=false, max_event_rate=None, roi=None, mask=None, adaptive_bias=None,
-    decay_ms=None, decay_s=None, decay_us=None, decay_ns=None
+    decay_ms=None, decay_s=None, decay_us=None, decay_ns=None, frames=false, imu=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stream(
@@ -6106,6 +6283,8 @@ fn stream(
     decay_s: Option<f64>,
     decay_us: Option<f64>,
     decay_ns: Option<f64>,
+    frames: bool,
+    imu: bool,
 ) -> PyResult<PyEventCamera> {
     let dt = resolve_duration_us("dt", dt_s, dt_ms, dt_us, dt_ns)?.map(|us| us as f64 / 1000.0);
     let decay_ms =
@@ -6204,6 +6383,7 @@ fn stream(
         }
         None => capture.mask().map(<[bool]>::to_vec),
     };
+    capture.collect_aux(frames, imu);
     // Created only now, so a failed camera open never leaves an empty recording behind.
     #[cfg(feature = "hdf5")]
     let recorder = record
@@ -6229,6 +6409,12 @@ fn stream(
         },
         skipped: 0,
         overflows: 0,
+        collects_frames: frames,
+        collects_imu: imu,
+        frames: std::collections::VecDeque::new(),
+        imu: std::collections::VecDeque::new(),
+        n_frames: 0,
+        n_imu: 0,
     })
 }
 
@@ -6302,6 +6488,8 @@ fn record(
         None,
         None,
         None,
+        /* frames */ false,
+        /* imu */ false,
     )?;
     let recorded = camera.record(py, path, seconds, compression);
     // Close before raising, so a failed recording still releases the device.

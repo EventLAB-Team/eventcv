@@ -113,7 +113,22 @@ with ecv.stream(dt_ms=50) as cam, ecv.EventSink("session.h5") as sink:
         track(events)           # ...and process the same window live
 ```
 
-Only events are saved either way — a DAVIS346's APS frames and IMU samples are dropped.
+Only events are saved either way. A DAVIS346's APS frames and IMU samples are not written to the
+recording, but they are no longer thrown away: pass `frames=True` / `imu=True` to
+{func}`~eventcv.stream` and collect them as you read.
+
+```python
+with ecv.stream(dt_ms=50, frames=True, imu=True) as cam:
+    for events in cam:
+        for t_us, frame in cam.read_frames():    # EventFrame, uint16 greyscale
+            reference(frame.numpy())
+        gyro = cam.read_imu()["angular_velocity"]  # rad/s, [N, 3]
+```
+
+These are the shapes {func}`~eventcv.read_frames` and {func}`~eventcv.read_imu` return for a `.bag`
+or `.aedat` recording, so the same code reads a file or a camera. `cam.show("aps")` watches the APS
+video live. Only the most recent few dozen frames are held — collect them each window, or the
+oldest are dropped rather than buffered forever.
 
 ## How capture keeps up
 
