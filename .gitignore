@@ -239,4 +239,9 @@ data/development/
 # ...and as a symlink, which the trailing-slash pattern above does not match. Development
 # recordings are hundreds of megabytes to tens of gigabytes and live outside the repository.
 data/development
-data/test
+# data/test is an allowlist: the small format fixtures the test suite reads are committed, while
+# multi-GB local recordings (sunset2.hdf5) and scratch files stay ignored unless named below.
+data/test/*
+!data/test/example.npz
+!data/test/sample.aedat4
+!data/test/sample_zstd.aedat4
