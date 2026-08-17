@@ -886,12 +886,12 @@ mod tests {
     /// A sensor big enough to cross [`PARALLEL_PIXEL_THRESHOLD`], so the tests below exercise the
     /// rayon path rather than the serial fallback.
     const PARALLEL_SIDE: usize = 288;
+    const _: () = assert!(
+        PARALLEL_SIDE * PARALLEL_SIDE >= PARALLEL_PIXEL_THRESHOLD,
+        "the test sensor must be large enough to take the parallel path"
+    );
 
     fn run_parallel_sensor() -> EventStream {
-        assert!(
-            PARALLEL_SIDE * PARALLEL_SIDE >= PARALLEL_PIXEL_THRESHOLD,
-            "the test sensor must be large enough to take the parallel path"
-        );
         let mut sim = Simulator::new(
             PARALLEL_SIDE,
             PARALLEL_SIDE,

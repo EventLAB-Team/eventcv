@@ -3011,6 +3011,7 @@ impl PyWindowIterator {
 ///
 /// `compression` applies to `.h5` and defaults to gzip 1; pass `False` for the fastest possible
 /// write at roughly three times the size.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (
     obj, path, *, topic=None, colormap="viridis", normalize=true, format=None, compression=None
