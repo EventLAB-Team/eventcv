@@ -37,6 +37,10 @@ pub enum RepresentationKind {
     Count,
     CountMask,
     Flow,
+    /// A plain greyscale image — not derived from events at all. Produced by the frame readers and
+    /// by reconstruction, and consumed by the simulator. Like `Flow` and `Labels` it has no
+    /// `Representation` impl, because there is no stream to generate it from.
+    Intensity,
     Labels,
     Mcts,
     Polarity,
@@ -53,6 +57,7 @@ impl RepresentationKind {
             Self::Count => "count",
             Self::CountMask => "countmask",
             Self::Flow => "flow",
+            Self::Intensity => "intensity",
             Self::Labels => "labels",
             Self::Mcts => "mcts",
             Self::Polarity => "polarity",
@@ -70,6 +75,7 @@ impl RepresentationKind {
             "count" => Self::Count,
             "countmask" => Self::CountMask,
             "flow" => Self::Flow,
+            "intensity" => Self::Intensity,
             "labels" => Self::Labels,
             "mcts" => Self::Mcts,
             "polarity" => Self::Polarity,
@@ -117,6 +123,43 @@ impl EventFrame {
             kind,
             channel_names,
         }
+    }
+
+    /// Builds a single-channel greyscale frame from raw samples, row-major.
+    ///
+    /// The public counterpart to [`EventFrame::from_parts`], which is crate-private and validates
+    /// nothing — so this is the only way anything outside the core (the bindings, the video decoder)
+    /// can construct a frame, and it checks the length rather than trusting the caller. Everything
+    /// downstream indexes `c * width * height + y * width + x` and would read out of bounds on a
+    /// mismatch.
+    pub fn intensity(
+        data: EventFrameData,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, RepresentationError> {
+        let expected = width
+            .checked_mul(height)
+            .ok_or(RepresentationError::SizeOverflow)?;
+        let actual = match &data {
+            EventFrameData::U8(values) => values.len(),
+            EventFrameData::U16(values) => values.len(),
+            EventFrameData::U64(values) => values.len(),
+            EventFrameData::F32(values) => values.len(),
+        };
+        if actual != expected {
+            return Err(RepresentationError::ShapeMismatch {
+                samples: actual,
+                width,
+                height,
+            });
+        }
+        Ok(Self::from_parts(
+            data,
+            width,
+            height,
+            RepresentationKind::Intensity,
+            vec!["intensity".to_owned()],
+        ))
     }
 
     pub fn data(&self) -> &EventFrameData {
@@ -207,6 +250,13 @@ pub enum RepresentationError {
         height: usize,
     },
     InvalidParameter(&'static str),
+    /// A frame's sample count does not match its dimensions. Caught at construction because every
+    /// consumer indexes `c * width * height + y * width + x` and would read out of bounds.
+    ShapeMismatch {
+        samples: usize,
+        width: usize,
+        height: usize,
+    },
 }
 
 impl fmt::Display for RepresentationError {
@@ -236,6 +286,15 @@ impl fmt::Display for RepresentationError {
                 "pct" => formatter.write_str("pct must be between 0 and 100"),
                 _ => write!(formatter, "{name} must be finite and positive"),
             },
+            Self::ShapeMismatch {
+                samples,
+                width,
+                height,
+            } => write!(
+                formatter,
+                "frame has {samples} samples but {width}x{height} needs {}",
+                width * height
+            ),
         }
     }
 }

@@ -43,10 +43,15 @@ classifiers = [
         'Operating System :: MacOS',
 ]
 
-# Test-only tools (writing/inspecting HDF5 fixtures). Not needed to use eventcv —
-# the Rust reader links its own libhdf5.
+# `onnx` is a *fallback*, not the way in: the wheels already carry an ONNX Runtime
+# (`scripts/fetch_onnxruntime.py` puts it there), so it exists for source and `--no-binary`
+# installs, which have no bundled copy. Conda users get the same effect from `onnxruntime-cpp`.
+# `test` additionally brings the tools for writing/inspecting HDF5 fixtures and ONNX graphs;
+# none of them are needed to use eventcv — the Rust reader links its own libhdf5.
 [project.optional-dependencies]
-test = ["h5py>=3", "hdf5plugin"]
+onnx = ["onnxruntime>=1.17"]
+# `onnx` below is the PyPI graph-building package used by tests/test_model.py, not this extra.
+test = ["h5py>=3", "hdf5plugin", "onnx", "onnxruntime>=1.17"]
 
 # `eventcv --version` reports the installed version and which optional features the wheel was
 # built with. `python -m eventcv --version` does the same without the console script on PATH.
@@ -63,9 +68,18 @@ bindings = "pyo3"
 manifest-path = "crates/eventcv-py/Cargo.toml"
 python-source = "python"
 module-name = "eventcv._rust"
-# Compile HDF5 reading and USB event-camera streaming into every wheel. `camera` pulls in the
-# neuromorphic-drivers crate + a vendored libusb (built from source, no system libusb at runtime).
-features = ["hdf5", "camera"]
+# Compile HDF5 reading, USB event-camera streaming and ONNX inference into every wheel. `camera`
+# pulls in the neuromorphic-drivers crate + a vendored libusb (built from source, no system libusb
+# at runtime). `onnx` pulls in ort, which *loads* ONNX Runtime at run time rather than linking a
+# prebuilt one in — the static runtime `ort` can fetch is built against glibc 2.38 and made the
+# whole extension unloadable on older distros. The flag remains because ort has no stable release
+# yet, so a bad RC is turned off here rather than worked around in the API.
+features = ["hdf5", "camera", "onnx"]
+# The ONNX Runtime the wheel carries, put there by `scripts/fetch_onnxruntime.py` before the build
+# (CI runs it in every wheel job). `format = "wheel"` because an sdist must not ship a binary — a
+# source build finds a runtime elsewhere, or says how to install one. maturin skips gitignored
+# files under `python-source`, and `_libs/` is gitignored, so this entry is what carries it.
+include = [{ path = "eventcv/_libs/*", format = "wheel" }]
 # Keep the docs source, fixtures, and dev-only files out of the sdist (the wheel already
 # only contains `python/eventcv/` + the compiled extension). Docs are hosted on Read the
 # Docs, so shipping them to PyPI would only bloat the download.

@@ -39,13 +39,16 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(_declared(ROOT / "crates" / "eventcv-core" / "Cargo.toml"), expected)
 
     def test_features_list_what_was_built_in(self):
-        # Published wheels carry both; a plain `cargo build` of the bindings carries neither.
+        # Published wheels carry all three; a plain `cargo build` of the bindings carries none.
         features = eventcv._rust.__features__
         self.assertIsInstance(features, list)
-        self.assertLessEqual(set(features), {"hdf5", "camera"})
+        self.assertLessEqual(set(features), {"hdf5", "camera", "onnx"})
         # Whatever they say must match what the module actually exposes.
         self.assertEqual("hdf5" in features, eventcv.EventSink is not None)
         self.assertEqual("camera" in features, eventcv.EventCamera is not None)
+        # `Model` is always bound — to the real class, or to a stub that explains the rebuild —
+        # so presence of the name proves nothing and the check has to be for the working one.
+        self.assertEqual("onnx" in features, eventcv.Model is getattr(eventcv._rust, "Model", None))
 
 
 class CommandLineTests(unittest.TestCase):
@@ -71,7 +74,19 @@ class CommandLineTests(unittest.TestCase):
         lines = self._run("--version").stdout.splitlines()
         for feature in eventcv._rust.__features__:
             self.assertIn(feature, lines[0], "the build's features belong on the version line")
-        self.assertTrue(lines[1].startswith("Python "), lines[1])
+        self.assertTrue(lines[-1].startswith("Python "), lines[-1])
+
+    @unittest.skipUnless(
+        "onnx" in eventcv._rust.__features__, "needs a build with the onnx feature"
+    )
+    def test_version_reports_which_onnx_runtime_was_loaded(self):
+        # Which library `Model` opened, and where it came from, is decided at run time — the one
+        # thing about a model bug report that a build-time feature list cannot answer.
+        lines = self._run("--version").stdout.splitlines()
+        self.assertTrue(
+            any(line.startswith("ONNX Runtime") for line in lines[1:-1]),
+            f"no ONNX Runtime line in {lines}",
+        )
 
     def test_bare_invocation_prints_help_and_succeeds(self):
         result = self._run()

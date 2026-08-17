@@ -51,23 +51,26 @@ pub(crate) fn run(scene: Scene) -> Result<(), String> {
     run_app(App::new(scene))
 }
 
-/// Opens a window and displays a live stream, pulling a fresh frame from `producer` every
-/// ~[`FRAME_INTERVAL`] until the user closes the window or `producer` returns an error. The producer
-/// polls the camera and renders on this (main) thread — `producer` returns `Ok(Some(image))` for a
-/// new frame, `Ok(None)` when nothing changed since the last call, or `Err` to abort. Reuses the
-/// same process-global event loop as [`run`], so a session mixes `.view()` and live streaming freely
-/// (one window at a time).
-#[cfg(feature = "camera")]
+/// Opens a window and displays a stream of frames, pulling a fresh one from `producer` every
+/// `interval` until the user closes the window or `producer` returns an error. The producer renders
+/// on this (main) thread — it returns `Ok(Some(image))` for a new frame, `Ok(None)` when nothing
+/// changed since the last call, or `Err` to abort. Reuses the same process-global event loop as
+/// [`run`], so a session mixes `.view()` and streaming freely (one window at a time).
+///
+/// Not camera-specific: a recorded file played back at a chosen rate is the same loop with a
+/// different producer, which is why `interval` is a parameter rather than the live viewer's
+/// hardcoded 60 FPS.
 pub(crate) fn run_live<P>(
     producer: P,
     width: u32,
     height: u32,
     title: String,
+    interval: std::time::Duration,
 ) -> Result<(), String>
 where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
-    run_app(LiveApp::new(producer, width, height, title, None))
+    run_app(LiveApp::new(producer, width, height, title, None, interval))
 }
 
 /// Like [`run_live`], but `editor` draws an ROI over the displayed frames: pointer drags become
@@ -84,7 +87,14 @@ pub(crate) fn run_draw<P>(
 where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
-    run_app(LiveApp::new(producer, width, height, title, Some(editor)))
+    run_app(LiveApp::new(
+        producer,
+        width,
+        height,
+        title,
+        Some(editor),
+        FRAME_INTERVAL,
+    ))
 }
 
 /// Runs an app to completion on the process-global event loop, surfacing whatever error ended it.
@@ -124,6 +134,8 @@ struct LiveApp<'a, P> {
     /// so the newest frame is kept here to composite onto even when the producer has nothing new.
     editor: Option<&'a mut MaskEditor>,
     frame: Option<super::Rgb8Image>,
+    /// How long to sleep between producer polls — the display cadence, not the data rate.
+    interval: std::time::Duration,
 }
 
 impl<P> Failable for LiveApp<'_, P> {
@@ -142,6 +154,7 @@ where
         height: u32,
         title: String,
         editor: Option<&'a mut MaskEditor>,
+        interval: std::time::Duration,
     ) -> Self {
         Self {
             producer,
@@ -153,6 +166,7 @@ where
             error: None,
             editor,
             frame: None,
+            interval,
         }
     }
 
@@ -216,7 +230,7 @@ where
 
     /// Sleeps until the next display frame is due.
     fn wait(&self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + self.interval));
     }
 
     fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
@@ -264,7 +278,7 @@ where
             Ok(render) => {
                 self.render = Some(render);
                 self.window = Some(window);
-                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + self.interval));
             }
             Err(error) => self.fail(event_loop, error),
         }

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from . import _rust
+from . import _ort, _rust
+
+# `Model` opens ONNX Runtime at run time, so settle which library that is — bundled, conda's,
+# pip's — before anything can ask for a model. Cheap, and a no-op when the user chose one.
+_ort.configure()
 
 EventStream = _rust.EventStream
 EventFrame = _rust.EventFrame
@@ -9,6 +13,29 @@ EventReader = _rust.EventReader
 Polarity = _rust.Polarity
 Camera = _rust.Camera
 FEAST = _rust.FEAST
+
+
+class _MissingModel:
+    """Stand-in for `Model` in a build without the `onnx` feature.
+
+    The published wheels have it, so this is only reached by a source build that left the feature
+    off. Raising at construction with the actual fix beats `AttributeError: no attribute 'Model'`,
+    which reads like the feature does not exist at all.
+    """
+
+    def __init__(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "eventcv was built without ONNX support, so Model is unavailable. Reinstall from "
+            "PyPI (`pip install --force-reinstall eventcv`), or rebuild with "
+            "`maturin develop --features onnx`. `eventcv --version` lists the features this "
+            "build has."
+        )
+
+
+Model = getattr(_rust, "Model", _MissingModel)
+Tracker = _rust.Tracker
+UdpSender = _rust.UdpSender
+UdpReceiver = _rust.UdpReceiver
 
 
 def load(
@@ -30,8 +57,19 @@ def load(
 
     Supported today: ``.npz`` (N-ImageNet), ``.txt``/``.csv`` (e.g. EV-IMO
     ``t x y p``), ``.bag`` (ROS ``dvs_msgs/EventArray``), ``.hdf5``/``.h5``,
-    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), ``.dat`` (Prophesee CD events), and
-    Prophesee EVT3 ``.raw`` recordings.
+    ``.aedat`` (AEDAT 2.0, jAER/DAVIS), ``.aedat4`` (AEDAT 4.0, iniVation DV),
+    ``.dat`` (Prophesee CD events), and Prophesee EVT2 and EVT3 ``.raw`` recordings.
+
+    A `.raw` file's encoding comes from its header, and its sensor size from ``% geometry`` when
+    present — some recorders omit it, and the size is then derived from the events themselves,
+    which is a tight bound on what fired rather than the physical sensor. Pass ``sensor_size``
+    to override.
+
+    An ``.aedat`` file's geometry comes from the chip named in its header (the DAVIS family;
+    DVS128 and older chips use a different address layout and are refused rather than misread);
+    an ``.aedat4`` file's comes from the stream description DV writes into its header. In both,
+    the APS frames and IMU samples are not events and so are not returned here — read them with
+    :func:`read_frames` and :func:`read_imu`.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted and only act
     as overrides: rosbags carry both in the message; HDF5/text infer the time unit
@@ -261,9 +299,16 @@ def open(
 FrameSink = getattr(_rust, "FrameSink", None)
 EventSink = getattr(_rust, "EventSink", None)
 
+# What `simulate(..., out=…)` hands back in place of an EventStream. Exported so it can be type-
+# checked and referenced, not because it is meant to be constructed.
+SimulationResult = _rust.SimulationResult
+
 # `EventCamera` and the live-streaming functions are only built when the extension includes
 # USB camera support (the published wheels do); keep imports resilient otherwise.
 EventCamera = getattr(_rust, "EventCamera", None)
+
+# Sentinel for "to the end of the recording" — i64::MAX on the Rust side.
+_MAX_US = (1 << 63) - 1
 
 _NO_CAMERA = (
     "eventcv was built without USB camera support. Install a build with the `camera` feature "
@@ -279,8 +324,14 @@ def list_cameras() -> list[dict]:
     be passed to :func:`stream` to select it when several are attached; an empty list means no
     supported camera was found.
 
-    On Linux, accessing the device needs udev rules — if a camera is plugged in but not listed,
-    install them (see the neuromorphic-drivers README) and re-plug.
+    **Asking never fails.** An empty list is the answer on a machine with no camera, in a container
+    without USB passthrough, or on a CI runner with no USB subsystem at all — none of which are
+    errors. The only exception raised is when the build has no camera support compiled in.
+
+    On Linux, accessing the device needs udev rules. If a camera is plugged in but not listed, this
+    emits a :class:`RuntimeWarning` saying so — install the rules (see the neuromorphic-drivers
+    README) and re-plug. It is a warning rather than an error because the list is genuinely empty
+    either way; the warning only tells you *why*.
     """
     if not hasattr(_rust, "list_cameras"):
         raise RuntimeError(_NO_CAMERA)
@@ -324,6 +375,8 @@ def stream(
     decay_s: float | None = None,
     decay_us: float | None = None,
     decay_ns: float | None = None,
+    frames: bool = False,
+    imu: bool = False,
 ) -> EventCamera:
     """Open a live USB event camera — the streaming twin of :func:`open`.
 
@@ -513,6 +566,24 @@ def stream(
                 sink.append(events)         # to disk
                 track(events)               # ...and process the same window live
 
+    **APS frames and IMU.** A DAVIS produces a greyscale video and an IMU stream alongside its
+    events. Pass ``frames=True`` / ``imu=True`` to collect them, then take them with
+    :meth:`EventCamera.read_frames` and :meth:`EventCamera.read_imu` — the same shapes
+    :func:`read_frames` and :func:`read_imu` return for a recording, so code written against a
+    file works unchanged on a live camera::
+
+        with ecv.stream(dt_ms=50, frames=True, imu=True) as cam:
+            for events in cam:
+                for t_us, frame in cam.read_frames():   # EventFrame, uint16 greyscale
+                    show(frame.numpy())
+                gyro = cam.read_imu()["angular_velocity"]
+
+        ecv.stream(frames=True).show("aps")             # watch the APS video live
+
+    Both are off by default: copying a frame out of every decode buffer is not free, and other
+    sensors have neither stream. Collect them as you read — only the most recent few dozen frames
+    and a few thousand samples are held, and the oldest are dropped rather than buffered forever.
+
     Requires a build with camera support and, on Linux, udev rules for USB access.
     """
     if not hasattr(_rust, "stream"):
@@ -553,6 +624,8 @@ def stream(
         decay_s=decay_s,
         decay_us=decay_us,
         decay_ns=decay_ns,
+        frames=frames,
+        imu=imu,
     )
 
 
@@ -611,7 +684,12 @@ def record(
 
 
 def save(
-    obj, path: str, *, topic: str | None = None, format: str | None = None
+    obj,
+    path: str,
+    *,
+    topic: str | None = None,
+    format: str | None = None,
+    compression: int | bool | None = None,
 ) -> None:
     """Save an :class:`EventStream`, :class:`EventFrame`, :class:`EventReader`, or :class:`FEAST`
     model to ``path``.
@@ -636,6 +714,15 @@ def save(
     than memory re-exports without being loaded, and any deferred ops on the reader (``crop``,
     ``mask``, ``hot_pixel_filter``, …) apply to what is written. eventcv does not read the E2VID
     layout back — keep an ``.npz``/``.h5`` if you need the recording itself.
+
+    **HDF5 compression.** Events are stored as four columns — ``x``/``y`` (``uint16``), ``t``
+    (``int64``) and ``p`` (``uint8``) — which is 13 raw bytes an event, so a large recording is
+    enormous stored plainly. ``.h5`` is therefore chunked, byte-shuffled and gzipped by default,
+    which typically cuts it by more than half at some cost in write speed. Pass
+    ``compression=False`` for the fastest possible write, or ``1``–``9`` to pick a level::
+
+        ecv.save(events, "rec.h5")                     # gzip 1, the default
+        ecv.save(events, "rec.h5", compression=False)  # fastest, largest
     """
     if isinstance(obj, FEAST):
         import numpy as np
@@ -647,7 +734,7 @@ def save(
             **obj.get_params(),
         )
         return
-    return _rust.save(obj, path, topic=topic, format=format)
+    return _rust.save(obj, path, topic=topic, format=format, compression=compression)
 
 
 def load_feast(path: str) -> FEAST:
@@ -680,6 +767,374 @@ def load_frame(path: str) -> EventFrame:
     Restores the representation's shape, dtype, ``kind``, and ``channel_names``.
     """
     return _rust.load_frame(path)
+
+
+def simulate(
+    source,
+    *,
+    pos_thres: float = 0.2,
+    neg_thres: float = 0.2,
+    sigma_thres: float = 0.03,
+    refractory_us: int = 100,
+    cutoff_hz: float = 200.0,
+    leak_rate_hz: float = 1.0,
+    shot_noise_rate_hz: float = 10.0,
+    seed: int = 0,
+    upsample: str | None = None,
+    max_events_per_pixel: float = 1.0,
+    max_upsample: int | None = None,
+    fps: float | None = None,
+    scale: tuple[int, int] | None = None,
+    max_frames: int | None = None,
+    out: str | None = None,
+    compression: int | bool | None = None,
+    progress: bool = False,
+):
+    """Simulate a DVS camera watching ``source``, returning the events it would have produced.
+
+    ``source`` is a **video file path** (which carries its own frame rate) or an **array of
+    frames** — ``[N, H, W]`` greyscale or ``[N, H, W, 3]`` RGB, integer ``0..255`` or float
+    ``0..1`` — which needs an explicit ``fps``. Writing ``.mp4`` and reading video both go
+    through ``ffmpeg``, so a video source needs it on ``PATH``.
+
+    The pixel model follows v2e (Hu et al., CVPRW 2021). Frames are linearised out of sRGB and
+    mapped lin-log before differencing, so contrast is measured in light rather than in
+    display-encoded values::
+
+        events = ecv.simulate("clip.mp4")                  # realistic defaults
+        events = ecv.simulate(frames, fps=1000)            # from an array
+        events = ecv.simulate("clip.mp4", sigma_thres=0.0, leak_rate_hz=0,
+                              shot_noise_rate_hz=0)        # an ideal, noiseless sensor
+
+    **Writing straight to a file.** A realistic sensor emits a *lot* — a second of 1080p is on the
+    order of a hundred million events, which is many gigabytes held in RAM before you can save any
+    of it. ``out=`` writes each frame interval as it is produced and returns a
+    :class:`SimulationResult` (``.path``, ``.frames``, ``.events``; ``len()`` is the event count)
+    instead of an :class:`EventStream`, so memory stays flat at one interval::
+
+        result = ecv.simulate("clip.mp4", out="events.h5", progress=True)
+        reader = ecv.open(result.path, dt_ms=20)
+
+    ``.h5`` streams; other formats are buffered and written once at the end. ``compression`` picks
+    the HDF5 filter (gzip 1 by default, ``False`` for none), and ``progress=True`` prints frames
+    and event counts to stderr as it runs.
+
+    Parameters mirror the sensor: ``pos_thres``/``neg_thres`` are the log-contrast thresholds,
+    ``sigma_thres`` their per-pixel spread, ``cutoff_hz`` the photoreceptor bandwidth for a white
+    pixel, ``leak_rate_hz`` spontaneous ON events, ``shot_noise_rate_hz`` the noise floor in dark
+    pixels, and ``refractory_us`` the dead time after each event. Set the noise terms to ``0`` for
+    a clean stream; the defaults are what a real camera does.
+
+    ``upsample`` subdivides each frame interval before simulating, which is what keeps timestamps
+    accurate when a lot happens between two frames: ``"adaptive"`` (the default) subdivides until
+    no pixel would emit more than ``max_events_per_pixel`` per sub-interval, ``"off"`` disables it,
+    and an integer string is a fixed factor. Each sub-step is a full pass over every pixel and the
+    *busiest* pixel sets the factor, so one hard edge can cost the maximum on an otherwise quiet
+    frame — ``max_upsample`` (default 64) caps that, trading timestamp accuracy for time.
+
+    ``scale`` decodes video at a different resolution, which is both much cheaper than resizing
+    afterwards and the most effective way to cut the event count — halving each side quarters the
+    pixels and roughly quarters the output. ``max_frames`` stops early, and ``seed`` makes a run
+    reproducible from its configuration (including across machines: the simulation runs on every
+    core, but its noise is seeded so that the result does not depend on how many there are).
+    """
+    return _rust.simulate(
+        source,
+        pos_thres=pos_thres,
+        neg_thres=neg_thres,
+        sigma_thres=sigma_thres,
+        refractory_us=refractory_us,
+        cutoff_hz=cutoff_hz,
+        leak_rate_hz=leak_rate_hz,
+        shot_noise_rate_hz=shot_noise_rate_hz,
+        seed=seed,
+        upsample=upsample,
+        max_events_per_pixel=max_events_per_pixel,
+        max_upsample=max_upsample,
+        fps=fps,
+        scale=scale,
+        max_frames=max_frames,
+        out=out,
+        compression=compression,
+        progress=progress,
+    )
+
+
+def save_video(
+    source,
+    path: str,
+    *,
+    fps: float = 30.0,
+    repr: str | None = None,
+    dt_ms: float | None = None,
+    decay_ms: float | None = None,
+    colormap: str = "viridis",
+    clim: float | None = None,
+    max_frames: int | None = None,
+) -> int:
+    """Render ``source`` as an animation, returning the number of frames written.
+
+    ``source`` is an :class:`EventReader` or an :class:`EventStream`; the container comes from
+    ``path``'s extension (``.gif``, ``.apng``, ``.mp4`` — the last needs ``ffmpeg`` on ``PATH``).
+
+    With no ``repr`` this writes the **raw stream**: every event lights its pixel in its polarity
+    colour and fades over ``decay_ms``, which is the picture a camera's own viewer shows and needs
+    no choice of representation to be meaningful::
+
+        ecv.save_video(ecv.open("rec.h5"), "raw.mp4", dt_ms=5)
+        ecv.save_video(events, "raw.gif", dt_ms=5, decay_ms=20)
+
+    ``dt_ms`` is how much of the recording each rendered frame covers — the shutter, not the
+    playback rate, which is ``fps``. Together they set the speed: ``dt_ms=5, fps=30`` plays six
+    times slower than real time. Passing it here rather than at :func:`open` is deliberate; it is
+    a property of the view, and a reader is often opened for something else entirely.
+
+    Pass ``repr="count"`` (or any representation name) to render that instead, with ``colormap``
+    and ``clim`` as in :meth:`EventReader.save_video`. A reader opened with ``repr=`` uses it
+    unless ``repr="raw"`` overrides.
+    """
+    if isinstance(source, str):
+        source = open(source)
+    kwargs = dict(
+        fps=fps,
+        colormap=colormap,
+        clim=clim,
+        max_frames=max_frames,
+        repr=repr,
+        decay_ms=decay_ms,
+    )
+    # A stream always needs a window (it has no opened-with default to fall back on), so it takes
+    # the argument's own default rather than `None`.
+    if dt_ms is not None:
+        kwargs["dt_ms"] = dt_ms
+    return source.save_video(path, **kwargs)
+
+
+def play(source, **kwargs) -> None:
+    """Open an interactive window playing ``source`` — an :class:`EventReader`, an
+    :class:`EventStream`, or a path.
+
+    The offline twin of :meth:`EventCamera.show`: with no ``repr`` it shows the raw event stream,
+    polarity dots fading by age, so watching a recording takes no more setup than watching a
+    camera::
+
+        ecv.play("rec.h5", dt_ms=5)             # raw, six times slower than real time at 30 fps
+        ecv.play("rec.h5", repr="count", dt_ms=20)
+        ecv.play(events, speed=0.25)
+
+    Blocks on the main thread until the window is closed (``Esc`` or the close button). Keyword
+    arguments are those of :meth:`EventReader.play` / :meth:`EventStream.play` — ``fps``,
+    ``dt_ms``, ``decay_ms``, ``speed``, ``loop_``, and for a reader also ``repr``/``colormap``.
+    """
+    if isinstance(source, str):
+        source = open(source)
+    return source.play(**kwargs)
+
+
+def reconstruct(
+    reader,
+    model,
+    path: str,
+    *,
+    fps: float = 30.0,
+    colormap: str = "grayscale",
+    max_frames: int | None = None,
+) -> int:
+    """Reconstruct an intensity video from events, returning the number of frames written.
+
+    ``reader`` must carry the representation the model expects, and ``model`` is an
+    :class:`Model` wrapping any ONNX graph that maps that representation to a single-channel
+    image — E2VID and its relatives::
+
+        reader = ecv.open("recording.h5", dt_ms=33, repr="voxel", bins=5)
+        ecv.reconstruct(reader, ecv.Model("e2vid.onnx"), "out.mp4")
+
+    EventCV supplies the runner and the tensors, not the weights: there is no official E2VID ONNX
+    export, so export one yourself with ``torch.onnx.export``. A recurrent model must have its
+    hidden state exposed as explicit inputs and outputs; a stateless export (``--no-recurrent``)
+    works as-is.
+
+    The output format comes from ``path``'s extension (``.gif``, ``.apng``, ``.mp4``), and the
+    reconstruction is rendered at its natural scale rather than auto-contrasted, so brightness
+    stays consistent across the sequence.
+    """
+    if Model is _MissingModel:
+        raise RuntimeError(
+            "eventcv was built without ONNX support, so reconstruct is unavailable. "
+            "Reinstall from PyPI, or rebuild with `maturin develop --features onnx`."
+        )
+    return _rust.reconstruct(
+        reader,
+        model,
+        path,
+        fps=fps,
+        colormap=colormap,
+        max_frames=max_frames,
+    )
+
+
+class StatefulModel:
+    """Drives a recurrent ONNX model, carrying its hidden state between calls.
+
+    E2VID and its relatives take ``(data, state_0, …)`` and return ``(image, new_state_0, …)``;
+    what makes them recurrent is feeding those states back, which a plain :class:`Model` call
+    deliberately does not do. ``state_map`` says which output feeds which input::
+
+        model = ecv.StatefulModel(
+            ecv.Model("e2vid_recurrent.onnx"),
+            state_map={"new_state": "state"},
+        )
+        for i in range(len(reader)):
+            image = model(reader[i])
+        model.reset()      # before an unrelated recording
+
+    State lives here rather than inside :class:`Model` so that ``Model`` stays a pure function and
+    resetting is something you ask for rather than something that happens invisibly. On the first
+    call — and after :meth:`reset` — each state input is seeded with zeros of its declared shape,
+    with any free dimension taken as 1.
+
+    There is no official recurrent E2VID export; produce one with ``torch.onnx.export``, exposing
+    the ConvLSTM states as explicit inputs and outputs. A stateless export needs none of this and
+    works with :class:`Model` directly.
+    """
+
+    def __init__(self, model, state_map: dict[str, str]):
+        self.model = model
+        self.state_map = dict(state_map)
+        self._state: dict = {}
+        self._data_input = None
+        for port in model.inputs:
+            if port["name"] not in self.state_map.values():
+                self._data_input = port["name"]
+                break
+        if self._data_input is None:
+            raise ValueError(
+                "every input is claimed by state_map, leaving nothing to feed the data into"
+            )
+        unknown = set(self.state_map.values()) - {p["name"] for p in model.inputs}
+        if unknown:
+            raise ValueError(f"state_map names inputs the graph does not have: {sorted(unknown)}")
+        outputs = {p["name"] for p in model.outputs}
+        missing = set(self.state_map) - outputs
+        if missing:
+            raise ValueError(f"state_map names outputs the graph does not have: {sorted(missing)}")
+
+    def reset(self) -> None:
+        """Forgets the hidden state, so the next call starts a fresh sequence."""
+        self._state = {}
+
+    def _zeros_for(self, name):
+        import numpy as np
+
+        shape = next(p["shape"] for p in self.model.inputs if p["name"] == name)
+        # A free dimension (-1) is almost always the batch axis; one is the only sane choice.
+        return np.zeros([1 if dim < 0 else dim for dim in shape], dtype="float32")
+
+    def __call__(self, data):
+        import numpy as np
+
+        array = np.asarray(data.numpy() if hasattr(data, "numpy") else data, dtype="float32")
+        expected = next(p["shape"] for p in self.model.inputs if p["name"] == self._data_input)
+        if array.ndim + 1 == len(expected):
+            array = array[None]
+        inputs = {self._data_input: array}
+        for output_name, input_name in self.state_map.items():
+            inputs[input_name] = self._state.get(input_name, self._zeros_for(input_name))
+        outputs = self.model.run_named(inputs)
+        for output_name, input_name in self.state_map.items():
+            self._state[input_name] = outputs[output_name]
+        # The image is whatever is not state — the graph's first non-state output.
+        for port in self.model.outputs:
+            if port["name"] not in self.state_map:
+                return outputs[port["name"]]
+        raise ValueError("every output is claimed by state_map, leaving no image to return")
+
+
+def bag_topics(path: str) -> list[tuple[str, str]]:
+    """List every topic in a ROS bag with its message type.
+
+    Bags disagree about names — a DAVIS recorded through ``dvs_ros_driver`` publishes
+    ``/dvs/events`` where :func:`load` defaults to ``/davis/left/events`` — so this is usually the
+    first thing to call on an unfamiliar file::
+
+        >>> ecv.bag_topics("recording.bag")
+        [('/dvs/camera_info', 'sensor_msgs/CameraInfo'),
+         ('/dvs/events', 'dvs_msgs/EventArray'),
+         ('/dvs/image_raw', 'sensor_msgs/Image'),
+         ('/dvs/imu', 'sensor_msgs/Imu')]
+    """
+    return _rust.bag_topics(path)
+
+
+def read_frames(
+    source,
+    *,
+    topic: str | None = None,
+    t0_us: int = 0,
+    t1_us: int | None = None,
+) -> list[tuple[int, EventFrame]]:
+    """Read DAVIS APS frames as ``[(t_us, EventFrame), …]``.
+
+    The greyscale images a DAVIS captures alongside its events — the reference the simulator is
+    calibrated against, since the frames and the events see the same scene through the same lens.
+
+    ``source`` is a path or an open :class:`EventReader`; ROS bags and AEDAT 2.0 recordings carry
+    frames, and any other format returns an empty list. Frames come back at the sensor's own
+    precision, so ``frame.numpy()`` is ``uint8`` from a bag (ROS ``mono8``) and ``uint16`` from
+    AEDAT (a 10-bit ADC).
+
+    ``topic`` selects the bag topic and defaults to its only ``sensor_msgs/Image`` topic when
+    there is exactly one; it does not apply to other formats. The time window matters: these
+    recordings run to tens of gigabytes, and whole chunks outside it are skipped without being
+    decoded. From a bag only ``mono8``/``rgb8``/``bgr8`` are supported; any other encoding raises
+    rather than being misread.
+    """
+    t1_us = _MAX_US if t1_us is None else t1_us
+    if isinstance(source, EventReader):
+        return source.read_frames(t0_us=t0_us, t1_us=t1_us)
+    return _rust.read_frames(source, topic=topic, t0_us=t0_us, t1_us=t1_us)
+
+
+def read_imu(
+    source,
+    *,
+    topic: str | None = None,
+    t0_us: int = 0,
+    t1_us: int | None = None,
+) -> dict:
+    """Read IMU samples as a dict of arrays.
+
+    Keys are ``t`` (µs), ``angular_velocity`` and ``linear_acceleration``, the latter two ``[N, 3]``
+    in rad/s and m/s². On a DAVIS this is the only independent measurement of how the camera moved,
+    which makes it the ground truth for :meth:`~eventcv.EventStream.contrast_maximise`::
+
+        imu = ecv.read_imu("recording.bag", t0_us=t0, t1_us=t1)
+        truth = imu["angular_velocity"].mean(axis=0)
+
+    ``source`` is a path or an open :class:`EventReader`; ROS bags and AEDAT 2.0 recordings carry
+    an IMU, and any other format returns empty arrays.
+
+    Orientation is not returned: on a DAVIS it is dead-reckoned from this same gyro, so it is not
+    an independent quantity. Temperature is not returned either.
+    """
+    t1_us = _MAX_US if t1_us is None else t1_us
+    if isinstance(source, EventReader):
+        return source.read_imu(t0_us=t0_us, t1_us=t1_us)
+    return _rust.read_imu(source, topic=topic, t0_us=t0_us, t1_us=t1_us)
+
+
+def read_camera_info(source, *, topic: str | None = None):
+    """Read camera intrinsics from a recording, or ``None`` if it carries none.
+
+    Returns a :class:`Camera` ready to pass to
+    ``contrast_maximise(model="rotation", camera=…)``, which needs intrinsics to map pixels onto
+    rays. ``source`` is a path or an open :class:`EventReader`; only ROS bags
+    (``sensor_msgs/CameraInfo``) record intrinsics today. Distortion coefficients are not applied
+    — build a :class:`Camera` yourself from the bag's ``D`` if you need undistortion.
+    """
+    if isinstance(source, EventReader):
+        return source.read_camera_info()
+    return _rust.read_camera_info(source, topic=topic)
 
 
 def circle_mask(sensor_size: tuple[int, int], cx: float, cy: float, r: float):
@@ -830,8 +1285,15 @@ __all__ = [
     "EventStream",
     "FEAST",
     "FrameSink",
+    "Model",
     "Polarity",
+    "SimulationResult",
+    "StatefulModel",
+    "Tracker",
+    "UdpReceiver",
+    "UdpSender",
     "circle_mask",
+    "bag_topics",
     "collate",
     "ellipse_mask",
     "export_png",
@@ -842,11 +1304,18 @@ __all__ = [
     "load_frame",
     "load_mask",
     "open",
+    "play",
     "polygon_mask",
+    "read_camera_info",
+    "read_frames",
+    "read_imu",
     "record",
+    "reconstruct",
     "rect_mask",
     "save",
     "save_mask",
+    "save_video",
+    "simulate",
     "stream",
 ]
 

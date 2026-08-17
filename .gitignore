@@ -229,6 +229,19 @@ TASKS.md
 *.DS_Store
 tests/quickview.py
 
+# The ONNX Runtime the wheels bundle. Fetched per build by scripts/fetch_onnxruntime.py — a
+# 24 MB binary that belongs in the wheel, never in the history. (`*.so` above does not match a
+# version-suffixed `libonnxruntime.so.1.28.0`, hence the explicit entry.)
+python/eventcv/_libs/
+
 # Large local development fixtures (multi-GB; keep local, never commit)
 data/development/
-data/test/sunset2.hdf5
+# ...and as a symlink, which the trailing-slash pattern above does not match. Development
+# recordings are hundreds of megabytes to tens of gigabytes and live outside the repository.
+data/development
+# data/test is an allowlist: the small format fixtures the test suite reads are committed, while
+# multi-GB local recordings (sunset2.hdf5) and scratch files stay ignored unless named below.
+data/test/*
+!data/test/example.npz
+!data/test/sample.aedat4
+!data/test/sample_zstd.aedat4

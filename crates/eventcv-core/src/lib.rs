@@ -27,9 +27,12 @@
 
 use ndarray::Array2;
 
+pub mod analytics;
+pub mod augment;
 pub mod bias;
 pub mod camera;
 pub mod cluster;
+pub mod cmax;
 #[cfg(feature = "camera")]
 pub mod device;
 pub mod feast;
@@ -39,8 +42,15 @@ pub mod flow;
 pub mod image;
 pub mod io;
 pub mod mask;
+/// ONNX inference. Requires the `onnx` feature (on in the published wheels).
+#[cfg(feature = "onnx")]
+pub mod model;
+pub mod net;
 pub mod representation;
+pub mod simulate;
+pub mod track;
 pub mod transform;
+pub mod video;
 pub mod viz;
 
 const COLUMN_COUNT: usize = 4;
@@ -189,6 +199,45 @@ impl EventStreamBuilder {
         self.ts.push(timestamp);
         self.ps.push(polarity);
         true
+    }
+
+    /// Appends every event of `stream`, dropping any that fall outside this builder's sensor.
+    ///
+    /// The bulk counterpart of [`push`](Self::push), for the callers that join streams rather than
+    /// generate them — concatenation, and the streaming writers that hand on a window at a time.
+    /// When every event fits (the case for anything produced by a reader or the simulator, which
+    /// cannot emit a coordinate its own sensor does not have) this is four `extend_from_slice`
+    /// calls instead of a bounds check and four pushes per event; the scan that establishes that is
+    /// two comparisons per event and vectorises.
+    pub fn extend_from_stream(&mut self, stream: &EventStream) {
+        let fits = stream
+            .xs()
+            .iter()
+            .zip(stream.ys())
+            .all(|(&x, &y)| usize::from(x) < self.width && usize::from(y) < self.height);
+        if fits {
+            self.xs.extend_from_slice(stream.xs());
+            self.ys.extend_from_slice(stream.ys());
+            self.ts.extend_from_slice(stream.ts());
+            self.ps.extend_from_slice(stream.ps());
+            return;
+        }
+        for index in 0..stream.len() {
+            self.push(
+                stream.xs()[index],
+                stream.ys()[index],
+                stream.ts()[index],
+                stream.ps()[index],
+            );
+        }
+    }
+
+    /// Reserves room for `additional` more events across every column.
+    pub fn reserve(&mut self, additional: usize) {
+        self.xs.reserve(additional);
+        self.ys.reserve(additional);
+        self.ts.reserve(additional);
+        self.ps.reserve(additional);
     }
 
     pub fn len(&self) -> usize {

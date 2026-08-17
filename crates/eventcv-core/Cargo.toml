@@ -12,7 +12,11 @@ categories = ["computer-vision"]
 ndarray = "0.17"
 npyz = { version = "0.9", features = ["derive", "npz"] }
 # Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
-rand = "0.8"
+# `small_rng` is the simulator's per-block noise generator: its parallel pixel loop needs one cheap,
+# independently seeded RNG per block, and `StdRng` (ChaCha12) costs far more than the arithmetic it
+# feeds. Reproducibility comes from how the seeds are derived, not from the algorithm — see
+# `simulate::block_seed`.
+rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 rayon = "1.10"
 rosbag = "0.6.3"
@@ -20,7 +24,22 @@ rosbag = "0.6.3"
 # Same major version npyz already pulls transitively; only `FileOptions` is named here.
 zip = { version = "0.6", default-features = false }
 # Pure-Rust PNG encoder for colormapped frame export (`.png`) — no system deps, keeps wheels easy.
+# Also writes animated PNG (`acTL`/`fcTL`), so `.apng` export costs no extra dependency.
 png = "0.17"
+# AEDAT 4 packet decompression. iniVation's DV compresses every packet, choosing per file between
+# LZ4 in its *frame* format (the C library's `LZ4F_decompress`, not raw blocks) and Zstd. `lz4` is
+# named here rather than a pure-Rust decoder because `rosbag` already pulls it in and builds it —
+# a second LZ4 implementation would be new code compiled to do what the tree already does. `zstd`
+# builds the reference C library from source, the same story libhdf5 and libusb already have, and
+# shares its `zstd-sys` with the copy `zip` depends on. Neither is behind a feature flag: a
+# `.aedat4` whose compression this build could not decode would be a file eventcv claims to read
+# and then does not.
+lz4 = "1.28"
+zstd = { version = "0.13", default-features = false }
+# Pure-Rust GIF encoder for animated export. Same no-system-deps story as `png`; `color_quant`
+# (pulled in by default) builds the 256-colour palette each frame needs. MP4 deliberately has no
+# crate here — it is piped to a system ffmpeg, see `video.rs` for why.
+gif = "0.14"
 # Optional: `.h5`/`.hdf5` reading. Builds libhdf5 from source (needs cmake) and
 # bundles the LZF filter used by event datasets. Enable with `--features hdf5`.
 hdf5 = { package = "hdf5-metno", version = "0.12", optional = true, default-features = false, features = ["static", "lzf", "zlib"] }
@@ -41,11 +60,45 @@ neuromorphic-drivers = { version = "0.17", optional = true }
 # driver.) Remove this once the fields are public upstream.
 serde_json = { version = "1", optional = true }
 
+# Optional: ONNX inference. The runtime is loaded at *run* time (`load-dynamic`), not linked in:
+# `download-binaries` used to fetch a prebuilt static ONNX Runtime, but that binary is built
+# against glibc 2.38, so linking it made the extension unloadable on every distro below that
+# (Ubuntu 22.04, Debian 12, RHEL 9) — an `undefined symbol: __isoc23_strtol` at import, which
+# the manylinux check misses because the references are unversioned. It also makes a source build
+# network-free. The wheels are still self-contained: they carry Microsoft's *shared* build (glibc
+# 2.27) instead, fetched by `scripts/fetch_onnxruntime.py`. `ORT_DYLIB_PATH` says which library to
+# open, and `python/eventcv/_ort.py` sets it from whatever the installation provides.
+# Pinned exactly because ort has no stable release yet (2.0 is still RC) and a point release can
+# move the API under us — the feature gate means a bad RC is a build-flag change, not an API
+# break. Enable with `--features onnx`.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+    "std",
+    "ndarray",          # take/return ndarray tensors, which representations already are
+    "load-dynamic",     # dlopen libonnxruntime on first use; nothing linked, nothing downloaded
+    "api-17",           # lowest API level this code compiles against, so any ORT >= 1.17 loads
+] }
+# Opens the runtime ourselves before handing over to ort, so "no ONNX Runtime here", "that file is
+# not ONNX Runtime" and "that ONNX Runtime is too old" are three different messages instead of one
+# panic from inside ort's lazy initialiser. Already in the tree — ort pulls it in for the same job.
+libloading = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
+# carries the numbers, and the plots need gnuplot or a heavier plotting stack.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
 # The `hdf5` feature turns on both the safe reader and the raw FFI it needs for compound datasets.
 # The `camera` feature turns on USB streaming (compiles the driver crate + a vendored libusb).
 [features]
 hdf5 = ["dep:hdf5", "dep:hdf5-sys"]
 camera = ["dep:neuromorphic-drivers", "dep:serde_json"]
+# ONNX inference for `Model`. Off by default so a source build never has to fetch a runtime;
+# the published wheels turn it on (see `[tool.maturin] features` in pyproject.toml).
+onnx = ["dep:ort", "dep:libloading"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.

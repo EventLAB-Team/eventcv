@@ -113,7 +113,22 @@ with ecv.stream(dt_ms=50) as cam, ecv.EventSink("session.h5") as sink:
         track(events)           # ...and process the same window live
 ```
 
-Only events are saved either way — a DAVIS346's APS frames and IMU samples are dropped.
+Only events are saved either way. A DAVIS346's APS frames and IMU samples are not written to the
+recording, but they are no longer thrown away: pass `frames=True` / `imu=True` to
+{func}`~eventcv.stream` and collect them as you read.
+
+```python
+with ecv.stream(dt_ms=50, frames=True, imu=True) as cam:
+    for events in cam:
+        for t_us, frame in cam.read_frames():    # EventFrame, uint16 greyscale
+            reference(frame.numpy())
+        gyro = cam.read_imu()["angular_velocity"]  # rad/s, [N, 3]
+```
+
+These are the shapes {func}`~eventcv.read_frames` and {func}`~eventcv.read_imu` return for a `.bag`
+or `.aedat` recording, so the same code reads a file or a camera. `cam.show("aps")` watches the APS
+video live. Only the most recent few dozen frames are held — collect them each window, or the
+oldest are dropped rather than buffered forever.
 
 ## How capture keeps up
 
@@ -264,3 +279,48 @@ It blocks on the main thread until the window closes, then the camera is usable 
 Full signatures and every {class}`~eventcv.EventCamera` method and property live in the
 {ref}`API reference <live-camera-streaming>`: {func}`~eventcv.stream`,
 {func}`~eventcv.list_cameras`, {class}`~eventcv.EventCamera`, and {class}`~eventcv.EventSink`.
+
+
+## Streaming over the network
+
+Events can be sent and received over UDP, wire-compatible with
+[aestream](https://github.com/aestream/aestream) and the SPIF transport SpiNNaker boards speak.
+
+```python
+import eventcv as ecv
+
+sender = ecv.UdpSender("127.0.0.1:3333")
+for events in ecv.stream(dt_ms=10):        # from a live camera
+    sender.send(events)
+```
+
+```python
+receiver = ecv.UdpReceiver("0.0.0.0:3333", sensor_size=(640, 480))
+while True:
+    events = receiver.recv(dt_ms=30)       # empty means silence, not failure
+    frame = events.tencode()
+```
+
+### What UDP does and does not promise
+
+There is no handshake, no acknowledgement and no retransmission. That suits event data — dropping a
+late packet beats delaying every packet behind it — but it has a consequence worth stating: **the
+count `send` returns is what was handed to the socket, not what arrived.**
+
+A large stream sent in one burst will overrun the receiver's kernel buffer unless something is
+draining it concurrently, even over loopback. The intended shape is a receiver looping on `recv`
+while the sender runs, not a send followed by a receive.
+
+### Wire format and byte order
+
+Events are 32-bit words: `x` in the high half, `y` in the low half, polarity in bit 15, and bit 31
+marking whether a timestamp word follows. A receiver detects the mode from the first word, so it
+does not need to be configured to match the sender.
+
+`timestamps=True` includes a timestamp per event, doubling the bandwidth. Without it the receiver
+stamps events on arrival — fine for live display, wrong for anything measuring latency. Note the
+wire timestamp is 32-bit and wraps after about 71 minutes at microsecond resolution.
+
+`host_endian` defaults to `True`, matching aestream — whose source concedes in comments that the
+packing *should* use `htons`/`htonl` and does not. Matching a documented bug is the only way to
+actually interoperate; set `host_endian=False` for correct network byte order with anything else.

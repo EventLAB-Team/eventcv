@@ -3,6 +3,7 @@ use std::{error::Error, fmt, io, path::Path};
 use crate::{EventStream, EventStreamBuilder};
 
 mod aedat;
+mod aedat4;
 mod bag;
 mod e2vid;
 #[cfg(feature = "hdf5")]
@@ -12,8 +13,12 @@ mod prophesee;
 mod prophesee_raw;
 mod text;
 
-pub use aedat::read_aedat;
-pub use bag::{open_bag_slice, read_bag, write_bag, BagSliceSource};
+pub use aedat::{open_aedat_slice, read_aedat};
+pub use aedat4::{open_aedat4_slice, read_aedat4};
+pub use bag::{
+    bag_topics, open_bag_slice, read_bag, read_bag_camera_info, read_bag_frames, read_bag_imu,
+    write_bag, BagSliceSource, ImuSample,
+};
 pub use e2vid::{write_e2vid, E2vidWriter};
 #[cfg(feature = "hdf5")]
 pub use h5::{
@@ -28,7 +33,7 @@ pub use text::{
     TextReader, TimeUnit,
 };
 
-use crate::representation::EventFrame;
+use crate::representation::{EventFrame, EventFrameData};
 use crate::viz::{render_frame, Colormap};
 
 /// A single event as produced by a reader, before it is placed on the sensor grid.
@@ -238,7 +243,7 @@ pub fn is_e2vid_target(path: impl AsRef<Path>, format: Option<&str>) -> bool {
 
 /// Loads events from any supported file, detected by extension — the OpenCV-style
 /// single entry point. Supported today: `.npz`, `.txt`/`.csv`, `.bag`, `.h5`/`.hdf5`,
-/// `.aedat` (AEDAT 2.0), and `.dat` (Prophesee CD).
+/// `.aedat` (AEDAT 2.0), `.aedat4` (AEDAT 4.0), and `.dat` (Prophesee CD).
 pub fn load(path: impl AsRef<Path>, options: LoadOptions) -> Result<EventStream, IoError> {
     let path = path.as_ref();
     let Some(cutoff) = options.offset.filter(|&offset| offset > 0) else {
@@ -286,10 +291,7 @@ fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoErro
             }
         }
         Format::Aedat => aedat::read_aedat(path, options),
-        Format::Aedat4 => Err(IoError::Unsupported(
-            "AEDAT4 (.aedat4, iniVation DV FlatBuffer/LZ4) reading is not implemented yet"
-                .to_owned(),
-        )),
+        Format::Aedat4 => aedat4::read_aedat4(path, options),
         Format::PropheseeDat => prophesee::read_dat(path, options),
         Format::PropheseeRaw => prophesee_raw::read_raw(path, options),
         Format::Png => Err(IoError::Unsupported(
@@ -317,6 +319,26 @@ pub trait SliceSource: Send {
     fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError>;
     /// Events whose timestamp (µs) lies in the half-open window `[t0, t1)`.
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError>;
+
+    /// The intensity (APS) frames a DAVIS recorded alongside its events, those whose timestamp
+    /// lies in the half-open window `[t0, t1)` (µs), paired with that timestamp.
+    ///
+    /// Frames, IMU and intrinsics default to empty rather than to an error: most formats carry
+    /// events and nothing else, and a caller asking a `.npz` for its IMU wants "there isn't
+    /// any", not a failure it has to match on per format.
+    fn frames(&self, _t0: i64, _t1: i64) -> Result<Vec<(i64, EventFrame)>, IoError> {
+        Ok(Vec::new())
+    }
+
+    /// The IMU samples in `[t0, t1)` (µs).
+    fn imu(&self, _t0: i64, _t1: i64) -> Result<Vec<ImuSample>, IoError> {
+        Ok(Vec::new())
+    }
+
+    /// The camera intrinsics the recording carries, if it carries any.
+    fn camera(&self) -> Result<Option<crate::camera::Camera>, IoError> {
+        Ok(None)
+    }
 
     /// Per-pixel event counts over the whole file (row-major `width·height`), out-of-bounds
     /// events dropped — what the reader's hot-pixel pre-scan needs. The default tallies through
@@ -410,9 +432,10 @@ impl SliceSource for MemorySliceSource {
 pub type Reader = Box<dyn SliceSource>;
 
 /// Opens a file for lazy slicing, detected by extension (the `VideoCapture` analogue to
-/// [`load`]'s `imread`). HDF5 is sliced in place by binary-searching its timestamp
-/// dataset; every other format is loaded once and sliced in memory. Same `LoadOptions`
-/// as [`load`] (`max_events` is ignored — slicing supersedes it).
+/// [`load`]'s `imread`). HDF5 is sliced in place by binary-searching its timestamp dataset,
+/// text and AEDAT 2.0 build a sparse index, rosbags use their own chunk index; formats
+/// without random access are loaded once and sliced in memory. Same `LoadOptions` as [`load`]
+/// (`max_events` is ignored — slicing supersedes it).
 pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoError> {
     let path = path.as_ref();
     match detect_format(path)? {
@@ -430,8 +453,45 @@ pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Reader, IoEr
         }
         Format::Text => Ok(Box::new(text::open_text_slice(path, &options)?)),
         Format::Rosbag => Ok(Box::new(bag::open_bag_slice(path, &options)?)),
+        Format::Aedat => Ok(Box::new(aedat::open_aedat_slice(path, &options)?)),
+        Format::Aedat4 => Ok(Box::new(aedat4::open_aedat4_slice(path, &options)?)),
         Format::PropheseeRaw => Ok(Box::new(prophesee_raw::open_raw_slice(path, &options)?)),
         _ => Ok(Box::new(MemorySliceSource::new(load(path, options)?))),
+    }
+}
+
+/// How an HDF5 event dataset is stored on disk.
+///
+/// Events are the one thing eventcv writes in bulk, and they compress far better than their raw
+/// width suggests: `t` is monotonically increasing and `p` is one bit wearing a whole byte, so a
+/// byte shuffle followed by deflate typically more than halves a recording. Uncompressed is still
+/// offered because a live capture would rather spend the bytes than the CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    /// Chunked but unfiltered — the fastest to write.
+    None,
+    /// Byte-shuffled, then deflated at this level (`1..=9`).
+    Gzip(u8),
+}
+
+/// Gzip level 1, because on event columns almost all of the win comes from the byte shuffle rather
+/// than from how hard deflate then looks. Measured on a 167 M-event simulation: unfiltered
+/// 2.18 GB / 22 s, level 1 429 MB / 35 s, level 4 408 MB / 42 s. Level 4 spends a fifth more time
+/// to save a twentieth more space, which is the wrong side of the trade for a default.
+impl Default for Compression {
+    fn default() -> Self {
+        Self::Gzip(1)
+    }
+}
+
+impl Compression {
+    /// The deflate level, or `None` when the data is stored unfiltered. Level 0 is treated as off:
+    /// HDF5 accepts it, but it pays the filter's framing cost to compress nothing.
+    pub fn level(self) -> Option<u8> {
+        match self {
+            Self::None | Self::Gzip(0) => None,
+            Self::Gzip(level) => Some(level.min(9)),
+        }
     }
 }
 
@@ -450,6 +510,8 @@ pub struct SaveOptions {
     /// layout to a `.txt` (which otherwise means eventcv's own text format); `.zip` already
     /// implies it. `None` follows the extension.
     pub format: Option<String>,
+    /// HDF5 only: how the event columns are filtered. Defaults to [`Compression::Gzip`] at level 4.
+    pub compression: Compression,
 }
 
 /// The format `path` and `options` together ask for: an explicit `format` name, else the
@@ -488,7 +550,7 @@ pub fn save_stream(
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {
-                h5::write_hdf5_stream(path, stream)
+                h5::write_hdf5_stream(path, stream, options.compression)
             }
             #[cfg(not(feature = "hdf5"))]
             {
@@ -593,9 +655,69 @@ pub fn write_mask(
 /// so a mask binarised in another tool loads as-is: a pixel is **kept where it is non-black and not
 /// fully transparent**. The counterpart of [`write_mask`].
 pub fn read_mask(path: impl AsRef<Path>) -> Result<(Vec<bool>, usize, usize), IoError> {
-    let path = path.as_ref();
+    let png = decode_png(path.as_ref(), "masks are loaded from .png")?;
+    let mut mask = Vec::with_capacity(png.width * png.height);
+    png.for_each_pixel(|colour, opacity| {
+        // Any non-black, non-transparent pixel is "keep" — the intensities themselves don't matter
+        // for a mask, only whether the pixel was painted.
+        mask.push(colour.iter().any(|&value| value != 0) && opacity.first() != Some(&0));
+    });
+    Ok((mask, png.width, png.height))
+}
+
+/// Reads a PNG as a single-channel 8-bit intensity frame.
+///
+/// Colour images are collapsed to luma with the Rec. 601 weights the rest of the library uses;
+/// an alpha channel is ignored rather than composited, since there is no background to composite
+/// against and a half-transparent pixel still had a measured brightness.
+pub fn read_png_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
+    let png = decode_png(path.as_ref(), "frames are loaded from .png")?;
+    let mut samples = Vec::with_capacity(png.width * png.height);
+    png.for_each_pixel(|colour, _| samples.push(luma(colour)));
+    EventFrame::intensity(EventFrameData::U8(samples), png.width, png.height)
+        .map_err(|error| IoError::Format(error.to_string()))
+}
+
+/// Rec. 601 luma. A single sample is already grey and passes through untouched, which keeps a
+/// greyscale PNG bit-exact rather than round-tripping it through the weights.
+pub(crate) fn luma(colour: &[u8]) -> u8 {
+    match colour {
+        [grey] => *grey,
+        [r, g, b, ..] => {
+            (0.299 * f32::from(*r) + 0.587 * f32::from(*g) + 0.114 * f32::from(*b)).round() as u8
+        }
+        _ => 0,
+    }
+}
+
+/// An 8-bit PNG decoded into memory, with enough shape to walk its pixels.
+struct DecodedPng {
+    buffer: Vec<u8>,
+    width: usize,
+    height: usize,
+    line_size: usize,
+    samples: usize,
+    alpha: bool,
+}
+
+impl DecodedPng {
+    /// Calls `visit(colour, opacity)` per pixel in row-major order, where `colour` excludes any
+    /// alpha sample and `opacity` is the alpha (empty when the image has none).
+    fn for_each_pixel(&self, mut visit: impl FnMut(&[u8], &[u8])) {
+        for row in self.buffer.chunks_exact(self.line_size).take(self.height) {
+            for pixel in row[..self.width * self.samples].chunks_exact(self.samples) {
+                let (colour, opacity) = pixel.split_at(self.samples - usize::from(self.alpha));
+                visit(colour, opacity);
+            }
+        }
+    }
+}
+
+/// Shared 8-bit PNG decode behind [`read_mask`] and [`read_png_frame`]. `unsupported` is the
+/// message used when the path is not a PNG at all, so each caller can say what it wanted.
+fn decode_png(path: &Path, unsupported: &str) -> Result<DecodedPng, IoError> {
     if !matches!(detect_format(path)?, Format::Png) {
-        return Err(IoError::Unsupported("masks are loaded from .png".to_owned()));
+        return Err(IoError::Unsupported(unsupported.to_owned()));
     }
     let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
     // Expands palette and sub-byte images and strips 16-bit samples, so everything below is 8-bit.
@@ -603,20 +725,17 @@ pub fn read_mask(path: impl AsRef<Path>) -> Result<(Vec<bool>, usize, usize), Io
     let mut reader = decoder.read_info().map_err(png_decoding_error)?;
     let mut buffer = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buffer).map_err(png_decoding_error)?;
-    let (width, height) = (info.width as usize, info.height as usize);
-    let samples = info.color_type.samples();
-    let alpha = matches!(
-        info.color_type,
-        png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
-    );
-    let mut mask = Vec::with_capacity(width * height);
-    for row in buffer.chunks_exact(info.line_size).take(height) {
-        for pixel in row[..width * samples].chunks_exact(samples) {
-            let (colour, opacity) = pixel.split_at(samples - usize::from(alpha));
-            mask.push(colour.iter().any(|&value| value != 0) && opacity.first() != Some(&0));
-        }
-    }
-    Ok((mask, width, height))
+    Ok(DecodedPng {
+        width: info.width as usize,
+        height: info.height as usize,
+        line_size: info.line_size,
+        samples: info.color_type.samples(),
+        alpha: matches!(
+            info.color_type,
+            png::ColorType::GrayscaleAlpha | png::ColorType::Rgba
+        ),
+        buffer,
+    })
 }
 
 fn png_decoding_error(error: png::DecodingError) -> IoError {
@@ -632,6 +751,9 @@ pub fn load_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
     let path = path.as_ref();
     match detect_format(path)? {
         Format::Npz => npz::read_npz_frame(path),
+        // A PNG has no stored kind or channel names, so it comes back as a greyscale intensity
+        // frame — the one representation that is not derived from events.
+        Format::Png => read_png_frame(path),
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {
@@ -736,15 +858,14 @@ mod tests {
     }
 
     #[test]
-    fn aedat4_is_unsupported_and_raw_dispatches() {
-        match load("recording.aedat4", LoadOptions::default()) {
-            Err(IoError::Unsupported(_)) => {}
-            other => panic!("expected unsupported for recording.aedat4, got {other:?}"),
+    fn aedat4_and_raw_dispatch_to_their_readers() {
+        // Both reach a reader, so the failure is the missing file rather than the format.
+        for path in ["recording.aedat4", "recording.raw"] {
+            assert!(
+                matches!(load(path, LoadOptions::default()), Err(IoError::Io(_))),
+                "{path} should dispatch into its reader"
+            );
         }
-        assert!(matches!(
-            load("recording.raw", LoadOptions::default()),
-            Err(IoError::Io(_))
-        ));
     }
 
     fn sample_source() -> MemorySliceSource {

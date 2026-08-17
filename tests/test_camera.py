@@ -13,6 +13,25 @@ import eventcv
 
 @unittest.skipUnless(eventcv.EventCamera is not None, "built without camera feature")
 class CameraApiTests(unittest.TestCase):
+    def test_enumeration_never_raises(self):
+        # The regression this file exists to prevent. `list_cameras()` used to raise on any machine
+        # whose USB subsystem could not be initialised — no camera attached, a container, a CI
+        # runner — which made a question about what is plugged in into a fatal error, and made the
+        # behaviour differ between Linux and macOS. Asking is always allowed; the answer may be
+        # nothing.
+        #
+        # `test_list_cameras_returns_a_list` below asserts the *shape* of the answer, but it only
+        # reaches its assertion on a machine where the call already worked. This asserts the call
+        # itself.
+        import warnings
+
+        with warnings.catch_warnings():
+            # A RuntimeWarning is legitimate here (a camera attached without udev rules), so it must
+            # not be promoted to an error — but nothing may be raised.
+            warnings.simplefilter("always")
+            cameras = eventcv.list_cameras()
+        self.assertIsInstance(cameras, list)
+
     def test_list_cameras_returns_a_list(self):
         cameras = eventcv.list_cameras()
         self.assertIsInstance(cameras, list)
@@ -228,6 +247,19 @@ class CameraApiTests(unittest.TestCase):
     def test_public_api_is_exported(self):
         for name in ("stream", "record", "list_cameras", "EventCamera"):
             self.assertIn(name, eventcv.__all__)
+
+    def test_auxiliary_streams_are_on_the_camera_surface(self):
+        # A DAVIS's frames and IMU reach Python under the same names, and in the same shapes, as
+        # they do from a file — so code written against a recording runs on a live camera. The
+        # decode paths need hardware; the surface does not.
+        import inspect
+
+        for name in ("read_frames", "read_imu", "n_frames", "n_imu"):
+            self.assertTrue(hasattr(eventcv.EventCamera, name), name)
+        parameters = inspect.signature(eventcv.stream).parameters
+        for name in ("frames", "imu"):
+            self.assertIn(name, parameters)
+            self.assertIs(parameters[name].default, False, f"{name} must be opt-in")
 
 
 if __name__ == "__main__":

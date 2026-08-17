@@ -23,7 +23,11 @@ use neuromorphic_drivers as nd;
 use neuromorphic_drivers::types::Polarity;
 use neuromorphic_drivers::Adapter;
 
+use neuromorphic_drivers::adapters::davis346;
+
 use crate::bias::{BiasConfig, BiasController, BiasOverrides, BiasState, BiasValues};
+use crate::io::ImuSample;
+use crate::representation::{EventFrame, EventFrameData};
 use crate::{EventStream, EventStreamBuilder};
 
 /// Device timestamps are microseconds, so one timestamp unit is `0.001` ms. Live streams carry
@@ -36,7 +40,7 @@ const TIMESTAMP_SCALE_MS: f64 = 0.001;
 const POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// A camera discovered by [`list_cameras`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CameraInfo {
     /// Machine-readable type, e.g. `"prophesee_evk4"` (the driver's module name).
     pub kind: String,
@@ -52,30 +56,73 @@ pub struct CameraInfo {
     pub speed: String,
 }
 
+/// What enumeration found, and anything worth telling the user about how it went.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CameraListing {
+    /// Connected, supported cameras. Empty is a normal answer, not a failure.
+    pub cameras: Vec<CameraInfo>,
+    /// Set only when enumeration was blocked by *permissions* rather than finding nothing — the
+    /// case where a camera is probably attached and udev rules are the fix. Callers should surface
+    /// this (as a warning, not an error): the list is still empty either way, but only here does
+    /// the emptiness mean something is wrong.
+    pub warning: Option<String>,
+}
+
 /// Enumerates every connected, supported event camera. The returned [`CameraInfo::serial`] can be
 /// passed to [`Capture::open`] to select a specific device when several are plugged in.
-pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
-    // Enumeration opens each candidate device to read its type and serial, so it fails as a whole
-    // when the host won't let us near one of them — the commonest cause by far, and one the raw
-    // libusb message ("Access denied") does not point at.
-    let listed = nd::list_devices().map_err(|error| {
-        format!(
-            "could not enumerate USB event cameras ({error}). On Linux this is usually missing \
-             udev rules for the device (see the neuromorphic-drivers README, then re-plug it); on \
-             Windows, a missing WinUSB driver for it"
-        )
-    })?;
-    Ok(listed
-        .into_iter()
-        .map(|device| CameraInfo {
-            kind: device.device_type.to_string(),
-            name: device.device_type.name().to_owned(),
-            serial: device.serial.ok(),
-            bus_number: device.bus_number,
-            address: device.address,
-            speed: speed_name(device.speed).to_owned(),
-        })
-        .collect())
+///
+/// **Never fails.** Asking what is attached is a question, and "nothing" is a valid answer — on a
+/// machine with no camera, in a container without USB passthrough, or on a CI runner with no
+/// `/dev/bus/usb` at all. Returning an error for those made a reasonable question fatal, and made
+/// the behaviour differ by platform: the same call already returned an empty list on macOS.
+///
+/// A permissions failure is different in kind — something is there and we are not allowed to look —
+/// so that comes back in [`CameraListing::warning`] rather than being silently indistinguishable.
+pub fn list_cameras() -> CameraListing {
+    let listed = match nd::list_devices() {
+        Ok(listed) => listed,
+        Err(error) => {
+            return CameraListing {
+                cameras: Vec::new(),
+                warning: enumeration_warning(error),
+            }
+        }
+    };
+    CameraListing {
+        cameras: listed
+            .into_iter()
+            .map(|device| CameraInfo {
+                kind: device.device_type.to_string(),
+                name: device.device_type.name().to_owned(),
+                serial: device.serial.ok(),
+                bus_number: device.bus_number,
+                address: device.address,
+                speed: speed_name(device.speed).to_owned(),
+            })
+            .collect(),
+        warning: None,
+    }
+}
+
+/// Decides whether an enumeration failure is worth reporting.
+///
+/// `Access` and `Busy` mean libusb saw a device and could not use it — on Linux that is almost
+/// always missing udev rules, and the raw message ("Access denied") does not say so. Everything
+/// else means there was nothing to enumerate in the first place: `Other` is what `libusb_init`
+/// returns when the usbfs backend cannot start, which is the ordinary state of a VM or container
+/// with no USB subsystem, and reporting it would cry wolf on every headless machine.
+///
+/// Split out from [`list_cameras`] so the decision is testable without a USB stack — it is the only
+/// part of enumeration with a judgement in it.
+fn enumeration_warning(error: nd::rusb::Error) -> Option<String> {
+    match error {
+        nd::rusb::Error::Access | nd::rusb::Error::Busy => Some(format!(
+            "a USB event camera appears to be attached but could not be read ({error}). On Linux \
+             this is usually missing udev rules for the device (see the neuromorphic-drivers \
+             README, then re-plug it); on Windows, a missing WinUSB driver for it"
+        )),
+        _ => None,
+    }
 }
 
 /// Turns a raw `nd::open` failure into an actionable message. The driver reports a device that is
@@ -83,7 +130,7 @@ pub fn list_cameras() -> Result<Vec<CameraInfo>, String> {
 /// a truly absent one — "no device found". So when enumeration *can* still see a supported camera,
 /// we say the device is present-but-unavailable rather than repeat the misleading "not found".
 fn open_error(serial: Option<&str>, error: impl std::fmt::Display) -> String {
-    let visible = list_cameras().unwrap_or_default();
+    let visible = list_cameras().cameras;
     let matched = match serial {
         Some(serial) => visible
             .iter()
@@ -179,9 +226,68 @@ pub enum Window {
 pub struct CaptureWindow {
     /// The events accumulated over this window.
     pub stream: EventStream,
+    /// The APS frames the sensor produced over the same span, `(t_us, frame)`. Empty unless the
+    /// camera was opened with [`Aux::new`]`(frames: true, …)` and the sensor has an APS array.
+    pub frames: Vec<(i64, EventFrame)>,
+    /// The IMU samples over the same span, on the same clock as the events.
+    pub imu: Vec<ImuSample>,
     /// `true` when the device's ring buffer overflowed just before this window — some events were
     /// dropped by the driver. Surfaced so callers can warn rather than lose data silently.
     pub first_after_overflow: bool,
+}
+
+/// The frame and IMU streams a DAVIS interleaves with its events, gathered over one decode pass.
+///
+/// Both are opt-in. Collecting them is not free — an APS frame is a copy of the whole array out
+/// of the decode buffer — and most captures only want events, so an unwanted callback returns
+/// without touching anything. Sensors that produce neither (Prophesee) never call in at all.
+#[derive(Clone, Debug, Default)]
+pub struct Aux {
+    frames: Vec<(i64, EventFrame)>,
+    imu: Vec<ImuSample>,
+    want_frames: bool,
+    want_imu: bool,
+}
+
+impl Aux {
+    pub fn new(frames: bool, imu: bool) -> Self {
+        Self {
+            want_frames: frames,
+            want_imu: imu,
+            ..Self::default()
+        }
+    }
+
+    /// Whether either stream was asked for — the callers' cheap test for "is any of this worth
+    /// doing", so a plain event capture keeps the code path it had.
+    pub fn wanted(&self) -> bool {
+        self.want_frames || self.want_imu
+    }
+
+    /// Takes what has accumulated, leaving the collector armed for the next pass.
+    fn take(&mut self) -> (Vec<(i64, EventFrame)>, Vec<ImuSample>) {
+        (
+            std::mem::take(&mut self.frames),
+            std::mem::take(&mut self.imu),
+        )
+    }
+}
+
+/// The driver hands frames over as raw 16-bit samples: correlated double sampling and the
+/// sensor's orientation are already applied, and the 10-bit result is left shifted into the top
+/// of the word. Shifting it back down puts live frames on the same 0..1023 scale AEDAT
+/// recordings use, so the same code reads either.
+const APS_SAMPLE_SHIFT: u32 = 6;
+
+/// The driver already reports the IMU in SI units — it scales the raw readings by the full-scale
+/// setting it configured — so this is a copy, not a conversion. The DAVIS346 and DVXplorer
+/// adapters report the same record under two distinct types, hence the loose scalars.
+fn imu_sample(t: u64, accelerometer: [f32; 3], gyroscope: [f32; 3]) -> ImuSample {
+    ImuSample {
+        t_us: t as i64,
+        angular_velocity: gyroscope.map(f64::from),
+        linear_acceleration: accelerometer.map(f64::from),
+    }
 }
 
 /// Accumulates decoded events into [`CaptureWindow`]s. Split out from the USB plumbing so its
@@ -199,6 +305,11 @@ struct Windower {
     pending: VecDeque<CaptureWindow>,
     /// Carries a pending overflow flag onto the next sealed window.
     overflow_pending: bool,
+    /// APS frames and IMU samples decoded since the last seal; they ride out on the window that
+    /// covers them. Bounding them is the same problem as bounding the events, and this is the
+    /// same answer: a consumer that stops taking windows stops the whole queue growing.
+    frames: Vec<(i64, EventFrame)>,
+    imu: Vec<ImuSample>,
 }
 
 impl Windower {
@@ -217,7 +328,15 @@ impl Windower {
             next_boundary_t: None,
             pending: VecDeque::new(),
             overflow_pending: false,
+            frames: Vec::new(),
+            imu: Vec::new(),
         }
+    }
+
+    /// Stages the auxiliary streams from one decode pass onto the window currently filling.
+    fn push_aux(&mut self, frames: Vec<(i64, EventFrame)>, imu: Vec<ImuSample>) {
+        self.frames.extend(frames);
+        self.imu.extend(imu);
     }
 
     /// Records that the device ring overflowed; the flag rides along on the next sealed window.
@@ -285,14 +404,17 @@ impl Windower {
         let builder = std::mem::replace(&mut self.builder, fresh);
         self.pending.push_back(CaptureWindow {
             stream: builder.build(),
+            frames: std::mem::take(&mut self.frames),
+            imu: std::mem::take(&mut self.imu),
             first_after_overflow: self.overflow_pending,
         });
         self.overflow_pending = false;
     }
 
-    /// Seals a final partial window (called when the stream stops).
+    /// Seals a final partial window (called when the stream stops), including one holding only
+    /// frames or IMU samples — a DAVIS staring at a still scene emits those and nothing else.
     fn flush(&mut self) {
-        if !self.builder.is_empty() {
+        if !self.builder.is_empty() || !self.frames.is_empty() || !self.imu.is_empty() {
             self.seal();
         }
     }
@@ -360,6 +482,8 @@ pub struct Capture {
     mask: Option<Vec<bool>>,
     /// The [`Limits::roi`] rectangle this camera was opened with, and where it is enforced.
     roi: Option<((usize, usize, usize, usize), RoiPlacement)>,
+    /// Collects the APS and IMU streams when [`collect_aux`](Self::collect_aux) turned them on.
+    aux: Aux,
     width: usize,
     height: usize,
     name: String,
@@ -436,6 +560,7 @@ impl Capture {
                 };
                 (rect, placement)
             }),
+            aux: Aux::default(),
             width,
             height,
             name,
@@ -455,6 +580,22 @@ impl Capture {
     /// in use.
     pub fn roi(&self) -> Option<((usize, usize, usize, usize), RoiPlacement)> {
         self.roi
+    }
+
+    /// Starts (or stops) collecting the APS frames and IMU samples a DAVIS produces alongside its
+    /// events. Off by default — a frame is a copy of the whole array out of the decode buffer,
+    /// and most captures only want events. Collected data reaches the caller on the
+    /// [`CaptureWindow`] covering it, or through [`take_aux`](Self::take_aux) on the unwindowed
+    /// drain paths.
+    pub fn collect_aux(&mut self, frames: bool, imu: bool) {
+        self.aux = Aux::new(frames, imu);
+    }
+
+    /// Takes the frames and IMU samples decoded since the last call — the drain-path counterpart
+    /// to reading them off a [`CaptureWindow`], for consumers (the live viewer) that bypass
+    /// windowing entirely.
+    pub fn take_aux(&mut self) -> (Vec<(i64, EventFrame)>, Vec<ImuSample>) {
+        self.aux.take()
     }
 
     /// A snapshot of the adaptive-bias controller, or `None` when the camera was opened without it.
@@ -583,18 +724,21 @@ impl Capture {
             }
             let slice = view.slice;
             // Disjoint field borrows: `slice` borrows `self.device`, the closure borrows
-            // `self.windower`, and `convert_buffer` borrows `self.adapter`.
+            // `self.windower`, and `convert_buffer` borrows `self.adapter` and `self.aux`.
             let windower = &mut self.windower;
             convert_buffer(
                 &mut self.adapter,
                 slice,
                 self.mask.as_deref(),
-                self.width,
+                (self.width, self.height),
                 |x, y, t, polarity| {
                     events += 1;
                     windower.push(x, y, t, polarity)
                 },
+                &mut self.aux,
             );
+            let (frames, imu) = self.aux.take();
+            self.windower.push_aux(frames, imu);
             // Flush the current window if its boundary has passed, so a mid-window pause doesn't
             // stall delivery. `current_t` advances with the device clock even during quiet periods.
             let current_t = self.adapter.current_t() as i64;
@@ -629,12 +773,15 @@ impl Capture {
                 &mut self.adapter,
                 slice,
                 self.mask.as_deref(),
-                self.width,
+                (self.width, self.height),
                 |x, y, t, polarity| {
                     events += 1;
                     windower.push(x, y, t, polarity)
                 },
+                &mut self.aux,
             );
+            let (frames, imu) = self.aux.take();
+            self.windower.push_aux(frames, imu);
             true
         } else {
             false
@@ -682,11 +829,12 @@ impl Capture {
                 &mut self.adapter,
                 view.slice,
                 self.mask.as_deref(),
-                self.width,
+                (self.width, self.height),
                 |x, y, t, polarity| {
                     events += 1;
                     on_event(x, y, t, polarity)
                 },
+                &mut self.aux,
             );
         }
         self.tick_bias(events, false);
@@ -730,11 +878,12 @@ impl Capture {
                 &mut self.adapter,
                 view.slice,
                 self.mask.as_deref(),
-                self.width,
+                (self.width, self.height),
                 |x, y, t, polarity| {
                     events += 1;
                     on_event(x, y, t, polarity)
                 },
+                &mut self.aux,
             );
             if start.elapsed() >= budget {
                 decoding = false;
@@ -967,19 +1116,24 @@ fn evk4_with_biases(
 }
 
 /// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity
-/// event as `(x, y, t_us, positive)` and discarding the IMU/trigger/APS streams. The single place
-/// the per-device adapter variants are matched, shared by every decode path above.
+/// event as `(x, y, t_us, positive)` and collecting into `aux` whichever of the APS and IMU
+/// streams were asked for (trigger events are still dropped). The single place the per-device
+/// adapter variants are matched, shared by every decode path above.
 ///
 /// Events outside `mask` (row-major `width`-wide, `true` = keep) are dropped here rather than
 /// downstream, so the one filter covers windowing, recording, and the live view — and the callers'
-/// event counters, which pace the bias controller, track the events actually kept.
+/// event counters, which pace the bias controller, track the events actually kept. The mask is
+/// deliberately *not* applied to frames: an ROI is a statement about which events are interesting,
+/// and a partly blanked image would be a strange thing to hand back.
 fn convert_buffer(
     adapter: &mut Adapter,
     slice: &[u8],
     mask: Option<&[bool]>,
-    width: usize,
+    size: (usize, usize),
     mut on_event: impl FnMut(u16, u16, i64, bool),
+    aux: &mut Aux,
 ) {
+    let (width, height) = size;
     let handle = |event: nd::types::PolarityEvent<u64, u16, u16>| {
         if let Some(mask) = mask {
             if mask.get(event.y as usize * width + event.x as usize) != Some(&true) {
@@ -993,12 +1147,63 @@ fn convert_buffer(
             matches!(event.polarity, Polarity::On),
         );
     };
+    // Destructured so the frame and IMU closures borrow different fields — `convert` takes them
+    // as separate arguments, so one shared `&mut aux` would not compile.
+    let Aux {
+        frames,
+        imu,
+        want_frames,
+        want_imu,
+    } = aux;
+    let (want_frames, want_imu) = (*want_frames, *want_imu);
+    let mut on_frame = |event: davis346::FrameEvent| {
+        if !want_frames || event.pixels.len() != width * height {
+            return;
+        }
+        let samples = event.pixels.iter().map(|s| s >> APS_SAMPLE_SHIFT).collect();
+        if let Ok(frame) = EventFrame::intensity(EventFrameData::U16(samples), width, height) {
+            frames.push((event.start_t as i64, frame));
+        }
+    };
     match adapter {
         Adapter::Evt3(adapter) => adapter.convert(slice, handle, |_trigger| {}),
-        Adapter::Dvxplorer(adapter) => adapter.convert(slice, handle, |_imu| {}, |_trigger| {}),
-        Adapter::Davis346(adapter) => {
-            adapter.convert(slice, handle, |_imu| {}, |_trigger| {}, |_frame| {})
-        }
+        Adapter::Dvxplorer(adapter) => adapter.convert(
+            slice,
+            handle,
+            |event| {
+                if want_imu {
+                    imu.push(imu_sample(
+                        event.t,
+                        [
+                            event.accelerometer_x,
+                            event.accelerometer_y,
+                            event.accelerometer_z,
+                        ],
+                        [event.gyroscope_x, event.gyroscope_y, event.gyroscope_z],
+                    ));
+                }
+            },
+            |_trigger| {},
+        ),
+        Adapter::Davis346(adapter) => adapter.convert(
+            slice,
+            handle,
+            |event| {
+                if want_imu {
+                    imu.push(imu_sample(
+                        event.t,
+                        [
+                            event.accelerometer_x,
+                            event.accelerometer_y,
+                            event.accelerometer_z,
+                        ],
+                        [event.gyroscope_x, event.gyroscope_y, event.gyroscope_z],
+                    ));
+                }
+            },
+            |_trigger| {},
+            &mut on_frame,
+        ),
     }
 }
 
@@ -1154,5 +1359,93 @@ mod tests {
 
         assert!(windower.pending[0].first_after_overflow);
         assert!(!windower.pending[1].first_after_overflow);
+    }
+
+    #[test]
+    fn auxiliary_streams_seal_with_the_window_that_covers_them() {
+        use super::{Aux, ImuSample};
+        use crate::representation::{EventFrame, EventFrameData};
+
+        let sample = |t_us| ImuSample {
+            t_us,
+            angular_velocity: [0.0; 3],
+            linear_acceleration: [0.0; 3],
+        };
+        let frame = || EventFrame::intensity(EventFrameData::U16(vec![0; 4]), 2, 2).unwrap();
+
+        let mut windower = Windower::new(10, 10, Window::Count(2));
+        windower.push_aux(vec![(5, frame())], vec![sample(5)]);
+        windower.push(1, 1, 5, true);
+        windower.push(2, 2, 6, true); // seals here
+        windower.push_aux(vec![(20, frame())], vec![sample(20)]);
+        windower.push(3, 3, 20, true);
+        windower.flush();
+
+        assert_eq!(windower.pending.len(), 2);
+        assert_eq!(windower.pending[0].frames.len(), 1);
+        assert_eq!(windower.pending[0].imu, [sample(5)]);
+        // The second window's aux must not have leaked into the first, nor been carried over.
+        assert_eq!(windower.pending[1].frames.len(), 1);
+        assert_eq!(windower.pending[1].imu, [sample(20)]);
+
+        // A window that holds only frames still gets flushed: a DAVIS on a still scene emits
+        // APS and IMU while producing no events at all.
+        let mut idle = Windower::new(10, 10, Window::Count(2));
+        idle.push_aux(vec![(1, frame())], Vec::new());
+        idle.flush();
+        assert_eq!(idle.pending.len(), 1);
+        assert!(idle.pending[0].stream.is_empty());
+
+        // Nothing is collected unless it was asked for.
+        assert!(!Aux::default().wanted());
+        assert!(Aux::new(true, false).wanted());
+    }
+
+    #[test]
+    fn only_permission_failures_warn() {
+        use neuromorphic_drivers::rusb::Error;
+
+        // A device is there and we are not allowed to touch it — the genuine udev case, and the
+        // only one where an empty list means something is wrong.
+        for error in [Error::Access, Error::Busy] {
+            let warning = super::enumeration_warning(error).expect("should warn");
+            assert!(warning.contains("udev"), "{warning}");
+            assert!(warning.contains("attached"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn an_absent_usb_stack_is_silent() {
+        use neuromorphic_drivers::rusb::Error;
+
+        // `Other` is what `libusb_init` returns when the usbfs backend cannot start — the ordinary
+        // state of a VM, a container without USB passthrough, or a CI runner. Warning about it
+        // would cry wolf on every headless machine, which is exactly what broke CI.
+        for error in [
+            Error::Other,
+            Error::NoDevice,
+            Error::NotFound,
+            Error::NotSupported,
+            Error::Io,
+        ] {
+            assert_eq!(
+                super::enumeration_warning(error),
+                None,
+                "{error:?} should be silent"
+            );
+        }
+    }
+
+    #[test]
+    fn enumeration_never_fails() {
+        // The contract the docstring always promised and the implementation did not keep. This runs
+        // on any machine — with a camera, without one, or with no USB subsystem at all — and must
+        // return a list every time.
+        let listing = super::list_cameras();
+        // A warning is only legitimate alongside an empty list: if we could see cameras, nothing
+        // was blocked.
+        if listing.warning.is_some() {
+            assert!(listing.cameras.is_empty());
+        }
     }
 }
