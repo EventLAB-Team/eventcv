@@ -39,16 +39,22 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(_declared(ROOT / "crates" / "eventcv-core" / "Cargo.toml"), expected)
 
     def test_features_list_what_was_built_in(self):
-        # Published wheels carry all three; a plain `cargo build` of the bindings carries none.
+        # Published wheels carry all four; a plain `cargo build` of the bindings carries none.
         features = eventcv._rust.__features__
         self.assertIsInstance(features, list)
-        self.assertLessEqual(set(features), {"hdf5", "camera", "onnx"})
-        # Whatever they say must match what the module actually exposes.
-        self.assertEqual("hdf5" in features, eventcv.EventSink is not None)
+        self.assertLessEqual(set(features), {"hdf5", "camera", "onnx", "gpu"})
+        # Whatever they say must match what the module actually exposes. `FrameSink` is the
+        # HDF5-only class — `EventSink` writes every event format now, so it is always bound and
+        # proves nothing about HDF5.
+        self.assertEqual("hdf5" in features, eventcv.FrameSink is not None)
         self.assertEqual("camera" in features, eventcv.EventCamera is not None)
         # `Model` is always bound — to the real class, or to a stub that explains the rebuild —
         # so presence of the name proves nothing and the check has to be for the working one.
         self.assertEqual("onnx" in features, eventcv.Model is getattr(eventcv._rust, "Model", None))
+        # `gpu` says the shaders were compiled in, not that a device exists, so the only thing that
+        # must hold is the one direction: no feature, no adapter.
+        if eventcv.gpu_available():
+            self.assertIn("gpu", features)
 
 
 class CommandLineTests(unittest.TestCase):

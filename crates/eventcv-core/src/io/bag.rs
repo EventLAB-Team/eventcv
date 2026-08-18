@@ -208,7 +208,9 @@ pub fn write_bag(
 pub struct BagEventSink {
     path: PathBuf,
     scratch: PathBuf,
-    payload: BufWriter<File>,
+    /// An `Option` so the handle can be closed *before* the scratch file is removed: unlinking a
+    /// file that is still open is fine on Unix and fails on Windows.
+    payload: Option<BufWriter<File>>,
     payload_len: u64,
     topic: String,
     /// `(start time, byte offset within the payload)` for every message written.
@@ -234,13 +236,20 @@ impl BagEventSink {
         Ok(Self {
             path,
             scratch,
-            payload,
+            payload: Some(payload),
             payload_len: connection.len() as u64,
             topic,
             index_entries: Vec::new(),
             sensor_size: None,
             span: None,
             n_events: 0,
+        })
+    }
+
+    /// The open payload writer, or an error if the sink has already been finished.
+    fn payload(&mut self) -> Result<&mut BufWriter<File>, IoError> {
+        self.payload.as_mut().ok_or_else(|| {
+            IoError::Io(std::io::Error::other("this rosbag sink has already been finished"))
         })
     }
 
@@ -261,7 +270,7 @@ impl BagEventSink {
         })?;
         let message = serialize_event_array(stream, start, end);
         let record = make_record(&message_fields(CONN_ID, stamp), &message);
-        self.payload.write_all(&record).map_err(IoError::Io)?;
+        self.payload()?.write_all(&record).map_err(IoError::Io)?;
         self.payload_len += record.len() as u64;
         self.index_entries.push((stamp, offset));
         Ok(())
@@ -270,6 +279,9 @@ impl BagEventSink {
 
 impl Drop for BagEventSink {
     fn drop(&mut self) {
+        // Closed before it is removed, for the same reason `finish` closes it: Windows refuses to
+        // unlink an open file, and a sink dropped without `finish` would leave the scratch behind.
+        drop(self.payload.take());
         let _ = std::fs::remove_file(&self.scratch);
     }
 }
@@ -304,7 +316,7 @@ impl super::EventSink for BagEventSink {
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
-        self.payload.flush().map_err(IoError::Io)
+        self.payload()?.flush().map_err(IoError::Io)
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), IoError> {
@@ -315,7 +327,11 @@ impl super::EventSink for BagEventSink {
             let empty = EventStreamBuilder::new(width, height, 0.001).build();
             self.write_message(&empty, 0, 0)?;
         }
-        self.payload.flush().map_err(IoError::Io)?;
+        // Closed rather than merely flushed: the scratch file is about to be read back into the
+        // bag, and Windows will not let that happen through a second handle while this one is open.
+        if let Some(mut payload) = self.payload.take() {
+            payload.flush().map_err(IoError::Io)?;
+        }
         let payload_len = u32::try_from(self.payload_len).map_err(|_| {
             IoError::Unsupported(
                 "a ROS bag chunk is limited to 4 GB by its 32-bit size field; record to \

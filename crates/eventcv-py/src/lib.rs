@@ -51,6 +51,8 @@ const FEATURES: &[&str] = &[
     "camera",
     #[cfg(feature = "onnx")]
     "onnx",
+    #[cfg(feature = "gpu")]
+    "gpu",
 ];
 
 /// Events read per pass when converting a whole `EventReader` to another format. Large enough
@@ -1410,7 +1412,7 @@ fn parse_compression(value: Option<&Bound<'_, PyAny>>) -> PyResult<Compression> 
 /// Deliberately the opposite default to [`parse_compression`]. A capture is racing a sensor that
 /// does not wait, so it would rather spend disk than risk falling behind; a `save` has already
 /// finished computing and only has to be small.
-#[cfg(all(feature = "camera", feature = "hdf5"))]
+#[cfg(feature = "camera")]
 fn capture_compression(level: Option<u8>) -> Compression {
     match level {
         None | Some(0) => Compression::None,
@@ -4965,7 +4967,7 @@ const LIVE_RENDER_INTERVAL_MS: u64 = 16;
 
 /// How often a continuous recording is forced out to disk, so a crash mid-session keeps everything
 /// captured up to about a second ago. Shared by `record()` and `stream(record=…)`.
-#[cfg(all(feature = "camera", feature = "hdf5"))]
+#[cfg(feature = "camera")]
 const RECORD_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What the live viewer is opened for: watching the stream (`show`) or drawing an ROI over it
@@ -5223,33 +5225,18 @@ fn note_overflow() {
 /// The open file behind `stream(record=…)` plus its flush clock: every window the camera hands out
 /// is appended here before it is rendered, so one loop both archives the raw events and processes
 /// representations.
-#[cfg(all(feature = "camera", feature = "hdf5"))]
+///
+/// The sink is whichever writer the path's extension names — the same `open_sink` that backs
+/// `eventcv.EventSink` and `save`. It used to be an `Hdf5EventSink`, because HDF5 was the only
+/// format that could be appended to; now that every one of them can, recording to a `.aedat4` or a
+/// `.raw` writes that format rather than an HDF5 file wearing its extension.
+#[cfg(feature = "camera")]
 pub(crate) struct Recorder {
-    sink: eventcv_core::io::Hdf5EventSink,
+    sink: Box<dyn eventcv_core::io::EventSink>,
     last_flush: std::time::Instant,
 }
 
-/// Without HDF5 there is nothing to record into — `stream(record=…)` is rejected up front, so this
-/// placeholder only exists to keep the camera's plumbing free of feature gates.
-#[cfg(all(feature = "camera", not(feature = "hdf5")))]
-pub(crate) struct Recorder;
-
-#[cfg(all(feature = "camera", not(feature = "hdf5")))]
-impl Recorder {
-    pub(crate) fn append(&mut self, _stream: &EventStream) -> Result<(), IoError> {
-        Ok(())
-    }
-
-    pub(crate) fn n_events(&self) -> usize {
-        0
-    }
-
-    pub(crate) fn finish(self) -> Result<(), IoError> {
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "camera", feature = "hdf5"))]
+#[cfg(feature = "camera")]
 impl Recorder {
     /// Checks a `record=` request without touching the filesystem, so a typo is rejected before the
     /// camera is opened — and with the same error whether or not a device is attached.
@@ -5269,10 +5256,15 @@ impl Recorder {
         Ok(())
     }
 
+    /// Opens the file. `compression` only reaches the HDF5 writer; the other formats have no
+    /// equivalent knob and ignore it.
     fn open(path: &str, compression: Option<u8>) -> PyResult<Self> {
+        let options = SaveOptions {
+            compression: capture_compression(compression),
+            ..SaveOptions::default()
+        };
         Ok(Self {
-            sink: eventcv_core::io::Hdf5EventSink::open(path, capture_compression(compression))
-                .map_err(map_io_error)?,
+            sink: eventcv_core::io::open_sink(path, &options).map_err(map_io_error)?,
             last_flush: std::time::Instant::now(),
         })
     }
@@ -5291,7 +5283,8 @@ impl Recorder {
         self.sink.n_events()
     }
 
-    /// Flushes and closes the recording.
+    /// Flushes and closes the recording. npz and rosbag only become readable here, since both have
+    /// something to write at the end; the rest were already complete after the last window.
     pub(crate) fn finish(self) -> Result<(), IoError> {
         self.sink.finish()
     }
@@ -5691,12 +5684,10 @@ impl PyEventCamera {
                  first, or drop record= from stream() and use camera.record({path:?}) alone"
             )));
         }
-        #[cfg(feature = "hdf5")]
-        if eventcv_core::io::supports_event_append(path) {
-            return self.record_streaming(py, path, seconds, compression);
-        }
-        let _ = compression; // only the HDF5 streaming path compresses; buffered formats ignore it.
-        self.record_buffered(py, path, seconds)
+        // Validated first so a path that is not an event file is refused now rather than after the
+        // capture has run; every event format streams, so there is no buffered fallback left.
+        Recorder::validate(path, compression)?;
+        self.record_streaming(py, path, seconds, compression)
     }
 
     /// Headless diagnostic: splits the cost of a captured event into **parsing** it out of the
@@ -6114,10 +6105,9 @@ impl PyEventCamera {
         }
     }
 
-    /// Streams the capture straight to an [`Hdf5EventSink`], appending each polled window to disk
+    /// Streams the capture straight to disk through a [`Recorder`], appending each polled window
     /// and flushing about once a second, so nothing accumulates in memory. Stops on the deadline or
     /// `Ctrl+C`, keeping whatever was already written.
-    #[cfg(feature = "hdf5")]
     fn record_streaming(
         &mut self,
         py: Python<'_>,
@@ -6126,9 +6116,7 @@ impl PyEventCamera {
         compression: Option<u8>,
     ) -> PyResult<usize> {
         let capture = self.parked_capture()?;
-        let mut sink =
-            eventcv_core::io::Hdf5EventSink::open(path, capture_compression(compression))
-                .map_err(map_io_error)?;
+        let mut sink = Recorder::open(path, compression)?;
         // The loop is kept separate so the sink is flushed and closed on *both* exits: a write
         // error used to return through `?` and drop it unfinished, losing the last second.
         let result = Self::fill_sink(py, capture, &mut sink, seconds);
@@ -6140,31 +6128,26 @@ impl PyEventCamera {
     }
 
     /// Polls the camera into `sink` until the deadline or `Ctrl+C`, flushing about once a second.
-    #[cfg(feature = "hdf5")]
     fn fill_sink(
         py: Python<'_>,
         capture: &mut eventcv_core::device::Capture,
-        sink: &mut eventcv_core::io::Hdf5EventSink,
+        sink: &mut Recorder,
         seconds: Option<f64>,
     ) -> PyResult<()> {
         let deadline =
             seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-        let mut last_flush = std::time::Instant::now();
         loop {
             match py.detach(|| capture.poll()) {
                 Ok(Some(window)) => {
                     if window.first_after_overflow {
                         note_overflow();
                     }
+                    // `Recorder::append` carries the flush clock, so there is no second one here.
                     py.detach(|| sink.append(&window.stream))
                         .map_err(map_io_error)?;
                 }
                 Ok(None) => {}
                 Err(message) => return Err(PyRuntimeError::new_err(message)),
-            }
-            if last_flush.elapsed() >= RECORD_FLUSH_INTERVAL {
-                py.detach(|| sink.flush()).map_err(map_io_error)?;
-                last_flush = std::time::Instant::now();
             }
             if let Some(deadline) = deadline {
                 if std::time::Instant::now() >= deadline {
@@ -6185,64 +6168,6 @@ impl PyEventCamera {
         Ok(())
     }
 
-    /// Buffers the whole recording in memory and writes it once at the end via `save_stream`. Used
-    /// for formats that can't be appended incrementally (npz/txt/bag).
-    fn record_buffered(
-        &mut self,
-        py: Python<'_>,
-        path: &str,
-        seconds: Option<f64>,
-    ) -> PyResult<usize> {
-        let capture = self.parked_capture()?;
-        let mut builder = EventStreamBuilder::new(capture.width(), capture.height(), 0.001);
-        let deadline =
-            seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-        loop {
-            match py.detach(|| capture.poll()) {
-                Ok(Some(window)) => {
-                    if window.first_after_overflow {
-                        note_overflow();
-                    }
-                    for event in window.stream.iter() {
-                        builder.push(
-                            event.x as u16,
-                            event.y as u16,
-                            event.timestamp as i64,
-                            event.polarity,
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(message) => return Err(PyRuntimeError::new_err(message)),
-            }
-            if let Some(deadline) = deadline {
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-            }
-            // Ctrl+C stops the recording and saves what was captured, rather than discarding it.
-            if py.check_signals().is_err() {
-                break;
-            }
-        }
-        // The recording ends here, so the window still filling belongs in it.
-        for window in drain_tail(capture) {
-            for event in window.stream.iter() {
-                builder.push(
-                    event.x as u16,
-                    event.y as u16,
-                    event.timestamp as i64,
-                    event.polarity,
-                );
-            }
-        }
-        let count = builder.len();
-        let stream = builder.build();
-        let options = SaveOptions::default();
-        py.detach(|| eventcv_core::io::save_stream(path, &stream, &options))
-            .map_err(map_io_error)?;
-        Ok(count)
-    }
 }
 
 /// Validates the source-side caps before the camera is opened, so a bad rate or rectangle raises
@@ -6513,16 +6438,9 @@ fn stream(
             )?)
         }
     };
-    #[cfg(feature = "hdf5")]
+    // Before the device is opened, so a typo is rejected the same way with or without hardware.
     if let Some(path) = record.as_deref() {
         Recorder::validate(path, compression)?;
-    }
-    #[cfg(not(feature = "hdf5"))]
-    if record.is_some() {
-        let _ = compression;
-        return Err(PyRuntimeError::new_err(
-            "record= needs HDF5 support, which this build of eventcv was compiled without",
-        ));
     }
     let limits = parse_limits(max_event_rate, roi)?;
     let bias = parse_adaptive_bias(adaptive_bias)?;
@@ -6572,13 +6490,10 @@ fn stream(
     };
     capture.collect_aux(frames, imu);
     // Created only now, so a failed camera open never leaves an empty recording behind.
-    #[cfg(feature = "hdf5")]
     let recorder = record
         .as_deref()
         .map(|path| Recorder::open(path, compression))
         .transpose()?;
-    #[cfg(not(feature = "hdf5"))]
-    let recorder = None;
     Ok(PyEventCamera {
         name: capture.name().to_owned(),
         serial: capture.serial().to_owned(),
@@ -6693,8 +6608,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // having in a bug report. `tests/test_version.py` keeps it in step with pyproject.toml.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // Which optional features this build has, so `eventcv --version` can say whether HDF5 reading,
-    // USB camera streaming and ONNX inference are actually compiled in (the published wheels have
-    // all three).
+    // USB camera streaming, ONNX inference and the GPU kernels are actually compiled in (the
+    // published wheels have all four). `gpu` here means the shaders were built, not that an
+    // adapter exists — `eventcv.gpu_available()` is what answers that.
     m.add("__features__", FEATURES)?;
     m.add_class::<PyEventStream>()?;
     m.add_class::<PyEventFrame>()?;

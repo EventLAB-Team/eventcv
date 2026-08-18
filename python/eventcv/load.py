@@ -427,12 +427,18 @@ def stream(
     override — ``stream(dt_ms=50, repr="tencode", window_ms=20)`` keeps only the newest 20 ms. In
     ``max_events`` mode there is no fixed duration, so the 30 ms defaults stand.
 
-    Pass ``record`` (an ``.h5``/``.hdf5`` path) to archive the session while you work: every window
-    the loop reads has its **raw** events appended to that file first, so a ``repr=`` loop processes
-    representations live and still keeps the full-resolution recording for later. Writing happens in
-    Rust as each window is polled — no per-window Python round trip — and is flushed about once a
-    second, so a crash keeps everything up to a second ago. ``compression`` is an optional gzip level
-    (``0..=9``); omit it for the fastest writes. The file is closed by :meth:`EventCamera.close` or
+    Pass ``record`` (a path in any event format :func:`save` writes — ``.h5``, ``.npz``, ``.txt``,
+    ``.csv``, ``.bag``, ``.aedat``, ``.aedat4``, ``.dat``, ``.raw``) to archive the session while you
+    work: every window the loop reads has its **raw** events appended to that file first, so a
+    ``repr=`` loop processes representations live and still keeps the full-resolution recording for
+    later. Writing happens in Rust as each window is polled — no per-window Python round trip — and
+    is flushed about once a second, so a crash keeps everything up to a second ago.
+
+    Formats differ in *when* the file becomes readable, which matters for a capture that might be
+    interrupted: HDF5, text, AEDAT and the Prophesee formats append straight to disk and are a valid
+    recording after every window, while npz and rosbag have a header or an index to write at the end
+    and are only complete once the camera is closed. ``compression`` is an optional gzip level
+    (``0..=9``) for HDF5; omit it for the fastest writes. The file is closed by :meth:`EventCamera.close` or
     the ``with`` block, and :attr:`EventCamera.n_recorded` counts what has been written. Only windows
     that are actually read are recorded (``show()`` doesn't poll them); to record without a loop, use
     :meth:`EventCamera.record` instead.
@@ -569,9 +575,9 @@ def stream(
                 slow_inference(cam.read().numpy())
             print(cam.n_skipped, "windows skipped,", cam.n_recorded, "events recorded")
 
-        # Record continuously, straight to disk (HDF5 streams window-by-window, never buffering
-        # the whole session), stopping after 10 s or on Ctrl+C. `eventcv.record` is the one-shot
-        # form of this and closes the camera for you:
+        # Record continuously, straight to disk (window-by-window, never buffering the whole
+        # session), stopping after 10 s or on Ctrl+C. `eventcv.record` is the one-shot form of
+        # this and closes the camera for you:
         eventcv.record("session.h5", seconds=10)
 
         # Or drive the recorder yourself with an EventSink, mixing capture and processing:
@@ -669,9 +675,10 @@ def record(
         ecv.record("session.h5", seconds=10)
         reader = ecv.open("session.h5", dt_ms=50)      # safe: nothing is still writing
 
-    The format follows the extension, as in :func:`save`. ``.h5``/``.hdf5`` targets are written
-    continuously, window-by-window (``compression`` is an optional gzip level ``0..=9``); npz, txt,
-    and bag buffer the whole session in memory and write once at the end.
+    The format follows the extension, as in :func:`save`, and every one of them is written
+    continuously, window-by-window — a recording is never held in memory, however long it runs.
+    ``compression`` is an optional gzip level (``0..=9``) for HDF5. npz and bag are the two that
+    only become readable once the recording closes, since both have something to write at the end.
 
     Everything :func:`stream` takes about *what the sensor sends* applies — ``serial``, ``dt_ms`` /
     ``max_events``, ``roi``, ``mask``, ``max_event_rate``, ``adaptive_bias``. The representation and

@@ -161,11 +161,24 @@ fn npy_header(descr: &str, len: usize) -> Vec<u8> {
 }
 
 /// One event column being spilled to a scratch file while the recording is still open.
+///
+/// The writer is an `Option` so it can be closed *before* the scratch file is removed. Unlinking a
+/// file that still has an open handle is fine on Unix and fails on Windows, which would leave a
+/// recording's worth of `.part` files behind.
 struct Column {
     descr: &'static str,
     name: &'static str,
     path: std::path::PathBuf,
-    writer: std::io::BufWriter<File>,
+    writer: Option<std::io::BufWriter<File>>,
+}
+
+impl Column {
+    /// The open writer, or an error if the sink has already been finished.
+    fn writer(&mut self) -> Result<&mut std::io::BufWriter<File>, IoError> {
+        self.writer.as_mut().ok_or_else(|| {
+            IoError::Io(std::io::Error::other("this npz sink has already been finished"))
+        })
+    }
 }
 
 /// Writes a native EventCV `.npz` a window at a time — the streaming form of
@@ -196,7 +209,9 @@ impl NpzEventSink {
                 Ok(Column {
                     descr,
                     name,
-                    writer: std::io::BufWriter::new(File::create(&part).map_err(IoError::Io)?),
+                    writer: Some(std::io::BufWriter::new(
+                        File::create(&part).map_err(IoError::Io)?,
+                    )),
                     path: part,
                 })
             })
@@ -229,8 +244,10 @@ impl NpzEventSink {
 impl Drop for NpzEventSink {
     fn drop(&mut self) {
         // A sink dropped without `finish` leaves no archive; the scratch files would otherwise
-        // outlive it as several gigabytes of nothing.
-        for column in &self.columns {
+        // outlive it as several gigabytes of nothing. Closed before they are removed, because
+        // Windows refuses to unlink a file that is still open.
+        for column in &mut self.columns {
+            drop(column.writer.take());
             let _ = std::fs::remove_file(&column.path);
         }
     }
@@ -244,25 +261,23 @@ impl super::EventSink for NpzEventSink {
         self.metadata
             .get_or_insert_with(|| (stream.sensor_size(), stream.timestamp_scale_ms()));
         let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
-        for value in ts {
-            self.columns[0]
-                .writer
-                .write_all(&value.to_le_bytes())
-                .map_err(IoError::Io)?;
-        }
-        for (column, values) in self.columns[1..3].iter_mut().zip([xs, ys]) {
-            for value in values {
-                column
-                    .writer
-                    .write_all(&value.to_le_bytes())
-                    .map_err(IoError::Io)?;
+        {
+            let writer = self.columns[0].writer()?;
+            for value in ts {
+                writer.write_all(&value.to_le_bytes()).map_err(IoError::Io)?;
             }
         }
-        for &value in ps {
-            self.columns[3]
-                .writer
-                .write_all(&[u8::from(value)])
-                .map_err(IoError::Io)?;
+        for (column, values) in self.columns[1..3].iter_mut().zip([xs, ys]) {
+            let writer = column.writer()?;
+            for value in values {
+                writer.write_all(&value.to_le_bytes()).map_err(IoError::Io)?;
+            }
+        }
+        {
+            let writer = self.columns[3].writer()?;
+            for &value in ps {
+                writer.write_all(&[u8::from(value)]).map_err(IoError::Io)?;
+            }
         }
         self.n_events += stream.len();
         Ok(())
@@ -274,14 +289,18 @@ impl super::EventSink for NpzEventSink {
 
     fn flush(&mut self) -> Result<(), IoError> {
         for column in &mut self.columns {
-            column.writer.flush().map_err(IoError::Io)?;
+            column.writer()?.flush().map_err(IoError::Io)?;
         }
         Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        // Closed rather than merely flushed: the columns are about to be read back, and on Windows
+        // a handle left open is one the archive step cannot work around.
         for column in &mut self.columns {
-            column.writer.flush().map_err(IoError::Io)?;
+            if let Some(mut writer) = column.writer.take() {
+                writer.flush().map_err(IoError::Io)?;
+            }
         }
         let mut zip = zip::ZipWriter::new(File::create(&self.path).map_err(IoError::Io)?);
         for column in &self.columns {

@@ -1065,6 +1065,52 @@ mod tests {
         ));
     }
 
+    /// npz and rosbag spill to a scratch file beside the target while a recording runs. Neither
+    /// may leave one behind — finished or abandoned — and the handle has to be *closed* before the
+    /// file is removed, because Windows will not unlink a file that is still open.
+    #[test]
+    fn the_spilling_sinks_leave_no_scratch_files() {
+        let stream = round_trip_stream();
+        for extension in ["npz", "bag"] {
+            let path = scratch("spill", extension);
+            let siblings = |suffix: &str| -> Vec<std::path::PathBuf> {
+                let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+                std::fs::read_dir(path.parent().expect("a parent"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|found| {
+                        found
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(stem) && name.ends_with(suffix))
+                    })
+                    .collect()
+            };
+
+            // Abandoned without `finish`: no archive, and no scratch either.
+            let mut sink = open_sink(&path, &SaveOptions::default()).expect(extension);
+            sink.append(&stream).expect(extension);
+            drop(sink);
+            assert!(
+                siblings(".part").is_empty(),
+                "{extension}: an abandoned sink left its scratch file behind"
+            );
+
+            // Finished: the archive exists and the scratch is gone.
+            let mut sink = open_sink(&path, &SaveOptions::default()).expect(extension);
+            sink.append(&stream).expect(extension);
+            sink.finish().expect(extension);
+            assert!(path.exists(), "{extension}: no archive was written");
+            assert!(
+                siblings(".part").is_empty(),
+                "{extension}: a finished sink left its scratch file behind"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
     #[test]
     fn out_of_order_events_are_refused_by_the_raw_writer() {
         let mut builder = EventStreamBuilder::new(64, 64, 0.001);

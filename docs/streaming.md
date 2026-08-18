@@ -73,9 +73,9 @@ discard its oldest 20 ms — on a real 50 ms window, 54% of the lit pixels.
 
 ## Recording while you process
 
-Pass `record=` an `.h5`/`.hdf5` path and every window has its **raw** events appended to that file
-before it is rendered. The loop works on representations while the file keeps the full-resolution
-recording for later:
+Pass `record=` a path and every window has its **raw** events appended to that file before it is
+rendered. The loop works on representations while the file keeps the full-resolution recording for
+later:
 
 ```python
 with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
@@ -87,8 +87,22 @@ ecv.open("session.h5")                  # reads back like any other recording
 
 Writing happens on the capture thread, so there is no per-window Python round trip, and the file is
 flushed about once a second — a crash keeps everything up to a second ago. `compression=` takes an
-optional gzip level (`0..=9`); omit it for the fastest writes. {attr}`~eventcv.EventCamera.n_recorded`
-counts events written, and the `with` block (or `close()`) finishes the file.
+optional gzip level (`0..=9`) for HDF5; omit it for the fastest writes.
+{attr}`~eventcv.EventCamera.n_recorded` counts events written, and the `with` block (or `close()`)
+finishes the file.
+
+**Any event format works**, chosen by the extension exactly as {func}`~eventcv.save` chooses it —
+`.h5`, `.npz`, `.txt`/`.csv`, `.bag`, `.aedat`, `.aedat4`, `.dat`, `.raw`. All of them are written
+window-by-window, so nothing is ever held in memory. What differs is when the file becomes readable,
+which is what matters if a capture is interrupted:
+
+| readable after every window | complete only when the camera closes |
+|---|---|
+| `.h5`, `.txt`/`.csv`, `.aedat`, `.aedat4`, `.dat`, `.raw` | `.npz`, `.bag` |
+
+npz and rosbag both have something to write at the end — a header stating the array length, a chunk
+index — so they spill to a scratch file beside the target while the capture runs and assemble it on
+close. Pick one of the others for a session you might have to kill.
 
 Only windows that are actually **read** are recorded, since `show()` doesn't poll them. To record
 without a loop, use {func}`~eventcv.record`, which opens the camera, captures, and closes it:
@@ -265,7 +279,6 @@ recordings.
 | Frames arrive but are stale | In-order delivery behind a slow loop | `latest=True` (and check `n_skipped`) |
 | `n_skipped` rising fast | Per-window work slower than the camera | Expected with `latest=True`; `record=` still archives everything |
 | "no event camera found" with a camera attached | Another handle holds the device, or udev rules are missing | Close the other handle (`with ecv.stream() as cam:`), or install udev rules |
-| `record=` raises on a `.npz` path | `record=` appends window-by-window, which needs HDF5 | Use `.h5`/`.hdf5`, or `cam.record("out.npz")` to buffer and write once |
 | A panic from `usb.rs` ("callback called for a transfer marked as complete") aborting the process, usually on Windows and usually right after a camera is released | A race in the USB teardown inside `neuromorphic-drivers`, the driver crate underneath EventCV: a cancelled transfer's completion callback can arrive after its slot was retired. It is an abort, not a Python exception, so it cannot be caught | Open the camera **once** and keep it for the session rather than opening and closing one per recording. `ecv.record(...)` and `with ecv.stream(...) as cam:` both close deterministically, which keeps the teardown off unpredictable GC timing |
 
 ## Live viewer

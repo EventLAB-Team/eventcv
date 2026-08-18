@@ -48,9 +48,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux and macOS differ in linker behaviour for the extension module and in how the
-        # ONNX Runtime is located at import time, so both are worth running.
-        os: [ubuntu-latest, macos-latest]
+        # The four targets `workflow.yml` builds wheels for. They were not all tested before, which
+        # is how a Windows wheel could be published without the suite ever having run on it. They
+        # differ in linker behaviour for the extension module, in how the ONNX Runtime is located at
+        # import time, and — on Windows — in the whole USB and filesystem story underneath the
+        # camera feature.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -59,14 +62,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # cmake is what builds the bundled libhdf5; without it the `hdf5` feature cannot compile.
+      # Both Linux runners (x86_64 and arm64) report `Linux`, so apt covers each of them.
       - name: Install cmake (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Install cmake (macOS, Windows)
+        # From pip rather than the system package manager — the same thing the release workflow
+        # does on these two, and it avoids a brew/choco round trip for a build-time-only tool.
+        if: runner.os != 'Linux'
+        run: python -m pip install cmake
       - name: Install ffmpeg
         # Only needed by the `.mp4` export tests. They skip cleanly when it is absent, so this
         # is here to make sure that path is actually exercised rather than silently skipped.
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get install -y ffmpeg; else brew install ffmpeg; fi
+          case "$RUNNER_OS" in
+            Linux)   sudo apt-get install -y ffmpeg ;;
+            macOS)   brew install ffmpeg ;;
+            Windows) choco install ffmpeg -y --no-progress ;;
+          esac
         shell: bash
       - name: Install eventcv and test dependencies
         # Builds with the same features as the published wheels, so CI tests what users get.

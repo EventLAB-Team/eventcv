@@ -61,14 +61,30 @@ class CameraApiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eventcv.stream(repr="not-a-representation")
 
-    def test_record_rejects_formats_that_cannot_be_appended(self):
-        # `record=` archives window-by-window, so it needs HDF5; npz/txt/bag are pointed at
-        # `camera.record(...)` instead. Checked before the device is touched.
-        for path in ("session.npz", "session.txt", "session.bag"):
-            with self.assertRaises(ValueError) as caught:
-                eventcv.stream(record=path)
-            self.assertIn("record", str(caught.exception))
-        self.assertFalse(os.path.exists("session.npz"), "rejected path must not be created")
+    def test_record_rejects_a_path_that_is_not_an_event_file(self):
+        # Every event format can be appended window-by-window, so the only thing `record=` turns
+        # away is a path that is not an event container at all. Checked before the device is
+        # touched, so it raises the same way with or without hardware.
+        with self.assertRaises(ValueError) as caught:
+            eventcv.stream(record="session.png")
+        self.assertIn("record", str(caught.exception))
+        self.assertFalse(os.path.exists("session.png"), "rejected path must not be created")
+
+    def test_record_accepts_every_event_format(self):
+        # The regression this replaces: `record=` used to write HDF5 whatever the extension said,
+        # so a `.npz` path produced an HDF5 file wearing the wrong name. These paths must now get
+        # *past* validation — with no camera attached that shows up as the device error rather than
+        # a ValueError, which is exactly the distinction worth pinning.
+        if eventcv.list_cameras():
+            self.skipTest("a camera is attached, so opening one would succeed and record for real")
+        for path in ("session.npz", "session.txt", "session.bag", "session.aedat4", "session.raw"):
+            with self.subTest(path=path):
+                with self.assertRaises(RuntimeError):
+                    eventcv.stream(record=path)
+                self.assertFalse(
+                    os.path.exists(path),
+                    "a recording must not be created before the camera opens",
+                )
 
     def test_record_rejects_a_bad_compression_level(self):
         with self.assertRaises(ValueError):
