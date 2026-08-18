@@ -30,6 +30,56 @@ pub fn write_text_stream(path: impl AsRef<Path>, stream: &EventStream) -> Result
     writer.flush().map_err(IoError::Io)
 }
 
+/// Appends `t x y p` lines to an open text file — the streaming form of [`write_text_stream`].
+///
+/// Text carries no header at all, so there is nothing to fix up at the end: the file is a valid,
+/// readable recording after every append, which makes this the cheapest target for a capture that
+/// might be interrupted.
+pub struct TextEventSink {
+    writer: BufWriter<File>,
+    n_events: usize,
+}
+
+impl TextEventSink {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, IoError> {
+        Ok(Self {
+            writer: BufWriter::new(File::create(path).map_err(IoError::Io)?),
+            n_events: 0,
+        })
+    }
+}
+
+impl super::EventSink for TextEventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for index in 0..stream.len() {
+            writeln!(
+                self.writer,
+                "{} {} {} {}",
+                ts[index],
+                xs[index],
+                ys[index],
+                u8::from(ps[index])
+            )
+            .map_err(IoError::Io)?;
+        }
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
+}
+
 /// Unit of the timestamp column. Events are stored internally in microseconds, so
 /// [`TextReader`] always reports `timestamp_scale_ms() == 0.001`; sub-microsecond
 /// precision is rounded.

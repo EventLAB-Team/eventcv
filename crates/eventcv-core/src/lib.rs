@@ -27,6 +27,7 @@
 
 use ndarray::Array2;
 
+pub mod accel;
 pub mod analytics;
 pub mod augment;
 pub mod bias;
@@ -40,6 +41,7 @@ pub mod features;
 pub mod filter;
 pub mod flow;
 pub mod image;
+pub mod interp;
 pub mod io;
 pub mod mask;
 /// ONNX inference. Requires the `onnx` feature (on in the published wheels).

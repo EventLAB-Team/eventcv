@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit as _atexit
+
 from . import _ort, _rust
 
 # `Model` opens ONNX Runtime at run time, so settle which library that is — bundled, conda's,
@@ -36,6 +38,18 @@ Model = getattr(_rust, "Model", _MissingModel)
 Tracker = _rust.Tracker
 UdpSender = _rust.UdpSender
 UdpReceiver = _rust.UdpReceiver
+
+# Where representations run. The session starts on the CPU — those implementations are the
+# reference — and `set_device("gpu")` moves everything that has a kernel; `device=` on an individual
+# call overrides it for that call. `EVENTCV_DEVICE` sets the session default for a whole process.
+set_device = _rust.set_device
+get_device = _rust.get_device
+gpu_available = _rust.gpu_available
+
+# Close the GPU before the interpreter tears itself down. A device left open across CPython's
+# finalisation faults intermittently on some drivers — after the script's last line, so it looks
+# like a crash in whatever ran last rather than in the teardown. A no-op when no GPU was used.
+_atexit.register(_rust.gpu_shutdown)
 
 
 def load(
@@ -789,6 +803,9 @@ def simulate(
     out: str | None = None,
     compression: int | bool | None = None,
     progress: bool = False,
+    device: str | None = None,
+    interpolate: str | None = None,
+    interpolate_factor: int = 2,
 ):
     """Simulate a DVS camera watching ``source``, returning the events it would have produced.
 
@@ -837,6 +854,35 @@ def simulate(
     pixels and roughly quarters the output. ``max_frames`` stops early, and ``seed`` makes a run
     reproducible from its configuration (including across machines: the simulation runs on every
     core, but its noise is seeded so that the result does not depend on how many there are).
+
+    ``device="gpu"`` runs the pixel model as a compute shader instead, which is worth it on a large
+    sensor: this is the heaviest loop in the library, and the one place the GPU wins clearly. The
+    two backends are not interchangeable to the last event, and the difference is worth knowing
+    before you rely on it:
+
+    * With ``shot_noise_rate_hz=0`` and ``leak_rate_hz=0`` they produce **identical** events.
+    * With ``sigma_thres`` on they produce the same events with the same polarities, and a couple of
+      timestamps in ~25 000 land a microsecond apart — the crossing fraction is double precision on
+      the CPU and shaders have no double precision.
+    * With noise on they draw **different random numbers** by construction (a per-pixel kernel
+      cannot replay a sequential generator), so the streams agree in rate, not event for event. A
+      GPU run is still bit-reproducible from its seed, run to run and across devices.
+
+    So compare a GPU run against a stored CPU one only with the noise terms off.
+
+    ``interpolate`` inserts *learned* frames before simulating, which is the other half of the
+    timestamp-accuracy problem. ``upsample`` subdivides the interval, but the levels it subdivides
+    are a straight-line blend of the two frames — right when a pixel's intensity ramps over the gap,
+    wrong when an edge crosses it and the pixel steps. Point ``interpolate`` at a RIFE ONNX export
+    (or anything shaped like one: a frame pair in, one image out, ideally with a ``timestep`` input)
+    and ``interpolate_factor`` says how many intervals each source pair becomes::
+
+        events = ecv.simulate("clip.mp4", interpolate="rife_v4.onnx", interpolate_factor=4)
+
+    The interpolated frames are fed to the simulator as ordinary source frames at proportional
+    timestamps, exactly as v2e uses Super-SloMo — the pixel model is untouched, and ``upsample``
+    still refines whatever is left. Frames are interpolated in luma, since that is all the simulator
+    consumes. No weights ship with eventcv; export the model yourself.
     """
     return _rust.simulate(
         source,
@@ -857,6 +903,9 @@ def simulate(
         out=out,
         compression=compression,
         progress=progress,
+        device=device,
+        interpolate=interpolate,
+        interpolate_factor=interpolate_factor,
     )
 
 
@@ -1293,6 +1342,9 @@ __all__ = [
     "UdpReceiver",
     "UdpSender",
     "circle_mask",
+    "get_device",
+    "gpu_available",
+    "set_device",
     "bag_topics",
     "collate",
     "ellipse_mask",

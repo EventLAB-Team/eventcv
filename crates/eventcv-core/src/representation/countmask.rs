@@ -1,5 +1,5 @@
 use super::{
-    frame_len, polarity::polarity_counts, EventFrame, EventFrameData, Representation,
+    frame_len, polarity::polarity_counts_on, EventFrame, EventFrameData, Representation,
     RepresentationError, RepresentationKind,
 };
 use crate::EventStream;
@@ -66,12 +66,23 @@ impl Representation for CountMask {
     type Output = EventFrame;
 
     fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
+        self.generate_on(stream, crate::accel::Device::Cpu)
+    }
+
+    /// Only the two count planes move to the GPU. The percentile that sets the scale stays on the
+    /// CPU: it is `O(pixels)` rather than `O(events)`, it is already the cheap half, and it is the
+    /// part that has to agree with the reference NumPy pipeline bit for bit.
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        device: crate::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
         if !self.pct.is_finite() || !(0.0..=100.0).contains(&self.pct) {
             return Err(RepresentationError::InvalidParameter("pct"));
         }
         let (width, height, length) = frame_len(stream, 3)?;
         let plane_len = width * height;
-        let (_, _, counts) = polarity_counts(stream)?;
+        let (_, _, counts) = polarity_counts_on(stream, device)?;
 
         let alpha = self.alpha(&counts);
         // Everything from here on runs in `f32`, matching the reference NumPy pipeline: a Python

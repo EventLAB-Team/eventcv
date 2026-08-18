@@ -194,3 +194,76 @@ Then look at what you made, without picking a representation first:
 $ eventcv play events.h5 --dt-ms 5
 $ eventcv render events.h5 raw.mp4 --dt-ms 5 --fps 20
 ```
+
+## Simulating on a GPU
+
+The pixel model is the heaviest loop in the library — every sub-step is a full pass over every
+pixel doing real arithmetic — which makes it the one place a GPU clearly pays. `device="gpu"` runs
+it as a compute shader:
+
+```python
+events = ecv.simulate("clip.mp4", device="gpu")
+```
+
+Measured on an RTX 2080 against a 12-core CPU (release build, a moving edge, default sensor model):
+
+| sensor | frames | CPU | GPU | |
+|---|---|---|---|---|
+| 346×260 | 24 | 479 ms | 219 ms | 2.2× |
+| 640×480 | 24 | 1352 ms | 620 ms | 2.2× |
+| 1280×720 | 16 | 2959 ms | 1488 ms | 2.0× |
+| 1920×1080 | 12 | 5314 ms | 2940 ms | 1.8× |
+
+The backend is `wgpu`, so this is Metal on macOS and Vulkan on Linux with the same shader; there is
+no CUDA toolkit involved. `ecv.gpu_available()` says whether it can run here, and asking for a GPU
+that is not there raises rather than falling back silently.
+
+### The two backends are not interchangeable to the last event
+
+Worth knowing before you compare a GPU run against a stored CPU one:
+
+| configuration | how they compare |
+|---|---|
+| noise and leak off | **identical**, event for event |
+| `sigma_thres` on, still noiseless | same events, same polarities; a couple of timestamps in ~25 000 land a microsecond apart |
+| noise on | same event *rate* to within a few per cent, **different events** |
+
+Threshold mismatch is drawn once on the host and uploaded, so a seed describes the same silicon on
+either backend — the random part of the *model* is not the part the GPU generates. The microsecond
+discrepancy is the crossing fraction, which is double precision on the CPU and cannot be in a
+shader. Shot noise and leak genuinely differ: a kernel with one invocation per pixel cannot replay
+a generator that the CPU consumes sequentially, so the GPU uses a counter-based one keyed on
+`(seed, frame, sub-step, pixel, polarity)`. That is reproducible from run to run and across
+devices, but it is a different sample path.
+
+So compare against a stored CPU result with `shot_noise_rate_hz=0, leak_rate_hz=0`, or compare
+distributions.
+
+## Learned frame interpolation
+
+`upsample` subdivides the interval between two frames, but the levels it subdivides are a
+**straight-line blend** of them. That is right when a pixel's intensity ramps over the frame gap and
+wrong when an edge crosses it and the pixel *steps* — and when it is wrong, every event from that
+pixel is placed at the wrong moment, however finely the interval was subdivided. v2e reaches for
+Super-SloMo here. `interpolate` reaches for whatever ONNX graph you have:
+
+```python
+events = ecv.simulate("clip.mp4", interpolate="rife_v4.onnx", interpolate_factor=4)
+```
+
+`interpolate_factor` is how many intervals each source pair becomes, so `4` inserts three frames.
+Those frames are fed to the simulator as **ordinary source frames at proportional timestamps** —
+the same arrangement v2e uses, and the reason the pixel model itself needs no changes. `upsample`
+then refines whatever is left.
+
+**No weights ship with eventcv.** It runs graphs; it does not carry a zoo. Export RIFE (or anything
+shaped like it) yourself. What the graph has to look like:
+
+- a frame pair in, either as one six-channel input or as two three-channel ones;
+- one image out;
+- ideally a scalar `timestep` input (RIFE v4 and later), which is what allows an arbitrary fraction
+  in a single pass.
+
+Without a `timestep` the network can only produce midpoints, so eventcv bisects towards the fraction
+it needs — which reaches `k/2ⁿ` and refuses anything else rather than quietly returning a midpoint.
+Frames are interpolated in luma, since luma is all the simulator consumes.

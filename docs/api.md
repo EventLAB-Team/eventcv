@@ -22,6 +22,17 @@ from the methods, so the two forms stay in sync.
 .. autofunction:: collate
 ```
 
+## Devices
+
+Where representations and the simulator run. The CPU is the default and the reference; see
+{doc}`representations` for what the GPU changes numerically and when it is worth using.
+
+```{eval-rst}
+.. autofunction:: set_device
+.. autofunction:: get_device
+.. autofunction:: gpu_available
+```
+
 ## Viewing
 
 ```{eval-rst}
@@ -281,5 +292,5 @@ with `slice`/`windows`/`with_repr` without loading the file.
       Polarity, FrameSink, EventSink, EventCamera, FEAST, load, from_numpy, open, save,
       load_frame, load_feast, export_png, collate, stream, list_cameras, Model,
       simulate, reconstruct, StatefulModel, Tracker, UdpSender, UdpReceiver,
-      play, save_video
+      play, save_video, set_device, get_device, gpu_available
 ```

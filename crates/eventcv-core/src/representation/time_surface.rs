@@ -56,6 +56,50 @@ impl Representation for TimeSurface {
             channel_names: vec!["positive".to_owned(), "negative".to_owned()],
         })
     }
+
+    /// The kernel keeps the *smallest age* per pixel and polarity with an integer `atomicMin`,
+    /// which is the same quantity the CPU's "latest timestamp" is, and maps it through the same
+    /// `exp` on readback. Order cannot matter to a minimum, so this is exact up to the one `exp`.
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        device: crate::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
+        if device == crate::accel::Device::Cpu {
+            return self.generate(stream);
+        }
+        validate_positive(self.tau_ms, "tau_ms")?;
+        let (width, height, length) = frame_len(stream, 2)?;
+        let ages = super::on_gpu(
+            stream,
+            &crate::accel::GpuDispatch {
+                entry: "time_surface",
+                cells: length,
+                initial: i32::MAX,
+                bins: 2,
+                span_ms: self.tau_ms as f32,
+                fixed_one: 1.0,
+                window_ms: None,
+                needs_ages: true,
+            },
+        )?;
+        let scale = stream.timestamp_scale_ms();
+        let values = ages
+            .iter()
+            .map(|age| match *age {
+                i32::MAX => 0.0, // no event ever landed on this pixel
+                age => (-(f64::from(age) * scale) / self.tau_ms).exp() as f32,
+            })
+            .collect();
+        Ok(EventFrame {
+            data: EventFrameData::F32(values),
+            channels: 2,
+            width,
+            height,
+            kind: RepresentationKind::TimeSurface,
+            channel_names: vec!["positive".to_owned(), "negative".to_owned()],
+        })
+    }
 }
 
 #[cfg(test)]

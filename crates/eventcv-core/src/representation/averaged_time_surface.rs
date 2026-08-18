@@ -57,14 +57,58 @@ impl Representation for AveragedTimeSurface {
             })
             .collect();
 
-        Ok(EventFrame {
-            data: EventFrameData::F32(values),
-            channels: 2,
-            width,
-            height,
-            kind: RepresentationKind::AveragedTimeSurface,
-            channel_names: vec!["positive".to_owned(), "negative".to_owned()],
-        })
+        Ok(frame(values, width, height))
+    }
+
+    /// The kernel accumulates the same `exp(-age/tau)` responses in Q16.16 and counts them
+    /// alongside, then divides here. Fixed point again, for the same reason as the voxel grid: the
+    /// mean of a pixel's responses should not depend on which invocation got there first.
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        device: crate::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
+        if device == crate::accel::Device::Cpu {
+            return self.generate(stream);
+        }
+        validate_positive(self.tau_ms, "tau_ms")?;
+        let (width, height, length) = frame_len(stream, 2)?;
+        // Two planes of sums followed by two of counts — one dispatch instead of two passes over
+        // the events.
+        let cells = super::on_gpu(
+            stream,
+            &crate::accel::GpuDispatch {
+                entry: "averaged_time_surface",
+                cells: length * 2,
+                initial: 0,
+                bins: 2,
+                span_ms: self.tau_ms as f32,
+                fixed_one: crate::accel::FIXED_ONE,
+                window_ms: None,
+                needs_ages: true,
+            },
+        )?;
+        let (sums, counts) = cells.split_at(length);
+        let values = sums
+            .iter()
+            .zip(counts)
+            .map(|(sum, count)| match count {
+                0 => 0.0,
+                count => *sum as f32 / crate::accel::FIXED_ONE / *count as f32,
+            })
+            .collect();
+        Ok(frame(values, width, height))
+    }
+}
+
+fn frame(values: Vec<f32>, width: usize, height: usize) -> EventFrame {
+    EventFrame {
+        data: EventFrameData::F32(values),
+        channels: 2,
+        width,
+        height,
+        kind: RepresentationKind::AveragedTimeSurface,
+        channel_names: vec!["positive".to_owned(), "negative".to_owned()],
     }
 }
 

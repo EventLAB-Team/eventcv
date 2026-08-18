@@ -28,3 +28,6 @@ camera = ["eventcv-core/camera"]
 # Build ONNX inference (`Model`) into the extension (forwards to eventcv-core, which downloads a
 # prebuilt ONNX Runtime at build time). Enable with `maturin develop --features onnx`.
 onnx = ["eventcv-core/onnx"]
+# Build the GPU compute kernels into the extension (forwards to eventcv-core). The viewer's wgpu is
+# the same dependency, so this adds shaders rather than a second graphics stack.
+gpu = ["eventcv-core/gpu"]

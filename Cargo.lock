@@ -712,6 +712,7 @@ dependencies = [
 name = "eventcv-core"
 version = "1.0.5"
 dependencies = [
+ "bytemuck",
  "criterion",
  "gif",
  "hdf5-metno",
@@ -723,11 +724,13 @@ dependencies = [
  "npyz",
  "ort",
  "png",
+ "pollster",
  "rand",
  "rand_distr",
  "rayon",
  "rosbag",
  "serde_json",
+ "wgpu",
  "zip",
  "zstd 0.13.3",
 ]

@@ -23,16 +23,21 @@ impl Representation for Polarity {
     type Output = EventFrame;
 
     fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
-        let (width, height, counts) = polarity_counts(stream)?;
+        self.generate_on(stream, crate::accel::Device::Cpu)
+    }
 
-        let data = if self.normalize {
-            EventFrameData::U8(normalize_u8(counts))
-        } else {
-            EventFrameData::U64(counts)
-        };
-
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        device: crate::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
+        let (width, height, counts) = polarity_counts_on(stream, device)?;
         Ok(EventFrame {
-            data,
+            data: if self.normalize {
+                EventFrameData::U8(normalize_u8(counts))
+            } else {
+                EventFrameData::U64(counts)
+            },
             channels: 2,
             width,
             height,
@@ -40,6 +45,35 @@ impl Representation for Polarity {
             channel_names: vec!["positive".to_owned(), "negative".to_owned()],
         })
     }
+}
+
+/// [`polarity_counts`] on `device`. Counting is integer work, so the kernel's answer is not merely
+/// close to the CPU's — it is the same numbers, whatever order the invocations landed in.
+///
+/// Both [`Polarity`] and the count-mask image are built from these two planes, so one kernel gives
+/// both a GPU path.
+pub(super) fn polarity_counts_on(
+    stream: &EventStream,
+    device: crate::accel::Device,
+) -> Result<(usize, usize, Vec<u64>), RepresentationError> {
+    if device == crate::accel::Device::Cpu {
+        return polarity_counts(stream);
+    }
+    let (width, height, length) = frame_len(stream, 2)?;
+    let cells = super::on_gpu(
+        stream,
+        &crate::accel::GpuDispatch {
+            entry: "polarity_counts",
+            cells: length,
+            initial: 0,
+            bins: 2,
+            span_ms: 0.0,
+            fixed_one: 1.0,
+            window_ms: None,
+            needs_ages: false,
+        },
+    )?;
+    Ok((width, height, cells.iter().map(|cell| *cell as u64).collect()))
 }
 
 /// Per-pixel event counts split into a positive plane (offset `0`) and a negative one (offset

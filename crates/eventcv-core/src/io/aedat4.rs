@@ -18,7 +18,7 @@
 //! an [`IoError::Format`] instead of reading past the end of a buffer.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::{ImuSample, IoError, LoadOptions, SliceSource};
@@ -191,15 +191,47 @@ impl<'a> Table<'a> {
     }
 }
 
-/// How each packet body is compressed, from `IOHeader.compression`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Compression {
+/// How each packet body is compressed — `IOHeader.compression` on read, and the choice
+/// [`Aedat4EventSink`] writes with. LZ4 is the default because it is what DV itself writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compression {
     None,
+    #[default]
     Lz4,
     Zstd,
 }
 
 impl Compression {
+    /// The `IOHeader.compression` value that names this scheme, the inverse of
+    /// [`from_header`](Self::from_header). The plain rather than the `_HIGH` variant: an event
+    /// packet is written once and read many times, and the extra effort buys little on data this
+    /// regular.
+    fn to_header(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Lz4 => 1,
+            Self::Zstd => 3,
+        }
+    }
+
+    /// Compresses one packet body for writing. LZ4 goes out in the *frame* format DV expects,
+    /// which is what [`decode`](Self::decode) reads back.
+    fn encode(self, body: &[u8]) -> Result<Vec<u8>, IoError> {
+        match self {
+            Self::None => Ok(body.to_vec()),
+            Self::Lz4 => {
+                let mut encoder = lz4::EncoderBuilder::new()
+                    .build(Vec::new())
+                    .map_err(IoError::Io)?;
+                encoder.write_all(body).map_err(IoError::Io)?;
+                let (out, result) = encoder.finish();
+                result.map_err(IoError::Io)?;
+                Ok(out)
+            }
+            Self::Zstd => zstd::stream::encode_all(body, 3).map_err(IoError::Io),
+        }
+    }
+
     fn from_header(value: i32) -> Result<Self, IoError> {
         match value {
             0 => Ok(Self::None),
@@ -977,5 +1009,377 @@ mod tests {
         let table = Table::root(&[4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0x7F]).unwrap();
         assert!(table.field(slot::ELEMENTS).is_none());
         assert_eq!(table.i64(slot::ELEMENTS, -7), -7); // absent field falls back to the default
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------------------------
+
+/// FlatBuffer file identifiers, the four bytes each root carries at offset 4. Taken from the files
+/// DV writes rather than from the schemas, since the schemas are not shipped with a recording.
+const IDENT_HEADER: &[u8; 4] = b"IOHE";
+const IDENT_EVENTS: &[u8; 4] = b"EVTS";
+const IDENT_TABLE: &[u8; 4] = b"FTAB";
+
+/// The one stream a written recording declares. Events only: a sink is handed an [`EventStream`],
+/// which carries neither frames nor IMU.
+const EVENT_STREAM_ID: i32 = 0;
+
+/// Events per packet. DV writes a packet per capture interval; a sink has no intervals, so this
+/// bounds the working buffer instead — 100k events is ~1.6 MB uncompressed, which compresses in
+/// one pass and keeps the data table short enough to stay a useful index.
+const PACKET_EVENTS: usize = 100_000;
+
+/// A minimal FlatBuffer *writer*, the counterpart of the [`Table`] reader above.
+///
+/// Buffers are built back-to-front, which is what the format's self-relative offsets require, so
+/// the bytes are accumulated reversed and flipped once at the end. Offsets are therefore counted
+/// from the buffer's end: an object written when `len()` was `n` ends up at final position
+/// `total - n`, and that single convention is what every offset below is expressed in.
+///
+/// This exists for the same reason the reader hand-rolls its decoding: the four schemas involved
+/// are small and fixed, and the `flatbuffers` crate's builder would pull in a code generator to
+/// emit what amounts to the hundred lines below.
+struct FlatBuilder {
+    /// The buffer reversed — `rev[0]` is the final buffer's last byte.
+    rev: Vec<u8>,
+    /// The strictest alignment anything asked for, used to pad the front at the end.
+    min_align: usize,
+}
+
+impl FlatBuilder {
+    fn new() -> Self {
+        Self {
+            rev: Vec::new(),
+            min_align: 4,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rev.len()
+    }
+
+    /// Pads so that `size` more bytes land on an `align` boundary.
+    fn pre_align(&mut self, size: usize, align: usize) {
+        self.min_align = self.min_align.max(align);
+        let pad = (align - ((self.len() + size) % align)) % align;
+        self.rev.resize(self.len() + pad, 0);
+    }
+
+    /// Writes `bytes` at the current position (reversed, so they read forwards in the result).
+    fn push(&mut self, bytes: &[u8]) {
+        self.rev.extend(bytes.iter().rev());
+    }
+
+    /// Writes one aligned scalar and returns its offset.
+    fn push_scalar(&mut self, bytes: &[u8]) -> usize {
+        self.pre_align(bytes.len(), bytes.len());
+        self.push(bytes);
+        self.len()
+    }
+
+    /// Writes a `uoffset` pointing at `target`, which must already have been written.
+    fn push_uoffset(&mut self, target: usize) -> usize {
+        self.pre_align(4, 4);
+        let value = (self.len() + 4 - target) as u32;
+        self.push(&value.to_le_bytes());
+        self.len()
+    }
+
+    /// Writes a length-prefixed UTF-8 string (NUL-terminated, as FlatBuffers stores them).
+    fn push_string(&mut self, value: &str) -> usize {
+        self.pre_align(value.len() + 1, 4);
+        self.push(&[0]);
+        self.push(value.as_bytes());
+        self.push_scalar(&(value.len() as u32).to_le_bytes())
+    }
+
+    /// Writes a vector of inline structs from `data` (already in final byte order), returning the
+    /// offset of its length prefix.
+    fn push_struct_vector(&mut self, data: &[u8], count: usize, align: usize) -> usize {
+        self.pre_align(data.len(), align);
+        self.push(data);
+        self.push_scalar(&(count as u32).to_le_bytes())
+    }
+
+    /// Closes a table whose fields have already been written.
+    ///
+    /// `start` is `len()` from before the first field, and `fields` pairs each occupied vtable slot
+    /// with the offset the field was written at. Every table gets its own vtable — flatc's builder
+    /// dedupes identical ones, which saves bytes but nothing a reader can tell apart.
+    fn end_table(&mut self, start: usize, fields: &[(usize, usize)]) -> usize {
+        self.pre_align(4, 4);
+        self.push(&0i32.to_le_bytes()); // patched below, once the vtable's position is known
+        let table = self.len();
+
+        let slots = fields.iter().map(|(slot, _)| *slot).max().unwrap_or(2);
+        let entries = (slots.saturating_sub(4)) / 2 + 1;
+        let mut vtable = vec![0u16; 2 + entries];
+        vtable[0] = (vtable.len() * 2) as u16;
+        vtable[1] = (table - start) as u16;
+        for (slot, offset) in fields {
+            vtable[2 + (slot - 4) / 2] = (table - offset) as u16;
+        }
+        self.pre_align(vtable.len() * 2, 2);
+        for value in vtable.iter().rev() {
+            self.push(&value.to_le_bytes());
+        }
+        let vtable_at = self.len();
+
+        // soffset = table position - vtable position, positive because the vtable precedes it.
+        let soffset = (vtable_at - table) as i32;
+        let bytes = soffset.to_le_bytes();
+        self.rev[table - 4..table].copy_from_slice(&[bytes[3], bytes[2], bytes[1], bytes[0]]);
+        table
+    }
+
+    /// Emits the finished buffer: the root offset, the file identifier, and — for the packet
+    /// bodies, which are framed that way — a leading length.
+    fn finish(mut self, root: usize, identifier: &[u8; 4], size_prefixed: bool) -> Vec<u8> {
+        let prefix = 4 + 4 + usize::from(size_prefixed) * 4;
+        self.pre_align(prefix, self.min_align);
+        self.push(identifier);
+        self.push_uoffset(root);
+        if size_prefixed {
+            let size = self.len() as u32;
+            self.push(&size.to_le_bytes());
+        }
+        self.rev.reverse();
+        self.rev
+    }
+}
+
+/// The `infoNode` XML declaring the single event stream, in the shape DV writes and
+/// [`parse_streams`] reads back.
+fn info_node(width: usize, height: usize, compression: Compression) -> String {
+    let compression = match compression {
+        Compression::None => "NONE",
+        Compression::Lz4 => "LZ4",
+        Compression::Zstd => "ZSTD",
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <dv version=\"2.0\">\n\
+         \x20   <node name=\"outInfo\" path=\"/outInfo/\">\n\
+         \x20       <node name=\"{EVENT_STREAM_ID}\" path=\"/outInfo/{EVENT_STREAM_ID}/\">\n\
+         \x20           <attr key=\"compression\" type=\"string\">{compression}</attr>\n\
+         \x20           <attr key=\"originalModuleName\" type=\"string\">eventcv</attr>\n\
+         \x20           <attr key=\"originalOutputName\" type=\"string\">events</attr>\n\
+         \x20           <attr key=\"typeDescription\" type=\"string\">Event data.</attr>\n\
+         \x20           <attr key=\"typeIdentifier\" type=\"string\">EVTS</attr>\n\
+         \x20           <node name=\"info\" path=\"/outInfo/{EVENT_STREAM_ID}/info/\">\n\
+         \x20               <attr key=\"sizeX\" type=\"int\">{width}</attr>\n\
+         \x20               <attr key=\"sizeY\" type=\"int\">{height}</attr>\n\
+         \x20               <attr key=\"source\" type=\"string\">eventcv</attr>\n\
+         \x20           </node>\n\
+         \x20       </node>\n\
+         \x20   </node>\n\
+         </dv>\n"
+    )
+}
+
+/// Builds the `IOHeader` FlatBuffer, and reports where its `dataTablePosition` field sits within
+/// the buffer so the sink can patch it once the table has been written.
+fn build_header(width: usize, height: usize, compression: Compression) -> (Vec<u8>, usize) {
+    let mut builder = FlatBuilder::new();
+    let info = builder.push_string(&info_node(width, height, compression));
+    let start = builder.len();
+    let compression_at = builder.push_scalar(&compression.to_header().to_le_bytes());
+    // Written as -1 — "no table" — so a recording abandoned before `finish` still opens, by the
+    // same packet walk the reader uses for an interrupted DV recording.
+    let position_at = builder.push_scalar(&(-1i64).to_le_bytes());
+    let info_at = builder.push_uoffset(info);
+    let root = builder.end_table(
+        start,
+        &[
+            (slot::COMPRESSION, compression_at),
+            (slot::DATA_TABLE_POSITION, position_at),
+            (slot::INFO_NODE, info_at),
+        ],
+    );
+    let buffer = builder.finish(root, IDENT_HEADER, false);
+    // Offsets were counted from the end; convert the field's to a position in the finished buffer.
+    let field = buffer.len() - position_at;
+    (buffer, field)
+}
+
+/// One packet as the data table records it.
+#[derive(Clone, Copy, Debug)]
+struct Definition {
+    byte_offset: i64,
+    size: i32,
+    elements: i64,
+    start: i64,
+    end: i64,
+}
+
+/// Builds the trailing `FileDataTable` — the index that makes a recording sliceable without
+/// reading it.
+fn build_data_table(definitions: &[Definition]) -> Vec<u8> {
+    let mut builder = FlatBuilder::new();
+    // Children before parents: every definition table is written first, then the vector of
+    // offsets to them, then the table that holds it.
+    let mut offsets = Vec::with_capacity(definitions.len());
+    for definition in definitions.iter().rev() {
+        let start = builder.len();
+        let byte_offset = builder.push_scalar(&definition.byte_offset.to_le_bytes());
+        let elements = builder.push_scalar(&definition.elements.to_le_bytes());
+        let start_at = builder.push_scalar(&definition.start.to_le_bytes());
+        let end_at = builder.push_scalar(&definition.end.to_le_bytes());
+        // `PacketInfo` is an inline struct of two `int32`s, so it is written in place.
+        builder.pre_align(8, 4);
+        builder.push(&definition.size.to_le_bytes());
+        builder.push(&EVENT_STREAM_ID.to_le_bytes());
+        let info = builder.len();
+        offsets.push(builder.end_table(
+            start,
+            &[
+                (slot::DEFINITION_BYTE_OFFSET, byte_offset),
+                (slot::DEFINITION_PACKET_INFO, info),
+                (slot::DEFINITION_NUM_ELEMENTS, elements),
+                (slot::DEFINITION_TIMESTAMP_START, start_at),
+                (slot::DEFINITION_TIMESTAMP_END, end_at),
+            ],
+        ));
+    }
+    offsets.reverse();
+
+    builder.pre_align(offsets.len() * 4, 4);
+    let mut vector_at = builder.len();
+    for offset in offsets.iter().rev() {
+        vector_at = builder.push_uoffset(*offset);
+    }
+    let _ = vector_at;
+    let vector = builder.push_scalar(&(offsets.len() as u32).to_le_bytes());
+
+    let start = builder.len();
+    let table_at = builder.push_uoffset(vector);
+    let root = builder.end_table(start, &[(slot::TABLE, table_at)]);
+    builder.finish(root, IDENT_TABLE, true)
+}
+
+/// Builds one `EventPacket` body from `stream[range]`.
+fn build_event_packet(stream: &EventStream, range: std::ops::Range<usize>) -> Vec<u8> {
+    let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+    let mut elements = Vec::with_capacity(range.len() * EVENT_STRIDE);
+    for index in range.clone() {
+        elements.extend_from_slice(&ts[index].to_le_bytes());
+        elements.extend_from_slice(&(xs[index] as i16).to_le_bytes());
+        elements.extend_from_slice(&(ys[index] as i16).to_le_bytes());
+        elements.push(u8::from(ps[index]));
+        elements.extend_from_slice(&[0; 3]); // padding to the struct's 8-byte alignment
+    }
+    let mut builder = FlatBuilder::new();
+    let vector = builder.push_struct_vector(&elements, range.len(), 8);
+    let start = builder.len();
+    let elements_at = builder.push_uoffset(vector);
+    let root = builder.end_table(start, &[(slot::ELEMENTS, elements_at)]);
+    builder.finish(root, IDENT_EVENTS, true)
+}
+
+/// Writes an AEDAT 4.0 (`.aedat4`) recording a window at a time — the inverse of [`read_aedat4`].
+///
+/// The `IOHeader` goes out on the first non-empty append, because its `infoNode` names the sensor
+/// size. Each append is then split into packets of at most [`PACKET_EVENTS`] events; every packet
+/// is a size-prefixed `EventPacket` FlatBuffer, compressed, behind an 8-byte `PacketHeader`.
+///
+/// The `FileDataTable` is written at [`finish`](super::EventSink::finish) and its position patched
+/// back into the header, which is what makes the result sliceable rather than merely readable. A
+/// recording abandoned before then still opens: the header's `dataTablePosition` stays `-1`, and
+/// the reader falls back to walking the packets — the same path it takes for a DV recording that
+/// was interrupted.
+pub struct Aedat4EventSink {
+    file: File,
+    compression: Compression,
+    /// Byte offset of the header's `dataTablePosition` field; `None` until the header is written.
+    position_field: Option<u64>,
+    definitions: Vec<Definition>,
+    n_events: usize,
+}
+
+impl Aedat4EventSink {
+    pub fn create(path: impl AsRef<Path>, compression: Compression) -> Result<Self, IoError> {
+        Ok(Self {
+            file: File::create(path.as_ref())?,
+            compression,
+            position_field: None,
+            definitions: Vec::new(),
+            n_events: 0,
+        })
+    }
+
+    /// Compresses and writes one packet, recording its data-table entry.
+    fn write_packet(&mut self, stream: &EventStream, range: std::ops::Range<usize>) -> Result<(), IoError> {
+        let ts = stream.ts();
+        let body = self
+            .compression
+            .encode(&build_event_packet(stream, range.clone()))?;
+        let size = i32::try_from(body.len()).map_err(|_| {
+            IoError::Unsupported("an AEDAT4 packet body exceeds 2 GB".to_owned())
+        })?;
+        self.file.write_all(&EVENT_STREAM_ID.to_le_bytes())?;
+        self.file.write_all(&size.to_le_bytes())?;
+        let byte_offset = self.file.stream_position()?;
+        self.file.write_all(&body)?;
+        self.definitions.push(Definition {
+            byte_offset: byte_offset as i64,
+            size,
+            elements: range.len() as i64,
+            start: ts[range.start],
+            end: ts[range.end - 1],
+        });
+        Ok(())
+    }
+}
+
+impl super::EventSink for Aedat4EventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        if self.position_field.is_none() {
+            let (width, height) = stream.sensor_size();
+            let (header, field) = build_header(width, height, self.compression);
+            self.file.write_all(MAGIC)?;
+            self.file.write_all(&(header.len() as u32).to_le_bytes())?;
+            self.file.write_all(&header)?;
+            self.position_field = Some((MAGIC.len() + 4 + field) as u64);
+        }
+        let mut start = 0;
+        while start < stream.len() {
+            let end = (start + PACKET_EVENTS).min(stream.len());
+            self.write_packet(stream, start..end)?;
+            start = end;
+        }
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.file.flush().map_err(IoError::Io)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        let Some(field) = self.position_field else {
+            // Nothing was ever appended: an empty header with no streams would not describe an
+            // event recording, so write one for a 1x1 sensor — what the readers infer for an
+            // empty stream anyway.
+            let (header, _) = build_header(1, 1, self.compression);
+            self.file.write_all(MAGIC)?;
+            self.file.write_all(&(header.len() as u32).to_le_bytes())?;
+            self.file.write_all(&header)?;
+            return self.file.flush().map_err(IoError::Io);
+        };
+        let position = self.file.stream_position()?;
+        let table = self.compression.encode(&build_data_table(&self.definitions))?;
+        self.file.write_all(&table)?;
+        self.file.seek(SeekFrom::Start(field))?;
+        self.file.write_all(&(position as i64).to_le_bytes())?;
+        self.file.flush().map_err(IoError::Io)
     }
 }

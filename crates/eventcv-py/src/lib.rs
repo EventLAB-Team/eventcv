@@ -528,7 +528,10 @@ impl PyEventStream {
         }
     }
 
-    #[pyo3(signature = (*, bins=9, window_ms=None, window_s=None, window_us=None, window_ns=None))]
+    #[pyo3(signature = (*, bins=9, window_ms=None, window_s=None, window_us=None, window_ns=None, device=None))]
+    // Four spellings of one duration, plus the bins and the device — a keyword-only Python
+    // signature, not a positional Rust one.
+    #[allow(clippy::too_many_arguments)]
     fn voxel(
         &self,
         py: Python<'_>,
@@ -537,17 +540,19 @@ impl PyEventStream {
         window_s: Option<f64>,
         window_us: Option<f64>,
         window_ns: Option<f64>,
+        device: Option<&str>,
     ) -> PyResult<PyEventFrame> {
         let bins =
             usize::try_from(bins).map_err(|_| PyValueError::new_err("bins must be at least 1"))?;
         let window_ms = resolve_ms("window", window_s, window_ms, window_us, window_ns)?
             .unwrap_or(DEFAULT_SPAN_MS);
-        py.detach(|| VoxelGrid::new(bins, window_ms).generate(&self.inner))
+        let device = resolve_device(device)?;
+        py.detach(|| VoxelGrid::new(bins, window_ms).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
 
-    #[pyo3(signature = (*, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None))]
+    #[pyo3(signature = (*, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, device=None))]
     fn tsurf(
         &self,
         py: Python<'_>,
@@ -555,16 +560,18 @@ impl PyEventStream {
         tau_s: Option<f64>,
         tau_us: Option<f64>,
         tau_ns: Option<f64>,
+        device: Option<&str>,
     ) -> PyResult<PyEventFrame> {
         let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS);
-        py.detach(|| TimeSurface::new(tau_ms).generate(&self.inner))
+        let device = resolve_device(device)?;
+        py.detach(|| TimeSurface::new(tau_ms).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
 
     /// Averaged time surface — the per-pixel mean of `exp(-age/tau_ms)` over all events
     /// (two polarity channels, float32). Brighter where activity recurs; see `tsurf`.
-    #[pyo3(signature = (*, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None))]
+    #[pyo3(signature = (*, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, device=None))]
     fn atsurf(
         &self,
         py: Python<'_>,
@@ -572,18 +579,26 @@ impl PyEventStream {
         tau_s: Option<f64>,
         tau_us: Option<f64>,
         tau_ns: Option<f64>,
+        device: Option<&str>,
     ) -> PyResult<PyEventFrame> {
         let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS);
-        py.detach(|| AveragedTimeSurface::new(tau_ms).generate(&self.inner))
+        let device = resolve_device(device)?;
+        py.detach(|| AveragedTimeSurface::new(tau_ms).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
 
     /// Event-count image — one channel of total events per pixel (both polarities). Raw
     /// `uint64` counts by default; `uint8` rescaled to the busiest pixel when `normalize=True`.
-    #[pyo3(signature = (*, normalize=false))]
-    fn count(&self, py: Python<'_>, normalize: bool) -> PyResult<PyEventFrame> {
-        py.detach(|| EventCount::new(normalize).generate(&self.inner))
+    #[pyo3(signature = (*, normalize=false, device=None))]
+    fn count(
+        &self,
+        py: Python<'_>,
+        normalize: bool,
+        device: Option<&str>,
+    ) -> PyResult<PyEventFrame> {
+        let device = resolve_device(device)?;
+        py.detach(|| EventCount::new(normalize).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
@@ -616,9 +631,16 @@ impl PyEventStream {
     /// the non-zero counts of the two planes pooled together. Timestamps are not used.
     /// `white_frame` inverts to a white background — the black-background default is the form
     /// downstream descriptor models expect.
-    #[pyo3(signature = (*, pct=99.0, white_frame=false))]
-    fn countmask(&self, py: Python<'_>, pct: f64, white_frame: bool) -> PyResult<PyEventFrame> {
-        py.detach(|| CountMask::new(pct, white_frame).generate(&self.inner))
+    #[pyo3(signature = (*, pct=99.0, white_frame=false, device=None))]
+    fn countmask(
+        &self,
+        py: Python<'_>,
+        pct: f64,
+        white_frame: bool,
+        device: Option<&str>,
+    ) -> PyResult<PyEventFrame> {
+        let device = resolve_device(device)?;
+        py.detach(|| CountMask::new(pct, white_frame).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
@@ -934,7 +956,8 @@ impl PyEventStream {
     }
 
     fn generate_polarity(&self, py: Python<'_>, polarity: Polarity) -> PyResult<PyEventFrame> {
-        py.detach(|| polarity.generate(&self.inner))
+        let device = eventcv_core::accel::default_device();
+        py.detach(|| polarity.generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
@@ -3121,7 +3144,8 @@ fn save(
     source, *, pos_thres=0.2, neg_thres=0.2, sigma_thres=0.03, refractory_us=100,
     cutoff_hz=200.0, leak_rate_hz=1.0, shot_noise_rate_hz=10.0, seed=0,
     upsample=None, max_events_per_pixel=1.0, max_upsample=None, fps=None, scale=None,
-    max_frames=None, out=None, compression=None, progress=false
+    max_frames=None, out=None, compression=None, progress=false, device=None,
+    interpolate=None, interpolate_factor=2
 ))]
 #[allow(clippy::too_many_arguments)]
 fn simulate(
@@ -3144,10 +3168,22 @@ fn simulate(
     out: Option<String>,
     compression: Option<&Bound<'_, PyAny>>,
     progress: bool,
+    device: Option<&str>,
+    interpolate: Option<&str>,
+    interpolate_factor: usize,
 ) -> PyResult<Py<PyAny>> {
     use eventcv_core::simulate::{
-        simulate_video_with_progress, Simulator, SimulatorConfig, Upsample, MAX_UPSAMPLE,
+        simulate_video_on, Simulator, SimulatorConfig, Upsample, MAX_UPSAMPLE,
     };
+    let device = resolve_device(device)?;
+    // Loaded before the decoder opens, so a bad path is reported straight away rather than after a
+    // clip has been read.
+    let mut interpolator = resolve_interpolator(interpolate)?;
+    if interpolate.is_some() && interpolate_factor < 2 {
+        return Err(PyValueError::new_err(
+            "interpolate_factor must be at least 2 (2 inserts one frame between each pair)",
+        ));
+    }
 
     let upsample = match upsample {
         None | Some("adaptive") => Upsample::Adaptive {
@@ -3186,9 +3222,16 @@ fn simulate(
 
     if let Ok(path) = source.extract::<String>() {
         let result = py.detach(|| {
-            simulate_video_with_progress(
+            simulate_video_on(
                 std::path::Path::new(&path),
                 config,
+                device,
+                interpolator.as_deref_mut().map(|interpolator| {
+                    eventcv_core::interp::Interpolation {
+                        interpolator,
+                        factor: interpolate_factor,
+                    }
+                }),
                 scale,
                 max_frames,
                 |stream| {
@@ -3254,12 +3297,14 @@ fn simulate(
 
         let plane = width * height;
         let limit = max_frames.map_or(count, |limit| limit.min(count));
-        let mut simulator = Simulator::new(width, height, config);
+        let mut simulator = Simulator::new(width, height, config).on_device(device);
         let mut luma = vec![0.0_f32; plane];
         let values = array.as_slice().ok_or_else(|| {
             PyValueError::new_err("frames must be a contiguous array; pass np.ascontiguousarray(…)")
         })?;
 
+        // The previous frame's luma, kept only when there is an interpolator to feed it to.
+        let mut previous: Option<Vec<f32>> = None;
         for index in 0..limit {
             let base = index * plane * channels;
             py.detach(|| {
@@ -3280,10 +3325,37 @@ fn simulate(
                         eventcv_core::simulate::linear_luma(level, level, level)
                     };
                 }
-                let stream = simulator.push_frame(&luma, index as i64 * us_per_frame);
-                sink.push(&stream)
+                Ok::<(), IoError>(())
             })
             .map_err(map_io_error)?;
+
+            let t = index as i64 * us_per_frame;
+            // Learned frames go in as ordinary source frames at proportional timestamps, exactly as
+            // on the video path — see `simulate_video_on`.
+            if let (Some(interpolator), Some(before)) =
+                (interpolator.as_deref_mut(), previous.as_ref())
+            {
+                let plan = eventcv_core::interp::Interpolation {
+                    interpolator,
+                    factor: interpolate_factor,
+                };
+                let fractions = plan.fractions();
+                let between = plan
+                    .interpolator
+                    .between(before, &luma, width, height, &fractions)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                for (fraction, frame) in fractions.iter().zip(&between) {
+                    let at = t - us_per_frame
+                        + (f64::from(*fraction) * us_per_frame as f64) as i64;
+                    py.detach(|| sink.push(&simulator.push_frame(frame, at)))
+                        .map_err(map_io_error)?;
+                }
+            }
+            py.detach(|| sink.push(&simulator.push_frame(&luma, t)))
+                .map_err(map_io_error)?;
+            if interpolator.is_some() {
+                previous = Some(luma.clone());
+            }
             frames = index + 1;
             py.check_signals()?;
             reporter.report(eventcv_core::simulate::SimulateProgress {
@@ -3344,7 +3416,6 @@ impl PySimulationResult {
 
 /// How often a streaming simulation is forced out to disk, so a crash keeps everything written up
 /// to about a second ago. Matches the live recorder's cadence.
-#[cfg(feature = "hdf5")]
 const SIMULATE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Where a simulation's events go as they are produced.
@@ -3360,10 +3431,10 @@ enum SimulationSink {
         builder: Option<EventStreamBuilder>,
         out: Option<(String, SaveOptions)>,
     },
-    /// Appended window by window. Only HDF5 supports this today.
-    #[cfg(feature = "hdf5")]
+    /// Appended window by window — every event format does this now, so `Buffered` with an `out`
+    /// is only reached for a target that is not an event container at all.
     Streaming {
-        sink: eventcv_core::io::Hdf5EventSink,
+        sink: Box<dyn eventcv_core::io::EventSink>,
         last_flush: std::time::Instant,
     },
 }
@@ -3383,21 +3454,10 @@ impl SimulationSink {
             ..SaveOptions::default()
         };
         if eventcv_core::io::supports_event_append(path) {
-            #[cfg(feature = "hdf5")]
-            {
-                return Ok(Self::Streaming {
-                    sink: eventcv_core::io::Hdf5EventSink::open(path, compression)
-                        .map_err(map_io_error)?,
-                    last_flush: std::time::Instant::now(),
-                });
-            }
-            #[cfg(not(feature = "hdf5"))]
-            {
-                return Err(PyValueError::new_err(
-                    "this build has no HDF5 support, so out= cannot stream to .h5; rebuild with \
-                     --features hdf5, or simulate to memory and save a .npz",
-                ));
-            }
+            return Ok(Self::Streaming {
+                sink: eventcv_core::io::open_sink(path, &options).map_err(map_io_error)?,
+                last_flush: std::time::Instant::now(),
+            });
         }
         Ok(Self::Buffered {
             builder: None,
@@ -3420,7 +3480,6 @@ impl SimulationSink {
                     .extend_from_stream(stream);
                 Ok(())
             }
-            #[cfg(feature = "hdf5")]
             Self::Streaming { sink, last_flush } => {
                 sink.append(stream)?;
                 if last_flush.elapsed() >= SIMULATE_FLUSH_INTERVAL {
@@ -3435,7 +3494,6 @@ impl SimulationSink {
     fn n_events(&self) -> usize {
         match self {
             Self::Buffered { builder, .. } => builder.as_ref().map_or(0, EventStreamBuilder::len),
-            #[cfg(feature = "hdf5")]
             Self::Streaming { sink, .. } => sink.n_events(),
         }
     }
@@ -3453,7 +3511,6 @@ impl SimulationSink {
                 );
                 eventcv_core::io::save_stream(path, &stream, &options)
             }
-            #[cfg(feature = "hdf5")]
             Self::Streaming { sink, .. } => sink.finish(),
         }
     }
@@ -3466,7 +3523,6 @@ impl SimulationSink {
                 || EventStreamBuilder::new(0, 0, 0.001).build(),
                 EventStreamBuilder::build,
             ),
-            #[cfg(feature = "hdf5")]
             Self::Streaming { .. } => unreachable!("a streaming sink is only built for out="),
         }
     }
@@ -3880,35 +3936,52 @@ impl PyFrameSink {
     }
 }
 
-/// Streams `EventStream` windows into extendable `events/{x,y,t,p}` HDF5 datasets — the event-level
-/// twin of `FrameSink`. Where `FrameSink` appends computed representations, this appends the raw
-/// events, so a live camera (or any window source) can be recorded to disk continuously without
-/// holding the whole session in memory. The sensor size and time base are taken from the first
-/// appended stream, and the file reads straight back with `eventcv.open` / `eventcv.load`.
-#[cfg(feature = "hdf5")]
+/// Streams `EventStream` windows into an event file — the event-level twin of `FrameSink`. Where
+/// `FrameSink` appends computed representations, this appends the raw events, so a live camera (or
+/// any window source) can be recorded to disk continuously without holding the whole session in
+/// memory. The sensor size and time base are taken from the first appended stream, and the file
+/// reads straight back with `eventcv.open` / `eventcv.load`.
+///
+/// Every event format `eventcv.save` writes can be appended this way, chosen by the path's
+/// extension exactly as `save` chooses it: `.h5`, `.npz`, `.txt`/`.csv`, `.bag`, `.aedat`,
+/// `.aedat4`, `.dat`, `.raw` and E2VID's `.zip`. What differs is when the file becomes readable —
+/// HDF5, text, AEDAT and the Prophesee formats append straight to disk, while npz and rosbag have a
+/// header or an index to write at the end and are only complete once `finish()` runs.
+///
+/// Behind a `Mutex` only to satisfy pyo3's `Sync` requirement on a `#[pyclass]`: a sink is a single
+/// writer by construction, and the zip encoder E2VID's export uses is `Send` but not `Sync`.
 #[pyclass(name = "EventSink")]
 struct PyEventSink {
-    inner: Option<eventcv_core::io::Hdf5EventSink>,
+    inner: std::sync::Mutex<Option<Box<dyn eventcv_core::io::EventSink>>>,
 }
 
-#[cfg(feature = "hdf5")]
 #[pymethods]
 impl PyEventSink {
-    /// Opens `path` for writing. `compression` matches `eventcv.save`: gzip 1 by default, `False`
-    /// for uncompressed columns and the fastest writes.
+    /// Opens `path` for writing. `format` overrides the extension (`"evt2"` / `"evt3"` pick the
+    /// Prophesee `.raw` encoding); `compression` applies to HDF5 columns and matches
+    /// `eventcv.save`: gzip 1 by default, `False` for uncompressed columns and the fastest writes.
     #[new]
-    #[pyo3(signature = (path, *, compression=None))]
-    fn new(path: &str, compression: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
-        let compression = parse_compression(compression)?;
-        let inner =
-            eventcv_core::io::Hdf5EventSink::open(path, compression).map_err(map_io_error)?;
-        Ok(Self { inner: Some(inner) })
+    #[pyo3(signature = (path, *, format=None, compression=None))]
+    fn new(
+        path: &str,
+        format: Option<String>,
+        compression: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let options = SaveOptions {
+            format,
+            compression: parse_compression(compression)?,
+            ..SaveOptions::default()
+        };
+        let inner = eventcv_core::io::open_sink(path, &options).map_err(map_io_error)?;
+        Ok(Self {
+            inner: std::sync::Mutex::new(Some(inner)),
+        })
     }
 
     /// Appends one `EventStream` window to the end of the file. Empty windows are a no-op.
-    fn append(&mut self, stream: PyRef<PyEventStream>) -> PyResult<()> {
-        let sink = self
-            .inner
+    fn append(&self, stream: PyRef<PyEventStream>) -> PyResult<()> {
+        let mut guard = self.lock();
+        let sink = guard
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("EventSink is already closed"))?;
         sink.append(&stream.inner).map_err(map_io_error)
@@ -3916,21 +3989,22 @@ impl PyEventSink {
 
     #[getter]
     fn n_events(&self) -> usize {
-        self.inner.as_ref().map_or(0, |sink| sink.n_events())
+        self.lock().as_ref().map_or(0, |sink| sink.n_events())
     }
 
     /// Forces buffered events out to disk without closing, so a crash mid-recording keeps
-    /// everything appended so far. Call periodically during a long capture.
+    /// everything appended so far. Call periodically during a long capture. For npz and rosbag the
+    /// bytes go out but the file stays incomplete until `finish()`.
     fn flush(&self) -> PyResult<()> {
-        match self.inner.as_ref() {
+        match self.lock().as_mut() {
             Some(sink) => sink.flush().map_err(map_io_error),
             None => Ok(()),
         }
     }
 
     /// Flushes and closes the file; further appends raise. Idempotent.
-    fn finish(&mut self) -> PyResult<()> {
-        match self.inner.take() {
+    fn finish(&self) -> PyResult<()> {
+        match self.lock().take() {
             Some(sink) => sink.finish().map_err(map_io_error),
             None => Ok(()),
         }
@@ -3942,7 +4016,7 @@ impl PyEventSink {
 
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
-        &mut self,
+        &self,
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_value: Option<&Bound<'_, PyAny>>,
         _traceback: Option<&Bound<'_, PyAny>>,
@@ -3950,6 +4024,87 @@ impl PyEventSink {
         self.finish()?;
         Ok(false) // never suppress an exception raised in the `with` body
     }
+}
+
+impl PyEventSink {
+    /// The lock is only ever held for the length of one call, so a poisoned mutex means a panic
+    /// inside the writer — recovering the guard keeps that reported as the original error.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn eventcv_core::io::EventSink>>> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// Loads a frame interpolator, or `None` when none was asked for.
+///
+/// A build without the `onnx` feature says so rather than reporting the path as missing — the fix
+/// is an install, not a different file.
+#[allow(unused_variables)]
+fn resolve_interpolator(
+    path: Option<&str>,
+) -> PyResult<Option<Box<dyn eventcv_core::interp::FrameInterpolator>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    #[cfg(feature = "onnx")]
+    {
+        eventcv_core::interp::OnnxInterpolator::load(path)
+            .map(|interpolator| {
+                Some(Box::new(interpolator) as Box<dyn eventcv_core::interp::FrameInterpolator>)
+            })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        Err(PyRuntimeError::new_err(
+            "eventcv was built without ONNX support, so interpolate= is unavailable. Reinstall \
+             from PyPI, or rebuild with `maturin develop --features onnx`.",
+        ))
+    }
+}
+
+/// Sets the device every representation uses when a call does not name one.
+///
+/// The session starts on `"cpu"` — the CPU implementations are the reference, and nothing changes
+/// numerically unless this is called. `EVENTCV_DEVICE` sets the same thing for a whole process
+/// without touching any code.
+#[pyfunction]
+#[pyo3(name = "set_device")]
+fn set_device(name: &str) -> PyResult<()> {
+    let device = eventcv_core::accel::Device::parse(name).ok_or_else(|| {
+        PyValueError::new_err(format!("device must be \"cpu\" or \"gpu\", not {name:?}"))
+    })?;
+    if device == eventcv_core::accel::Device::Gpu && !eventcv_core::accel::gpu_available() {
+        return Err(PyRuntimeError::new_err(
+            eventcv_core::accel::unavailable_reason_public(),
+        ));
+    }
+    eventcv_core::accel::set_default_device(device);
+    Ok(())
+}
+
+/// The device representations run on when a call does not name one.
+#[pyfunction]
+#[pyo3(name = "get_device")]
+fn get_device() -> &'static str {
+    eventcv_core::accel::default_device().as_str()
+}
+
+/// Whether `device="gpu"` can actually run here — the build carries the kernels *and* an adapter
+/// was found. The first call opens the adapter, which takes a few milliseconds.
+#[pyfunction]
+#[pyo3(name = "gpu_available")]
+fn gpu_available() -> bool {
+    eventcv_core::accel::gpu_available()
+}
+
+/// Closes the GPU, waiting for anything still queued. Registered with `atexit` by the package, so
+/// the device is gone before the interpreter tears itself down — leaving it open faults
+/// intermittently on some drivers, and it does so *after* the user's last line, which reads like a
+/// crash in whatever they ran last. Safe to call at any time; the next GPU call reopens.
+#[pyfunction]
+#[pyo3(name = "gpu_shutdown")]
+fn gpu_shutdown(py: Python<'_>) {
+    py.detach(eventcv_core::accel::shutdown);
 }
 
 fn map_io_error(error: IoError) -> PyErr {
@@ -4368,26 +4523,57 @@ impl ReprSpec {
         }
     }
 
+    /// Renders on the session's device (see `eventcv.set_device`).
+    ///
+    /// The default lives here rather than in the core, where `generate` stays the CPU reference
+    /// implementation: a Rust caller asking for `generate` should get exactly that, while a
+    /// `reader = ecv.open(..., repr="voxel")` that never names a device should follow whatever the
+    /// session was set to. Representations with no kernel fall back to the CPU on their own.
     fn generate(self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
+        self.generate_on(stream, eventcv_core::accel::default_device())
+    }
+
+    fn generate_on(
+        self,
+        stream: &EventStream,
+        device: eventcv_core::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
         match self {
-            Self::Binary => Binary.generate(stream),
-            Self::Count { normalize } => EventCount::new(normalize).generate(stream),
-            Self::Polarity { normalize } => Polarity::new(normalize).generate(stream),
-            Self::Voxel { bins, window_ms } => VoxelGrid::new(bins, window_ms).generate(stream),
-            Self::TimeSurface { tau_ms } => TimeSurface::new(tau_ms).generate(stream),
+            Self::Binary => Binary.generate_on(stream, device),
+            Self::Count { normalize } => EventCount::new(normalize).generate_on(stream, device),
+            Self::Polarity { normalize } => Polarity::new(normalize).generate_on(stream, device),
+            Self::Voxel { bins, window_ms } => {
+                VoxelGrid::new(bins, window_ms).generate_on(stream, device)
+            }
+            Self::TimeSurface { tau_ms } => TimeSurface::new(tau_ms).generate_on(stream, device),
             Self::AveragedTimeSurface { tau_ms } => {
-                AveragedTimeSurface::new(tau_ms).generate(stream)
+                AveragedTimeSurface::new(tau_ms).generate_on(stream, device)
             }
-            Self::Tencode { window_ms } => Tencode::new(window_ms).generate(stream),
+            Self::Tencode { window_ms } => Tencode::new(window_ms).generate_on(stream, device),
             Self::CountMask { pct, white_frame } => {
-                CountMask::new(pct, white_frame).generate(stream)
+                CountMask::new(pct, white_frame).generate_on(stream, device)
             }
-            Self::Mcts { max_window_ms } => Mcts::new(max_window_ms).generate(stream),
+            Self::Mcts { max_window_ms } => Mcts::new(max_window_ms).generate_on(stream, device),
             Self::Flow { window } => stream.optical_flow(window).map_err(|error| match error {
                 FlowError::SizeOverflow => RepresentationError::SizeOverflow,
                 FlowError::InvalidParameter(name) => RepresentationError::InvalidParameter(name),
             }),
         }
+    }
+}
+
+/// The device a call should run on: the named one, or the session default.
+///
+/// A name that is not `"cpu"` or `"gpu"` is an error rather than a silent fall back to the CPU —
+/// `device="gpi"` should say so, not quietly halve the throughput someone was expecting.
+fn resolve_device(name: Option<&str>) -> PyResult<eventcv_core::accel::Device> {
+    match name {
+        None => Ok(eventcv_core::accel::default_device()),
+        Some(name) => eventcv_core::accel::Device::parse(name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "device must be \"cpu\" or \"gpu\", not {name:?}"
+            ))
+        }),
     }
 }
 
@@ -5075,8 +5261,9 @@ impl Recorder {
         }
         if !eventcv_core::io::supports_event_append(path) {
             return Err(PyValueError::new_err(format!(
-                "record={path} needs a format that can be appended window-by-window (.h5/.hdf5); \
-                 for npz/txt/bag record the whole session at once with camera.record({path:?})"
+                "record={path} is not an event file; every event format can be appended \
+                 window-by-window (.h5, .npz, .txt, .csv, .bag, .aedat, .aedat4, .dat, .raw), but \
+                 .png is a frame export"
             )));
         }
         Ok(())
@@ -6544,10 +6731,16 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polygon_mask, m)?)?;
     m.add_function(wrap_pyfunction!(save_mask, m)?)?;
     m.add_function(wrap_pyfunction!(load_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(set_device, m)?)?;
+    m.add_function(wrap_pyfunction!(get_device, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_shutdown, m)?)?;
+    // `EventSink` writes every event format, so it is always available; `FrameSink` is still HDF5's
+    // alone, since no other container stores computed representations.
+    m.add_class::<PyEventSink>()?;
     #[cfg(feature = "hdf5")]
     {
         m.add_class::<PyFrameSink>()?;
-        m.add_class::<PyEventSink>()?;
     }
     #[cfg(feature = "camera")]
     {

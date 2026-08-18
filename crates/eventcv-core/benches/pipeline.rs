@@ -74,6 +74,92 @@ fn representations(c: &mut Criterion) {
     group.finish();
 }
 
+/// The same kernels on both backends, so the GPU's claim is a measurement rather than an
+/// assertion.
+///
+/// Built only with `--features gpu`, and silently absent without an adapter. Run it before moving
+/// anything to the GPU: on a fast CPU the cheap kernels lose, because the events have to be copied
+/// across a bus that the arithmetic is then too light to pay for.
+#[cfg(feature = "gpu")]
+fn representations_on_gpu(c: &mut Criterion) {
+    use eventcv_core::accel::{gpu_available, Device};
+    use eventcv_core::representation::{
+        AveragedTimeSurface, EventCount, Representation, TimeSurface, VoxelGrid,
+    };
+
+    if !gpu_available() {
+        return;
+    }
+    let stream = scene(346, 260, 40);
+    let mut group = c.benchmark_group("representations_gpu");
+    group.throughput(Throughput::Elements(stream.len() as u64));
+
+    for (name, run) in [
+        (
+            "count",
+            &(|stream: &_, device| EventCount::new(false).generate_on(stream, device).map(|_| ()))
+                as &dyn Fn(&_, Device) -> Result<(), _>,
+        ),
+        ("voxel_5", &|stream, device| {
+            VoxelGrid::new(5, 30.0).generate_on(stream, device).map(|_| ())
+        }),
+        ("time_surface", &|stream, device| {
+            TimeSurface::new(30.0).generate_on(stream, device).map(|_| ())
+        }),
+        ("averaged_time_surface", &|stream, device| {
+            AveragedTimeSurface::new(30.0)
+                .generate_on(stream, device)
+                .map(|_| ())
+        }),
+    ] {
+        for device in [Device::Cpu, Device::Gpu] {
+            group.bench_function(BenchmarkId::new(name, device.as_str()), |b| {
+                b.iter(|| black_box(run(&stream, device)))
+            });
+        }
+    }
+    group.finish();
+    simulation_on_gpu(c);
+    // Close the device while the process is still healthy; see `accel::shutdown`.
+    eventcv_core::accel::shutdown();
+}
+
+/// The pixel model on both backends. This is the one that pays: a sub-step is a full pass over
+/// every pixel doing real arithmetic, which is what a GPU is for — where the representation kernels
+/// above are scatter-adds the CPU already does at memory speed.
+#[cfg(feature = "gpu")]
+fn simulation_on_gpu(c: &mut Criterion) {
+    use eventcv_core::accel::Device;
+    use eventcv_core::simulate::{Simulator, SimulatorConfig};
+
+    let (width, height, frames) = (640, 480, 8);
+    let mut group = c.benchmark_group("simulate_gpu");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements((width * height * frames) as u64));
+    // A moving edge, so pixels actually fire; a flat field measures the leak term and nothing else.
+    let stack: Vec<Vec<f32>> = (0..frames)
+        .map(|index| {
+            let edge = (index * width) / frames;
+            (0..width * height)
+                .map(|pixel| if pixel % width < edge { 0.85 } else { 0.15 })
+                .collect()
+        })
+        .collect();
+
+    for device in [Device::Cpu, Device::Gpu] {
+        group.bench_function(BenchmarkId::new("moving_edge_640x480", device.as_str()), |b| {
+            b.iter(|| {
+                let mut simulator =
+                    Simulator::new(width, height, SimulatorConfig::default()).on_device(device);
+                for (index, frame) in stack.iter().enumerate() {
+                    black_box(simulator.push_frame(frame, index as i64 * 10_000));
+                }
+            })
+        });
+    }
+    group.finish();
+}
+
 fn filters_and_transforms(c: &mut Criterion) {
     let stream = scene(346, 260, 40);
     let mut group = c.benchmark_group("stream_ops");
@@ -159,9 +245,13 @@ fn tracking(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(not(feature = "gpu"))]
+fn representations_on_gpu(_: &mut Criterion) {}
+
 criterion_group!(
     benches,
     representations,
+    representations_on_gpu,
     filters_and_transforms,
     simulation,
     contrast_maximisation,

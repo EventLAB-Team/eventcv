@@ -27,7 +27,60 @@ pub use voxel::VoxelGrid;
 pub trait Representation {
     type Output;
 
+    /// The reference implementation, on the CPU. Always available, always the definition of what
+    /// this representation *is*: the GPU kernels are checked against it, not the other way round.
     fn generate(&self, stream: &EventStream) -> Result<Self::Output, RepresentationError>;
+
+    /// Runs on `device`.
+    ///
+    /// The default ignores it and runs [`generate`](Self::generate) — a representation with no GPU
+    /// kernel is not an error to ask for on the GPU, it is simply computed on the CPU, and a
+    /// pipeline that sets `device="gpu"` once should not have to know which of its steps have
+    /// kernels. Asking for a GPU that does not *exist* is still an error; that is decided by the
+    /// implementations that do have one.
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        _device: crate::accel::Device,
+    ) -> Result<Self::Output, RepresentationError> {
+        self.generate(stream)
+    }
+}
+
+/// Runs a kernel over `stream`, or says why it could not.
+///
+/// Every GPU-capable representation funnels through here, so "no adapter", "this build has no GPU
+/// support" and "an accumulator would have overflowed" are worded once. The `gpu` feature being
+/// off collapses this to the error arm, which is why the body is not itself behind a `cfg`.
+#[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
+pub(crate) fn on_gpu(
+    stream: &EventStream,
+    dispatch: &crate::accel::GpuDispatch,
+) -> Result<Vec<i32>, RepresentationError> {
+    #[cfg(feature = "gpu")]
+    {
+        crate::accel::gpu::with_context(|context| {
+            crate::accel::gpu::run(context, stream, dispatch)
+        })
+        .ok_or_else(|| RepresentationError::Device(crate::accel::unavailable_reason()))?
+        .map_err(|error| match error {
+            crate::accel::gpu::GpuError::Saturated => RepresentationError::Device(
+                "a GPU accumulator overflowed: the kernels sum in fixed point so that the result \
+                 does not depend on the order the events arrived, and a cell of this frame exceeds \
+                 what that can hold. Narrow the window, or use device=\"cpu\"."
+                    .to_owned(),
+            ),
+            crate::accel::gpu::GpuError::Driver(message) => {
+                RepresentationError::Device(format!("the GPU driver refused the work: {message}"))
+            }
+        })
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Err(RepresentationError::Device(
+            crate::accel::unavailable_reason(),
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +310,9 @@ pub enum RepresentationError {
         width: usize,
         height: usize,
     },
+    /// The requested device could not run this — no adapter, no GPU support in the build, or a
+    /// kernel that could not represent the answer. Carries the sentence explaining which.
+    Device(String),
 }
 
 impl fmt::Display for RepresentationError {
@@ -295,6 +351,7 @@ impl fmt::Display for RepresentationError {
                 "frame has {samples} samples but {width}x{height} needs {}",
                 width * height
             ),
+            Self::Device(message) => formatter.write_str(message),
         }
     }
 }

@@ -16,7 +16,7 @@
 //! wraps it saw and a serial pass turns those into an absolute microsecond offset.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -306,6 +306,117 @@ fn read_aedat_from<R: BufRead>(
 /// Prefer [`open_aedat_slice`] for large recordings — this materialises the whole stream.
 pub fn read_aedat(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
     read_aedat_from(BufReader::new(File::open(path)?), options)
+}
+
+/// Packs a DVS event into an AEDAT 2.0 address word — the inverse of [`classify`]. Bits 31 and 10
+/// stay clear, which is what marks the record as a DVS event rather than an APS or IMU sample.
+///
+/// `y` is the eventcv (top-left origin) row; jAER's origin is bottom-left, so it is flipped back on
+/// the way out, undoing the flip the reader applies on the way in.
+fn dvs_address(x: u16, height: usize, y: u16, polarity: bool) -> u32 {
+    let row = (height - 1).saturating_sub(usize::from(y)) as u32;
+    ((u32::from(x) & 0x3FF) << 12) | ((row & 0x1FF) << 22) | ((polarity as u32) << 11)
+}
+
+/// The chip name to stamp in the header for a sensor size, so [`resolve_sensor`] recovers the
+/// geometry on read-back. `None` for a size no DAVIS has — the inverse of [`chip_name`].
+fn chip_for_size(size: (usize, usize)) -> Option<&'static str> {
+    CHIPS
+        .iter()
+        .find(|(_, chip)| *chip == size)
+        .map(|(names, _)| names[0])
+}
+
+/// Writes an AEDAT 2.0 (`.aedat`) recording a window at a time — the inverse of [`read_aedat`].
+///
+/// Only DVS events are written: APS frames and IMU samples are read by this module but a sink
+/// takes an [`EventStream`], which has neither. The header goes out on the first non-empty append
+/// because it names the chip, and the chip is what carries the sensor geometry — AEDAT 2.0 has no
+/// width/height field of its own, so the size has to survive as a chip name.
+///
+/// Records are 8 big-endian bytes, address then timestamp, appended with nothing to fix up at the
+/// end. Timestamps are the format's own 32-bit microsecond counter; unlike the reader, which
+/// unwraps them, the writer rejects a value that does not fit rather than wrapping silently.
+pub struct AedatEventSink {
+    writer: BufWriter<File>,
+    header_written: bool,
+    n_events: usize,
+}
+
+impl AedatEventSink {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, IoError> {
+        Ok(Self {
+            writer: BufWriter::new(File::create(path).map_err(IoError::Io)?),
+            header_written: false,
+            n_events: 0,
+        })
+    }
+}
+
+impl super::EventSink for AedatEventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        if !self.header_written {
+            let size = stream.sensor_size();
+            let chip = chip_for_size(size).ok_or_else(|| {
+                let known: Vec<String> = CHIPS
+                    .iter()
+                    .map(|(names, (width, height))| format!("{} ({width}x{height})", names[0]))
+                    .collect();
+                IoError::Unsupported(format!(
+                    "AEDAT 2.0 stores the sensor geometry as a chip name, and no DAVIS is {}x{} \
+                     — the format has nowhere to record that size. Known: {}. Use a format that \
+                     stores the size itself (.h5, .npz, .aedat4) instead.",
+                    size.0,
+                    size.1,
+                    known.join(", ")
+                ))
+            })?;
+            // `\r\n` and the `#!AER-DAT2.0` first line are what `check_version` looks for; the
+            // `AEChip:` line is what `resolve_sensor` searches, and it searches only those lines.
+            write!(
+                self.writer,
+                "#!AER-DAT2.0\r\n# This is a raw AE data file written by eventcv\r\n\
+                 # AEChip: eu.seebetter.ini.chips.davis.{chip}\r\n"
+            )
+            .map_err(IoError::Io)?;
+            self.header_written = true;
+        }
+        let height = stream.sensor_size().1;
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for index in 0..stream.len() {
+            let timestamp = u32::try_from(ts[index]).map_err(|_| {
+                IoError::Unsupported(format!(
+                    "AEDAT 2.0 timestamps are a 32-bit microsecond counter, so {} does not fit; \
+                     the reader unwraps that counter but a writer has nowhere to put the high \
+                     half — rebase the stream first (stream.time_shift(-t0))",
+                    ts[index]
+                ))
+            })?;
+            self.writer
+                .write_all(&dvs_address(xs[index], height, ys[index], ps[index]).to_be_bytes())
+                .map_err(IoError::Io)?;
+            self.writer
+                .write_all(&timestamp.to_be_bytes())
+                .map_err(IoError::Io)?;
+        }
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
 }
 
 /// One array read, filled sample by sample as it arrives.

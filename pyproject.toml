@@ -74,7 +74,10 @@ module-name = "eventcv._rust"
 # prebuilt one in — the static runtime `ort` can fetch is built against glibc 2.38 and made the
 # whole extension unloadable on older distros. The flag remains because ort has no stable release
 # yet, so a bad RC is turned off here rather than worked around in the API.
-features = ["hdf5", "camera", "onnx"]
+# `gpu` adds the compute shaders. It costs almost nothing in the wheel — wgpu is already there for
+# the viewer — and the CPU stays the default at run time, so this only decides whether
+# `device="gpu"` is available at all rather than whether anything uses it.
+features = ["hdf5", "camera", "onnx", "gpu"]
 # The ONNX Runtime the wheel carries, put there by `scripts/fetch_onnxruntime.py` before the build
 # (CI runs it in every wheel job). `format = "wheel"` because an sdist must not ship a binary — a
 # source build finds a runtime elsewhere, or says how to install one. maturin skips gitignored

@@ -8,7 +8,7 @@
 //! layout exactly. EVT3 `.raw` recordings are handled by the sibling `prophesee_raw` module.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::Path;
 
 use super::{EventSource, IoError, LoadOptions, RawEvent};
@@ -134,6 +134,90 @@ fn read_dat_from<R: BufRead>(mut reader: R, options: &LoadOptions) -> Result<Eve
 /// timestamp unit is always microseconds. `max_events` caps how many events are kept.
 pub fn read_dat(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
     read_dat_from(BufReader::new(File::open(path)?), options)
+}
+
+/// Writes a Prophesee `.dat` CD recording a window at a time — the inverse of [`read_dat`].
+///
+/// The `%` header and the event-type/size pair are written on the first non-empty append, because
+/// the header carries `% Width`/`% Height` and those come from the first stream's sensor size.
+/// After that every append is a run of 8-byte records with nothing to fix up, so the file is
+/// readable at any point.
+///
+/// Timestamps are `u32` microseconds, which is the format's own width: it wraps after ~71 minutes
+/// and the format offers no high half, so a recording longer than that is rejected rather than
+/// silently wrapped.
+pub struct DatEventSink {
+    writer: BufWriter<File>,
+    header_written: bool,
+    n_events: usize,
+}
+
+impl DatEventSink {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, IoError> {
+        Ok(Self {
+            writer: BufWriter::new(File::create(path).map_err(IoError::Io)?),
+            header_written: false,
+            n_events: 0,
+        })
+    }
+}
+
+/// Packs `x`, `y` and polarity into a `.dat` CD word, the inverse of the unpacking in
+/// [`DatSource::next_event`].
+fn cd_word(x: u16, y: u16, polarity: bool) -> u32 {
+    (u32::from(x) & 0x3FFF) | ((u32::from(y) & 0x3FFF) << 14) | ((polarity as u32) << 28)
+}
+
+impl super::EventSink for DatEventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        if !self.header_written {
+            let (width, height) = stream.sensor_size();
+            write!(
+                self.writer,
+                "% Date 1970-01-01 00:00:00\n% Version 2\n% Width {width}\n% Height {height}\n"
+            )
+            .map_err(IoError::Io)?;
+            // Event type 0x0C (CD_LOW/CD event) and the 8-byte record size the reader requires.
+            self.writer
+                .write_all(&[0x0C, CD_EVENT_SIZE])
+                .map_err(IoError::Io)?;
+            self.header_written = true;
+        }
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for index in 0..stream.len() {
+            let timestamp = u32::try_from(ts[index]).map_err(|_| {
+                IoError::Unsupported(format!(
+                    "Prophesee .dat timestamps are 32-bit microseconds, so {} does not fit; the \
+                     format cannot hold a recording longer than ~71 minutes or one starting at a \
+                     Unix epoch — subtract the start time first (stream.time_shift(-t0))",
+                    ts[index]
+                ))
+            })?;
+            self.writer
+                .write_all(&timestamp.to_le_bytes())
+                .map_err(IoError::Io)?;
+            self.writer
+                .write_all(&cd_word(xs[index], ys[index], ps[index]).to_le_bytes())
+                .map_err(IoError::Io)?;
+        }
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
 }
 
 #[cfg(test)]

@@ -184,26 +184,26 @@ impl SimulatorConfig {
 /// and a single slice is what [`par_chunks_mut`](rayon::slice::ParallelSliceMut::par_chunks_mut)
 /// can hand to a worker without a five-way zip.
 #[derive(Clone, Copy, Debug)]
-struct PixelState {
+pub(crate) struct PixelState {
     /// Memorised log intensity — the level each event is measured against.
-    log_ref: f32,
+    pub(crate) log_ref: f32,
     /// Photoreceptor lowpass state.
-    lowpass: f32,
+    pub(crate) lowpass: f32,
     /// Thresholds, drawn once at construction: mismatch is a property of the silicon, not noise
     /// that resamples every frame.
-    thres_pos: f32,
-    thres_neg: f32,
+    pub(crate) thres_pos: f32,
+    pub(crate) thres_neg: f32,
     /// Last emission time, for the refractory check.
-    last_t: i64,
+    pub(crate) last_t: i64,
 }
 
 /// One generated event, before it is sorted and handed to an [`EventStreamBuilder`].
 #[derive(Clone, Copy, Debug)]
-struct SimEvent {
-    t: i64,
-    x: u16,
-    y: u16,
-    positive: bool,
+pub(crate) struct SimEvent {
+    pub(crate) t: i64,
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) positive: bool,
 }
 
 /// A DVS pixel array, driven one frame at a time.
@@ -242,6 +242,9 @@ pub struct Simulator {
     blocks: Vec<Vec<SimEvent>>,
     /// The concatenated interval, sorted in place before being handed out.
     events: Vec<SimEvent>,
+    /// Where the pixel model runs. The CPU is the reference and the default; see
+    /// [`on_device`](Self::on_device).
+    device: crate::accel::Device,
 }
 
 impl Simulator {
@@ -287,7 +290,39 @@ impl Simulator {
             frame: 0,
             blocks: vec![Vec::new(); pixels.div_ceil(PIXEL_BLOCK)],
             events: Vec::new(),
+            device: crate::accel::Device::Cpu,
         }
+    }
+
+    /// Runs the pixel model on `device`.
+    ///
+    /// # What is and is not the same as the CPU
+    ///
+    /// The deterministic half is the same by construction. Threshold mismatch is drawn *here*, once
+    /// at [`new`](Self::new), and uploaded — the GPU never regenerates it — so two sensors built
+    /// from one seed are the same silicon whichever backend runs them. The sub-interval boundaries
+    /// are computed on the host in `f64` and uploaded for the same reason. What is left is `exp`,
+    /// `floor` and the arithmetic between them, where WGSL and Rust agree to a few ULP.
+    ///
+    /// The random half is **not** the same sample path. The CPU draws from a generator seeded per
+    /// block of pixels and consumed in order; a kernel with one invocation per pixel cannot replay a
+    /// sequential stream without serialising itself. The GPU uses a counter-based generator keyed on
+    /// `(seed, frame, sub-step, pixel, polarity)`, which is reproducible from run to run and across
+    /// devices — every operation in it is integer — but draws different numbers from the CPU's.
+    ///
+    /// So, measured rather than hoped for (see this module's `gpu_tests`):
+    ///
+    /// | configuration | how the backends compare |
+    /// |---|---|
+    /// | no shot noise, no leak, no mismatch | identical, event for event |
+    /// | mismatch on, still noiseless | same events, same polarity; a couple of timestamps in ~25 000 land a microsecond apart, because the crossing fraction is `f64` on the CPU and WGSL has no `f64` |
+    /// | noise on | same event *rate* to within a few per cent, different events — and bit-reproducible from run to run for a given seed |
+    ///
+    /// A run that needs to be compared against a stored CPU result should therefore either turn the
+    /// random terms off or compare distributions. A run that just needs events does not care.
+    pub fn on_device(mut self, device: crate::accel::Device) -> Self {
+        self.device = device;
+        self
     }
 
     pub fn sensor_size(&self) -> (usize, usize) {
@@ -333,6 +368,9 @@ impl Simulator {
     /// interact, so a block can walk the whole interval on its own, which keeps its state hot in
     /// cache and costs one rayon dispatch per frame instead of one per sub-step.
     fn simulate_interval(&mut self, t_previous: i64, span: i64, steps: usize) {
+        if self.device == crate::accel::Device::Gpu && self.simulate_interval_on_gpu(t_previous, span, steps) {
+            return;
+        }
         let width = self.width;
         let pixels = self.state.len();
         // Field-by-field borrows: the state is written, everything else only read.
@@ -391,6 +429,51 @@ impl Simulator {
                 .enumerate()
                 .for_each(|(block, (state, out))| run(block, state, out));
         }
+    }
+
+    /// The same interval on the GPU, returning `false` when there is no adapter so the caller can
+    /// fall through to the CPU loop.
+    ///
+    /// The kernel writes its events through one atomic cursor, so they arrive in whatever order the
+    /// scheduler produced them. That costs nothing: [`collect_interval`](Self::collect_interval)
+    /// sorts every interval by `(t, y, x, polarity)` anyway — the CPU path needs the same sort to
+    /// stay independent of its core count — so the two backends hand back the same ordering.
+    ///
+    /// The events land in `blocks[0]` because that is what `collect_interval` concatenates; the
+    /// remaining blocks are cleared so a run that switches backends mid-recording cannot replay a
+    /// stale interval.
+    #[cfg(feature = "gpu")]
+    fn simulate_interval_on_gpu(&mut self, t_previous: i64, span: i64, steps: usize) -> bool {
+        // Boundaries in `f64`, matching the CPU loop exactly; the shader has no `f64` to do this in.
+        let bounds: Vec<i64> = (0..=steps)
+            .map(|step| t_previous + (span as f64 * step as f64 / steps as f64) as i64)
+            .collect();
+        let Some(events) = crate::accel::sim::run_interval(
+            self.width,
+            self.height,
+            &self.config,
+            self.frame,
+            &bounds,
+            &self.prev_log,
+            &self.log_now,
+            &self.prev_luma,
+            &self.luma,
+            &mut self.state,
+        ) else {
+            return false;
+        };
+        for block in &mut self.blocks {
+            block.clear();
+        }
+        if let Some(first) = self.blocks.first_mut() {
+            *first = events;
+        }
+        true
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn simulate_interval_on_gpu(&mut self, _t_previous: i64, _span: i64, _steps: usize) -> bool {
+        false
     }
 
     /// Concatenates the per-block buffers, sorts, and builds the interval's stream.
@@ -707,7 +790,16 @@ pub fn simulate_video(
     max_frames: Option<usize>,
     on_events: impl FnMut(EventStream) -> std::io::Result<()>,
 ) -> std::io::Result<(usize, usize)> {
-    simulate_video_with_progress(path, config, scale, max_frames, on_events, |_| Ok(()))
+    simulate_video_on(
+        path,
+        config,
+        crate::accel::Device::Cpu,
+        None,
+        scale,
+        max_frames,
+        on_events,
+        |_| Ok(()),
+    )
 }
 
 /// [`simulate_video`], reporting after every frame.
@@ -721,6 +813,34 @@ pub fn simulate_video_with_progress(
     config: SimulatorConfig,
     scale: Option<(usize, usize)>,
     max_frames: Option<usize>,
+    on_events: impl FnMut(EventStream) -> std::io::Result<()>,
+    on_progress: impl FnMut(SimulateProgress) -> std::io::Result<()>,
+) -> std::io::Result<(usize, usize)> {
+    simulate_video_on(
+        path,
+        config,
+        crate::accel::Device::Cpu,
+        None,
+        scale,
+        max_frames,
+        on_events,
+        on_progress,
+    )
+}
+
+/// [`simulate_video_with_progress`] on a chosen device, optionally interpolating first.
+///
+/// See [`Simulator::on_device`] for exactly how the two backends differ, and
+/// [`crate::interp`] for what `interpolate` does and why it happens here rather than inside the
+/// pixel model.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_video_on(
+    path: &std::path::Path,
+    config: SimulatorConfig,
+    device: crate::accel::Device,
+    mut interpolate: Option<crate::interp::Interpolation<'_>>,
+    scale: Option<(usize, usize)>,
+    max_frames: Option<usize>,
     mut on_events: impl FnMut(EventStream) -> std::io::Result<()>,
     mut on_progress: impl FnMut(SimulateProgress) -> std::io::Result<()>,
 ) -> std::io::Result<(usize, usize)> {
@@ -730,22 +850,50 @@ pub fn simulate_video_with_progress(
         (Some(total), Some(limit)) => Some(total.min(limit)),
         (total, limit) => total.or(limit),
     };
-    let mut simulator = Simulator::new(info.width, info.height, config);
+    let mut simulator = Simulator::new(info.width, info.height, config).on_device(device);
     // Frame index drives the clock rather than any wall time: the source's own frame rate is what
     // the timestamps have to be consistent with.
     let us_per_frame = (1_000_000.0 / info.fps.max(1e-6)).round() as i64;
     let (mut frames, mut events) = (0usize, 0usize);
+    // The previous source frame, kept only when there is something to interpolate between.
+    let mut previous: Option<Vec<f32>> = None;
     while let Some(image) = decoder.next_frame()? {
         if max_frames.is_some_and(|limit| frames >= limit) {
             break;
         }
         let luma = luma_from_rgb(&image);
-        let stream = simulator.push_frame(&luma, frames as i64 * us_per_frame);
-        frames += 1;
-        events += stream.len();
-        if !stream.is_empty() {
-            on_events(stream)?;
+        let t = frames as i64 * us_per_frame;
+        let mut push = |simulator: &mut Simulator,
+                        frame: &[f32],
+                        t: i64,
+                        events: &mut usize|
+         -> std::io::Result<()> {
+            let stream = simulator.push_frame(frame, t);
+            *events += stream.len();
+            if !stream.is_empty() {
+                on_events(stream)?;
+            }
+            Ok(())
+        };
+
+        // Interpolated frames are pushed as ordinary source frames at proportional timestamps, so
+        // the simulator sees a denser recording and nothing else changes.
+        if let (Some(plan), Some(before)) = (interpolate.as_mut(), previous.as_ref()) {
+            let fractions = plan.fractions();
+            let between = plan
+                .interpolator
+                .between(before, &luma, info.width, info.height, &fractions)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            for (fraction, frame) in fractions.iter().zip(&between) {
+                let at = t - us_per_frame + (f64::from(*fraction) * us_per_frame as f64) as i64;
+                push(&mut simulator, frame, at, &mut events)?;
+            }
         }
+        push(&mut simulator, &luma, t, &mut events)?;
+        if interpolate.is_some() {
+            previous = Some(luma);
+        }
+        frames += 1;
         on_progress(SimulateProgress {
             frames,
             total_frames,
@@ -1211,5 +1359,237 @@ mod tests {
             "refractory must suppress: {free} vs {limited}"
         );
         assert!(limited > 0, "but not suppress everything");
+    }
+}
+
+/// The GPU pixel model against the CPU one — the contract [`Simulator::on_device`] states.
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_tests {
+    use super::{Simulator, SimulatorConfig, Upsample};
+    use crate::accel::Device;
+    use crate::EventStream;
+
+    fn skip_without_gpu() -> bool {
+        if crate::accel::gpu_available() {
+            return false;
+        }
+        assert!(
+            std::env::var("EVENTCV_REQUIRE_GPU").is_err(),
+            "EVENTCV_REQUIRE_GPU is set but no adapter was found"
+        );
+        true
+    }
+
+    /// A moving edge: the frames that make a DVS actually fire, rather than a flat field that
+    /// exercises nothing but the leak term.
+    fn frames(width: usize, height: usize, count: usize) -> Vec<Vec<f32>> {
+        (0..count)
+            .map(|index| {
+                let edge = (index * width) / count.max(1);
+                (0..width * height)
+                    .map(|pixel| if pixel % width < edge { 0.85 } else { 0.15 })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn run(config: SimulatorConfig, device: Device) -> Vec<EventStream> {
+        let (width, height) = (64, 48);
+        let mut simulator = Simulator::new(width, height, config).on_device(device);
+        frames(width, height, 12)
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| simulator.push_frame(frame, index as i64 * 10_000))
+            .collect()
+    }
+
+    fn columns(streams: &[EventStream]) -> (Vec<u16>, Vec<u16>, Vec<i64>, Vec<bool>) {
+        let mut out = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for stream in streams {
+            out.0.extend_from_slice(stream.xs());
+            out.1.extend_from_slice(stream.ys());
+            out.2.extend_from_slice(stream.ts());
+            out.3.extend_from_slice(stream.ps());
+        }
+        out
+    }
+
+    /// The regression gate. With the random terms off, the only difference left between the
+    /// backends is `exp`/`floor` rounding — and on a threshold model that either changes nothing or
+    /// changes an event, so "the same events" is the right assertion, not "close".
+    #[test]
+    fn a_noiseless_sensor_produces_the_same_events_on_both_backends() {
+        if skip_without_gpu() {
+            return;
+        }
+        for upsample in [Upsample::Off, Upsample::Fixed(4)] {
+            let config = SimulatorConfig {
+                upsample,
+                ..SimulatorConfig::ideal()
+            };
+            let cpu = columns(&run(config, Device::Cpu));
+            let gpu = columns(&run(config, Device::Gpu));
+            assert_eq!(cpu.2, gpu.2, "{upsample:?}: timestamps");
+            assert_eq!(cpu.0, gpu.0, "{upsample:?}: x");
+            assert_eq!(cpu.1, gpu.1, "{upsample:?}: y");
+            assert_eq!(cpu.3, gpu.3, "{upsample:?}: polarity");
+        }
+    }
+
+    /// Mismatch is drawn on the host and uploaded, so a sensor built from one seed is the same
+    /// silicon on either backend: the same pixels fire, the same number of times, with the same
+    /// polarity.
+    ///
+    /// Timestamps are where the two can part, and only just. The moment of the k-th crossing is
+    /// `k * threshold / |delta|` of the way through the sub-interval — a fraction the CPU widens to
+    /// `f64` before scaling, and the GPU cannot, because WGSL has no `f64`. On a run of ~25 000
+    /// events that puts a couple of them one microsecond apart. The assertion is that bound, not a
+    /// hopeful tolerance: anything larger would mean the model itself had diverged.
+    #[test]
+    fn threshold_mismatch_is_the_same_silicon_on_both_backends() {
+        if skip_without_gpu() {
+            return;
+        }
+        let config = SimulatorConfig {
+            sigma_thres: 0.05,
+            seed: 7,
+            ..SimulatorConfig::ideal()
+        };
+        let (cpu_x, cpu_y, cpu_t, cpu_p) = columns(&run(config, Device::Cpu));
+        let (gpu_x, gpu_y, gpu_t, gpu_p) = columns(&run(config, Device::Gpu));
+        assert_eq!(cpu_t.len(), gpu_t.len(), "event count");
+        assert_eq!(cpu_x, gpu_x, "x");
+        assert_eq!(cpu_y, gpu_y, "y");
+        assert_eq!(cpu_p, gpu_p, "polarity");
+
+        let apart: Vec<i64> = cpu_t
+            .iter()
+            .zip(&gpu_t)
+            .map(|(cpu, gpu)| (cpu - gpu).abs())
+            .filter(|difference| *difference > 0)
+            .collect();
+        assert!(
+            apart.iter().all(|difference| *difference <= 1),
+            "timestamps should differ by at most a microsecond, got {:?}",
+            apart.iter().max()
+        );
+        assert!(
+            apart.len() * 100 < cpu_t.len(),
+            "{} of {} timestamps differ; that is rounding turning into divergence",
+            apart.len(),
+            cpu_t.len()
+        );
+    }
+
+    /// With noise on the two backends draw different numbers by design, so the claim is
+    /// distributional: the same scene should produce a comparable event rate, not the same events.
+    #[test]
+    fn shot_noise_agrees_in_rate_rather_than_event_for_event() {
+        if skip_without_gpu() {
+            return;
+        }
+        let config = SimulatorConfig {
+            shot_noise_rate_hz: 500.0,
+            upsample: Upsample::Off,
+            ..SimulatorConfig::ideal()
+        };
+        let cpu: usize = run(config, Device::Cpu).iter().map(EventStream::len).sum();
+        let gpu: usize = run(config, Device::Gpu).iter().map(EventStream::len).sum();
+        let ratio = gpu as f64 / cpu as f64;
+        assert!(
+            (0.9..1.1).contains(&ratio),
+            "noise rates should agree to ~10%, got {cpu} vs {gpu} ({ratio:.3})"
+        );
+    }
+
+    /// The counter-based generator's whole point: same seed, same events, every run.
+    #[test]
+    fn a_noisy_run_is_reproducible_on_the_gpu() {
+        if skip_without_gpu() {
+            return;
+        }
+        let config = SimulatorConfig {
+            shot_noise_rate_hz: 500.0,
+            leak_rate_hz: 5.0,
+            ..SimulatorConfig::default()
+        };
+        let first = columns(&run(config, Device::Gpu));
+        for _ in 0..2 {
+            assert_eq!(first.2, columns(&run(config, Device::Gpu)).2);
+        }
+    }
+}
+
+/// Interpolation as a *preprocessing* stage — that it changes what the simulator sees, and that
+/// leaving it out changes nothing.
+#[cfg(test)]
+mod interp_tests {
+    use super::{simulate_video_on, SimulatorConfig, Upsample};
+    use crate::interp::{Interpolation, LinearInterpolator};
+
+    /// A short synthetic clip, or `None` when ffmpeg is not on `PATH` — the same shape the other
+    /// video-backed test in this module uses.
+    fn clip() -> Option<std::path::PathBuf> {
+        std::process::Command::new("ffmpeg").arg("-version").output().ok()?;
+        let path = std::env::temp_dir().join(format!("eventcv_interp_{}.mp4", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=64x48:rate=30:duration=1"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .ok()?;
+        made.success().then_some(path)
+    }
+
+    fn count(path: &std::path::Path, factor: usize) -> usize {
+        let mut linear = LinearInterpolator;
+        let plan = (factor > 1).then_some(Interpolation {
+            interpolator: &mut linear as &mut dyn crate::interp::FrameInterpolator,
+            factor,
+        });
+        let mut events = 0;
+        simulate_video_on(
+            path,
+            SimulatorConfig {
+                upsample: Upsample::Off,
+                ..SimulatorConfig::ideal()
+            },
+            crate::accel::Device::Cpu,
+            plan,
+            None,
+            None,
+            |stream| {
+                events += stream.len();
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("simulating the clip");
+        events
+    }
+
+    /// The linear baseline is what the simulator's own subdivision already does, so inserting
+    /// frames that way must not change the events — which is the strongest statement available that
+    /// the plumbing is a *preprocessing* stage and not a change to the model.
+    #[test]
+    fn a_linear_interpolator_reproduces_the_uninterpolated_run() {
+        let Some(path) = clip() else {
+            return; // no ffmpeg here
+        };
+        let plain = count(&path, 1);
+        assert!(plain > 0, "the clip should produce events at all");
+        for factor in [2, 4] {
+            let interpolated = count(&path, factor);
+            // Not exactly equal: the extra frames give the threshold model more chances to cross,
+            // so timestamps sharpen. The count is what must not move.
+            let drift = (interpolated as f64 - plain as f64).abs() / plain as f64;
+            assert!(
+                drift < 0.02,
+                "factor {factor}: {plain} events became {interpolated}, which is a change in the \
+                 model rather than in the timing"
+            );
+        }
+        std::fs::remove_file(&path).ok();
     }
 }

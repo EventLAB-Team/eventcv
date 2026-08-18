@@ -259,3 +259,58 @@ frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")   # → EventFr
 
 `"pset"` and `"labels"` are not valid names here — `pset` is sparse (see above), and `labels`
 is generated from a frame, not a stream.
+
+## Running on a GPU
+
+Every representation runs on the CPU by default, and those implementations are the reference: the
+GPU kernels are checked against them, not the other way round. `device="gpu"` moves one call,
+`eventcv.set_device("gpu")` moves the session, and `EVENTCV_DEVICE=gpu` moves a whole process
+without touching any code.
+
+```python
+frame = stream.voxel(bins=5, device="gpu")
+
+ecv.set_device("gpu")        # everything from here on, including reader slices
+print(ecv.get_device())      # "gpu"
+print(ecv.gpu_available())   # False on a build or a machine without one
+```
+
+The backend is `wgpu`, so the same shaders run on **Metal** (macOS), **Vulkan** (Linux) and
+**DX12** (Windows) — there is no CUDA path to install and no separate Apple path to maintain.
+Asking for a GPU that is not there raises rather than quietly falling back, because "my GPU is not
+being used" should not be something you discover by timing a benchmark.
+
+### Whether it is worth it
+
+Usually not, and the numbers say so. Measured on an RTX 2080 against a 12-core CPU, release build,
+8 M events from a 346×260 recording:
+
+| kernel | CPU | GPU | |
+|---|---|---|---|
+| `count` | 10.5 ms | 19.1 ms | CPU wins |
+| `countmask` | 16.7 ms | 20.3 ms | CPU wins |
+| `voxel(bins=5)` | 20.8 ms | 28.8 ms | CPU wins |
+| `tsurf` | 34.2 ms | 29.8 ms | about even |
+| `atsurf` | 83.9 ms | 29.2 ms | **2.9× faster** |
+
+The pattern is not about the GPU being slow. These kernels are scatter-adds that the CPU already
+does at memory speed, so the cost is dominated by getting the events across the bus — and only
+`atsurf`, which evaluates an exponential per event, has enough arithmetic to pay for the trip. The
+place the GPU wins clearly is the **simulator**, where every sub-step is a full pass of real
+arithmetic over every pixel; see {doc}`simulation`.
+
+So: leave it on the CPU unless you have measured otherwise on your own data. `cargo bench --features
+gpu -- representations_gpu` runs the comparison above on your machine.
+
+### What changes, numerically
+
+Nothing you would notice, and the tests pin exactly how much:
+
+- `count`, `polarity`, `countmask` and `tsurf` are **bit-identical** to the CPU. They accumulate
+  integers, and integer addition commutes exactly where float addition does not.
+- `voxel` and `atsurf` accumulate in Q16.16 fixed point, which is what makes them independent of
+  the order the GPU happened to run in. They agree with the CPU to about 1e-4 on a cell — well
+  below `float32`'s own resolution for those values — and are bit-reproducible run to run.
+- A representation with no kernel (`tencode`, `mcts`, `binary`, `flow`) simply runs on the CPU when
+  you ask for the GPU. A pipeline that sets `device="gpu"` once should not have to know which steps
+  were ported.

@@ -139,6 +139,173 @@ pub fn write_npz_stream(path: impl AsRef<Path>, stream: &EventStream) -> Result<
     finish(npz)
 }
 
+/// The `.npy` preamble: magic, version, and the `u16` header length.
+const NPY_PREAMBLE: usize = 10;
+
+/// numpy pads the header dict so the array data starts on a 64-byte boundary.
+const NPY_ALIGN: usize = 64;
+
+/// Builds a `.npy` header for a 1-D array of `len` elements with numpy dtype string `descr`.
+fn npy_header(descr: &str, len: usize) -> Vec<u8> {
+    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({len},), }}");
+    // The dict is padded with spaces and newline-terminated so `NPY_PREAMBLE + header` lands on a
+    // 64-byte boundary, which is what numpy itself writes.
+    let padded = (NPY_PREAMBLE + dict.len() + 1).next_multiple_of(NPY_ALIGN) - NPY_PREAMBLE;
+    let mut header = Vec::with_capacity(NPY_PREAMBLE + padded);
+    header.extend_from_slice(b"\x93NUMPY\x01\x00");
+    header.extend_from_slice(&(padded as u16).to_le_bytes());
+    header.extend_from_slice(dict.as_bytes());
+    header.resize(NPY_PREAMBLE + padded - 1, b' ');
+    header.push(b'\n');
+    header
+}
+
+/// One event column being spilled to a scratch file while the recording is still open.
+struct Column {
+    descr: &'static str,
+    name: &'static str,
+    path: std::path::PathBuf,
+    writer: std::io::BufWriter<File>,
+}
+
+/// Writes a native EventCV `.npz` a window at a time — the streaming form of
+/// [`write_npz_stream`].
+///
+/// A `.npz` is a zip of `.npy` members, and a `.npy` states its length in a header written *before*
+/// the data, so the length has to be known before the first byte goes out. Rather than hold the
+/// recording in memory to learn it, each column is spilled to a scratch file beside the target and
+/// copied into the archive at [`finish`](super::EventSink::finish), when the count is finally
+/// known. Memory stays flat; the cost is that the `.npz` does not exist until the recording is
+/// closed, and that the scratch files transiently need the recording's own size on disk.
+pub struct NpzEventSink {
+    path: std::path::PathBuf,
+    columns: Vec<Column>,
+    /// `None` until the first non-empty append fixes the sensor size and time base.
+    metadata: Option<((usize, usize), f64)>,
+    n_events: usize,
+}
+
+impl NpzEventSink {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, IoError> {
+        let path = path.as_ref().to_path_buf();
+        // Scratch files sit beside the target so the copy at `finish` stays on one filesystem.
+        let columns = [("t", "<i8"), ("x", "<u2"), ("y", "<u2"), ("p", "|u1")]
+            .into_iter()
+            .map(|(name, descr)| {
+                let part = path.with_extension(format!("{name}.part"));
+                Ok(Column {
+                    descr,
+                    name,
+                    writer: std::io::BufWriter::new(File::create(&part).map_err(IoError::Io)?),
+                    path: part,
+                })
+            })
+            .collect::<Result<Vec<_>, IoError>>()?;
+        Ok(Self {
+            path,
+            columns,
+            metadata: None,
+            n_events: 0,
+        })
+    }
+
+    /// Streams one spilled column into the archive as a STORED `.npy` member.
+    fn store_column(
+        zip: &mut zip::ZipWriter<File>,
+        column: &Column,
+        len: usize,
+    ) -> Result<(), IoError> {
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        zip.start_file(format!("{}.npy", column.name), options)
+            .map_err(|error| IoError::Format(format!("zip: {error}")))?;
+        zip.write_all(&npy_header(column.descr, len))
+            .map_err(IoError::Io)?;
+        let mut spilled = BufReader::new(File::open(&column.path).map_err(IoError::Io)?);
+        std::io::copy(&mut spilled, zip).map_err(IoError::Io)?;
+        Ok(())
+    }
+}
+
+impl Drop for NpzEventSink {
+    fn drop(&mut self) {
+        // A sink dropped without `finish` leaves no archive; the scratch files would otherwise
+        // outlive it as several gigabytes of nothing.
+        for column in &self.columns {
+            let _ = std::fs::remove_file(&column.path);
+        }
+    }
+}
+
+impl super::EventSink for NpzEventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        self.metadata
+            .get_or_insert_with(|| (stream.sensor_size(), stream.timestamp_scale_ms()));
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for value in ts {
+            self.columns[0]
+                .writer
+                .write_all(&value.to_le_bytes())
+                .map_err(IoError::Io)?;
+        }
+        for (column, values) in self.columns[1..3].iter_mut().zip([xs, ys]) {
+            for value in values {
+                column
+                    .writer
+                    .write_all(&value.to_le_bytes())
+                    .map_err(IoError::Io)?;
+            }
+        }
+        for &value in ps {
+            self.columns[3]
+                .writer
+                .write_all(&[u8::from(value)])
+                .map_err(IoError::Io)?;
+        }
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        for column in &mut self.columns {
+            column.writer.flush().map_err(IoError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        for column in &mut self.columns {
+            column.writer.flush().map_err(IoError::Io)?;
+        }
+        let mut zip = zip::ZipWriter::new(File::create(&self.path).map_err(IoError::Io)?);
+        for column in &self.columns {
+            Self::store_column(&mut zip, column, self.n_events)?;
+        }
+        // An empty recording never learned a sensor size; fall back to the same 1x1 the readers'
+        // `infer_size` produces for one, so the file still round-trips.
+        let ((width, height), scale) = self.metadata.unwrap_or(((1, 1), DEFAULT_SCALE_MS));
+        let mut scalar = |name: &str, descr: &str, bytes: &[u8]| -> Result<(), IoError> {
+            let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file(format!("{name}.npy"), options)
+                .map_err(|error| IoError::Format(format!("zip: {error}")))?;
+            zip.write_all(&npy_header(descr, 1)).map_err(IoError::Io)?;
+            zip.write_all(bytes).map_err(IoError::Io)
+        };
+        scalar("width", "<u8", &(width as u64).to_le_bytes())?;
+        scalar("height", "<u8", &(height as u64).to_le_bytes())?;
+        scalar("timestamp_scale_ms", "<f8", &scale.to_le_bytes())?;
+        zip.finish()
+            .map_err(|error| IoError::Format(format!("zip: {error}")))?;
+        Ok(())
+    }
+}
+
 /// Persists an [`EventFrame`] as `.npz`: the flat `data` (native dtype), the `[C, H, W]`
 /// `shape`, a `dtype` code, and the `kind` / `channel_names` tags so [`read_npz_frame`]
 /// recovers the frame verbatim.

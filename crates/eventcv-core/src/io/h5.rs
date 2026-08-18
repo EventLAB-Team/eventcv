@@ -1314,6 +1314,26 @@ impl Hdf5EventSink {
     }
 }
 
+/// HDF5 was the first appendable target and the one the trait's shape was taken from, so every
+/// method here forwards to the inherent one.
+impl super::EventSink for Hdf5EventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        Hdf5EventSink::append(self, stream)
+    }
+
+    fn n_events(&self) -> usize {
+        Hdf5EventSink::n_events(self)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        Hdf5EventSink::flush(self)
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), IoError> {
+        Hdf5EventSink::finish(*self)
+    }
+}
+
 /// Creates one empty, extendable (`0..` on the append axis), chunked column dataset, optionally
 /// shuffled and gzip-compressed.
 fn new_event_column<T: H5Type>(

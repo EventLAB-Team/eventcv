@@ -16,7 +16,7 @@
 //! the decoder state differ, which is what [`Codec`] abstracts.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::{EventStream, EventStreamBuilder, IoError, LoadOptions, RawEvent, SliceSource};
@@ -539,6 +539,216 @@ pub fn read_raw(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventSt
     let source = open_raw_slice(path, options)?;
     let limit = options.max_events.unwrap_or(source.n_events());
     source.slice_index(0, limit)
+}
+
+/// Which of the two `.raw` encodings [`RawEventSink`] writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EvtVersion {
+    /// One self-contained 32-bit word per event. Four bytes an event, and a decoder needs no state
+    /// beyond the timestamp high half — the default for that reason.
+    #[default]
+    Evt2,
+    /// Stateful 16-bit words. Two bytes an event before any vectorisation, and less than one for a
+    /// dense row, at the cost of a decoder that has to carry `y`, `x` base and time across words.
+    Evt3,
+}
+
+/// Writes a Prophesee `.raw` recording a window at a time — the inverse of [`read_raw`].
+///
+/// The `%` header goes out on the first non-empty append (it carries `% geometry`, which comes from
+/// the stream's sensor size); after that both encodings are pure appends, so the file is readable at
+/// any point.
+///
+/// **Events must arrive in non-decreasing time order.** Both encodings carry the timestamp as a
+/// coarse half that is emitted only when it changes, so a backwards step would be encoded as a
+/// counter wrap and silently move the event forwards by hours. Out-of-order input is rejected
+/// rather than mis-encoded.
+pub struct RawEventSink {
+    writer: BufWriter<File>,
+    version: EvtVersion,
+    header_written: bool,
+    n_events: usize,
+    last_t: Option<i64>,
+    /// EVT2: the timestamp high half last emitted. EVT3: `(time_base, time_low)`.
+    state: EncoderState,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EncoderState {
+    /// `t >> EVT2_TIME_SHIFT` (EVT2) or `t >> 12` (EVT3), as last written.
+    time_high: Option<i64>,
+    /// EVT3 only: the low 12 bits, and the row and polarity the decoder currently holds.
+    time_low: Option<i64>,
+    y: Option<u16>,
+}
+
+impl RawEventSink {
+    pub fn create(path: impl AsRef<Path>, version: EvtVersion) -> Result<Self, IoError> {
+        Ok(Self {
+            writer: BufWriter::new(File::create(path).map_err(IoError::Io)?),
+            version,
+            header_written: false,
+            n_events: 0,
+            last_t: None,
+            state: EncoderState::default(),
+        })
+    }
+
+    fn word16(&mut self, kind: u16, payload: u16) -> Result<(), IoError> {
+        self.writer
+            .write_all(&(((kind & 0xF) << 12) | (payload & 0x0FFF)).to_le_bytes())
+            .map_err(IoError::Io)
+    }
+
+    fn word32(&mut self, word: u32) -> Result<(), IoError> {
+        self.writer.write_all(&word.to_le_bytes()).map_err(IoError::Io)
+    }
+
+    /// EVT2: an `EVT_TIME_HIGH` whenever the 28-bit high half moves, then one CD word per event.
+    fn append_evt2(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for index in 0..stream.len() {
+            let t = ts[index];
+            let high = t >> EVT2_TIME_SHIFT;
+            if self.state.time_high != Some(high) {
+                // Masked to 28 bits: past that the counter wraps, which is exactly what the
+                // decoder's `high_loops` accounting reconstructs.
+                self.word32((0x8 << 28) | (high as u32 & 0x0FFF_FFFF))?;
+                self.state.time_high = Some(high);
+            }
+            let low = (t - (high << EVT2_TIME_SHIFT)) as u32 & 0x3F;
+            self.word32(
+                ((ps[index] as u32) << 28)
+                    | (low << 22)
+                    | ((u32::from(xs[index]) & 0x7FF) << 11)
+                    | (u32::from(ys[index]) & 0x7FF),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// EVT3: `EVT_TIME_HIGH` / `EVT_TIME_LOW` when the clock moves, `EVT_ADDR_Y` when the row
+    /// changes, then the events themselves.
+    ///
+    /// A run of events sharing row, time and polarity with ascending `x` is written as a
+    /// `VECT_BASE_X` plus one `VECT_12` per 12-pixel window — one word for up to twelve events
+    /// instead of one word each. That is what EVT3 is *for*, and such runs are exactly what a
+    /// recording decoded from EVT3 in the first place still contains. Anything shorter goes out as
+    /// plain `EVT_ADDR_X`, which costs fewer words than a vector's two-word preamble.
+    fn append_evt3(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        let mut index = 0;
+        while index < stream.len() {
+            let (t, y, p) = (ts[index], ys[index], ps[index]);
+            let high = t >> 12;
+            if self.state.time_high != Some(high) {
+                self.word16(0x8, (high & 0xFFF) as u16)?;
+                self.state.time_high = Some(high);
+                // The decoder resets `time` to the base on a TIME_HIGH, so the low half it holds
+                // is no longer whatever we last sent.
+                self.state.time_low = Some(0);
+            }
+            let low = t - (high << 12);
+            if self.state.time_low != Some(low) {
+                self.word16(0x6, low as u16)?;
+                self.state.time_low = Some(low);
+            }
+            if self.state.y != Some(y) {
+                self.word16(0x0, y & 0x07FF)?;
+                self.state.y = Some(y);
+            }
+            // How many events from here share this row, time and polarity with ascending x.
+            let mut run = 1;
+            while index + run < stream.len()
+                && ts[index + run] == t
+                && ys[index + run] == y
+                && ps[index + run] == p
+                && xs[index + run] > xs[index + run - 1]
+            {
+                run += 1;
+            }
+            let span = usize::from(xs[index + run - 1] - xs[index]) + 1;
+            let vector_words = 1 + span.div_ceil(12);
+            if run > 2 && vector_words < run {
+                let mut base = xs[index];
+                self.word16(0x3, (base & 0x07FF) | ((p as u16) << 11))?;
+                let end = index + run;
+                let mut cursor = index;
+                while cursor < end {
+                    let mut mask = 0u16;
+                    while cursor < end && xs[cursor] < base + 12 {
+                        mask |= 1 << (xs[cursor] - base);
+                        cursor += 1;
+                    }
+                    self.word16(0x4, mask)?;
+                    base += 12;
+                }
+                index = end;
+            } else {
+                for offset in 0..run {
+                    self.word16(
+                        0x2,
+                        (xs[index + offset] & 0x07FF) | ((p as u16) << 11),
+                    )?;
+                }
+                index += run;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl super::EventSink for RawEventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        let ts = stream.ts();
+        for index in 0..stream.len() {
+            let previous = if index == 0 { self.last_t } else { Some(ts[index - 1]) };
+            if previous.is_some_and(|previous| ts[index] < previous) {
+                return Err(IoError::Unsupported(format!(
+                    "Prophesee .raw carries the timestamp as a coarse half emitted only when it \
+                     changes, so events must be in time order: {} follows {}. Sort first \
+                     (stream.sort_by_time()).",
+                    ts[index],
+                    previous.unwrap_or_default()
+                )));
+            }
+        }
+        if !self.header_written {
+            let (width, height) = stream.sensor_size();
+            let format = match self.version {
+                EvtVersion::Evt2 => "EVT2",
+                EvtVersion::Evt3 => "EVT3",
+            };
+            write!(
+                self.writer,
+                "% format {format}\n% geometry {width}x{height}\n% generator eventcv\n% end\n"
+            )
+            .map_err(IoError::Io)?;
+            self.header_written = true;
+        }
+        match self.version {
+            EvtVersion::Evt2 => self.append_evt2(stream)?,
+            EvtVersion::Evt3 => self.append_evt3(stream)?,
+        }
+        self.last_t = ts.last().copied();
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        self.writer.flush().map_err(IoError::Io)
+    }
 }
 
 #[cfg(test)]

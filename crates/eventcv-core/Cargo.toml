@@ -82,6 +82,15 @@ ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, fea
 # panic from inside ort's lazy initialiser. Already in the tree — ort pulls it in for the same job.
 libloading = { version = "0.9", optional = true }
 
+# Optional: GPU compute for the representation kernels and the simulator's pixel model. `wgpu`
+# compiles to Metal on macOS, Vulkan on Linux and DX12 on Windows, so one set of WGSL shaders
+# covers every platform and nothing needs a vendor toolkit at build time — the reason this is not
+# a CUDA path plus a Metal path. The versions match the ones `eventcv-py` already pins for the
+# viewer, so a wheel links one wgpu rather than two. Enable with `--features gpu`.
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }   # block on wgpu's async device/adapter requests
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
 [dev-dependencies]
 # Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
 # carries the numbers, and the plots need gnuplot or a heavier plotting stack.
@@ -99,6 +108,9 @@ camera = ["dep:neuromorphic-drivers", "dep:serde_json"]
 # ONNX inference for `Model`. Off by default so a source build never has to fetch a runtime;
 # the published wheels turn it on (see `[tool.maturin] features` in pyproject.toml).
 onnx = ["dep:ort", "dep:libloading"]
+# GPU compute (`Device::Gpu`). Off by default: the CPU path is the reference implementation and
+# stays the default at run time even when this is built in.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 # docs.rs builds with default features (hdf5 off), so it never has to compile libhdf5
 # from source — the API surface is identical, and the build stays fast and network-free.

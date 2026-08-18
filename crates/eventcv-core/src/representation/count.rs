@@ -34,20 +34,53 @@ impl Representation for EventCount {
             counts[event_index(event, width, height)?] += 1;
         }
 
-        let data = if self.normalize {
-            EventFrameData::U8(normalize_u8(&counts))
-        } else {
-            EventFrameData::U64(counts)
-        };
+        Ok(self.frame(counts, width, height))
+    }
 
-        Ok(EventFrame {
-            data,
+    /// Counting is the one kernel that is *exactly* the CPU's answer rather than close to it:
+    /// contributions are ones and the accumulator is an integer, so the sum is the same however
+    /// the invocations interleave.
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        device: crate::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
+        if device == crate::accel::Device::Cpu {
+            return self.generate(stream);
+        }
+        let (width, height, length) = frame_len(stream, 1)?;
+        let cells = super::on_gpu(
+            stream,
+            &crate::accel::GpuDispatch {
+                entry: "count",
+                cells: length,
+                initial: 0,
+                bins: 1,
+                span_ms: 0.0,
+                fixed_one: 1.0,
+                window_ms: None,
+                needs_ages: false,
+            },
+        )?;
+        let counts = cells.iter().map(|cell| *cell as u64).collect();
+        Ok(self.frame(counts, width, height))
+    }
+}
+
+impl EventCount {
+    fn frame(&self, counts: Vec<u64>, width: usize, height: usize) -> EventFrame {
+        EventFrame {
+            data: if self.normalize {
+                EventFrameData::U8(normalize_u8(&counts))
+            } else {
+                EventFrameData::U64(counts)
+            },
             channels: 1,
             width,
             height,
             kind: RepresentationKind::Count,
             channel_names: vec!["count".to_owned()],
-        })
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rosbag::{ChunkRecord, IndexRecord, MessageRecord, RosBag};
@@ -193,6 +193,190 @@ pub fn write_bag(
     )
     .map_err(IoError::Io)?;
     writer.flush().map_err(IoError::Io)
+}
+
+/// Writes a ROS1 bag a window at a time — the streaming form of [`write_bag`].
+///
+/// A bag chunk states its uncompressed size in a header that precedes the payload, and the bag
+/// header states where the index sits, so neither can be written until the recording is closed.
+/// The chunk payload is therefore spilled to a scratch file beside the target as it is appended and
+/// copied into place at [`finish`](super::EventSink::finish); only the index entries — twelve bytes
+/// per million-event message — stay in memory.
+///
+/// The result is byte-for-byte what [`write_bag`] would have produced from the concatenated
+/// windows, so a recording made this way is indistinguishable from one saved in a single call.
+pub struct BagEventSink {
+    path: PathBuf,
+    scratch: PathBuf,
+    payload: BufWriter<File>,
+    payload_len: u64,
+    topic: String,
+    /// `(start time, byte offset within the payload)` for every message written.
+    index_entries: Vec<(i64, u32)>,
+    /// Sensor size and time span, taken from the appended windows.
+    sensor_size: Option<(usize, usize)>,
+    span: Option<(i64, i64)>,
+    n_events: usize,
+}
+
+/// The one connection every bag eventcv writes carries.
+const CONN_ID: u32 = 0;
+
+impl BagEventSink {
+    pub fn create(path: impl AsRef<Path>, topic: Option<&str>) -> Result<Self, IoError> {
+        let path = path.as_ref().to_path_buf();
+        let scratch = path.with_extension("chunk.part");
+        let topic = topic.unwrap_or(DEFAULT_TOPIC).to_owned();
+        let mut payload = BufWriter::new(File::create(&scratch).map_err(IoError::Io)?);
+        // The connection record opens the chunk, exactly as in `write_bag`.
+        let connection = make_record(&connection_fields(CONN_ID, &topic), &connection_data(&topic));
+        payload.write_all(&connection).map_err(IoError::Io)?;
+        Ok(Self {
+            path,
+            scratch,
+            payload,
+            payload_len: connection.len() as u64,
+            topic,
+            index_entries: Vec::new(),
+            sensor_size: None,
+            span: None,
+            n_events: 0,
+        })
+    }
+
+    /// Writes one `dvs_msgs/EventArray` message covering `[start, end)` and indexes it.
+    fn write_message(
+        &mut self,
+        stream: &EventStream,
+        start: usize,
+        end: usize,
+    ) -> Result<(), IoError> {
+        let stamp = stream.ts().get(start).copied().unwrap_or(0);
+        let offset = u32::try_from(self.payload_len).map_err(|_| {
+            IoError::Unsupported(
+                "a ROS bag chunk is limited to 4 GB by its 32-bit size field; split the recording \
+                 across files, or record to .h5/.aedat4 which have no such ceiling"
+                    .to_owned(),
+            )
+        })?;
+        let message = serialize_event_array(stream, start, end);
+        let record = make_record(&message_fields(CONN_ID, stamp), &message);
+        self.payload.write_all(&record).map_err(IoError::Io)?;
+        self.payload_len += record.len() as u64;
+        self.index_entries.push((stamp, offset));
+        Ok(())
+    }
+}
+
+impl Drop for BagEventSink {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.scratch);
+    }
+}
+
+impl super::EventSink for BagEventSink {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        self.sensor_size.get_or_insert_with(|| stream.sensor_size());
+        let ts = stream.ts();
+        if let (Some(&lo), Some(&hi)) = (ts.iter().min(), ts.iter().max()) {
+            self.span = Some(match self.span {
+                Some((start, end)) => (start.min(lo), end.max(hi)),
+                None => (lo, hi),
+            });
+        }
+        // Messages are capped at `MESSAGE_EVENTS` here for the same reason `write_bag` caps them:
+        // a reader deserialises a whole message at once.
+        let mut start = 0;
+        while start < stream.len() {
+            let end = (start + MESSAGE_EVENTS).min(stream.len());
+            self.write_message(stream, start, end)?;
+            start = end;
+        }
+        self.n_events += stream.len();
+        Ok(())
+    }
+
+    fn n_events(&self) -> usize {
+        self.n_events
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.payload.flush().map_err(IoError::Io)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<(), IoError> {
+        if self.index_entries.is_empty() {
+            // Same as `write_bag`: one empty message so the reader finds a connection and data,
+            // and rebuilds an empty stream with the right sensor size.
+            let (width, height) = self.sensor_size.unwrap_or((1, 1));
+            let empty = EventStreamBuilder::new(width, height, 0.001).build();
+            self.write_message(&empty, 0, 0)?;
+        }
+        self.payload.flush().map_err(IoError::Io)?;
+        let payload_len = u32::try_from(self.payload_len).map_err(|_| {
+            IoError::Unsupported(
+                "a ROS bag chunk is limited to 4 GB by its 32-bit size field; record to \
+                 .h5/.aedat4 instead"
+                    .to_owned(),
+            )
+        })?;
+
+        let message_count = self.index_entries.len() as u32;
+        let (start_us, end_us) = self.span.unwrap_or((0, 0));
+        let bag_header_len = make_record(&bag_header_fields(0, 1, 1), &[]).len();
+        let chunk_pos = BAG_MAGIC.len() + bag_header_len;
+        let chunk_fields = chunk_fields(payload_len);
+        let mut index_data: Vec<u8> = Vec::with_capacity(self.index_entries.len() * 12);
+        for (time_us, offset) in &self.index_entries {
+            index_data.extend_from_slice(&ros_time(*time_us));
+            index_data.extend_from_slice(&offset.to_le_bytes());
+        }
+        let index_record = make_record(&index_data_fields(CONN_ID, message_count), &index_data);
+        let index_pos =
+            chunk_pos + record_len(&chunk_fields, payload_len as usize) + index_record.len();
+
+        let mut writer = BufWriter::new(File::create(&self.path).map_err(IoError::Io)?);
+        writer.write_all(BAG_MAGIC).map_err(IoError::Io)?;
+        write_record(&mut writer, &bag_header_fields(index_pos as u64, 1, 1), &[])
+            .map_err(IoError::Io)?;
+        // The chunk record is framed by hand rather than through `write_record`, because its data
+        // is the scratch file rather than a slice in memory — the whole point of this sink. The
+        // framing is `write_record`'s: header length, the fields, data length, then the data.
+        let header_len: usize = chunk_fields.iter().map(Vec::len).sum();
+        writer
+            .write_all(&(header_len as u32).to_le_bytes())
+            .map_err(IoError::Io)?;
+        for field in &chunk_fields {
+            writer.write_all(field).map_err(IoError::Io)?;
+        }
+        writer
+            .write_all(&payload_len.to_le_bytes())
+            .map_err(IoError::Io)?;
+        let mut scratch = BufReader::new(File::open(&self.scratch).map_err(IoError::Io)?);
+        std::io::copy(&mut scratch, &mut writer).map_err(IoError::Io)?;
+
+        writer.write_all(&index_record).map_err(IoError::Io)?;
+        // Footer (read by `index_records`): the connection, then the chunk info.
+        write_record(
+            &mut writer,
+            &connection_fields(CONN_ID, &self.topic),
+            &connection_data(&self.topic),
+        )
+        .map_err(IoError::Io)?;
+        let mut chunk_info_data = Vec::with_capacity(8);
+        chunk_info_data.extend_from_slice(&CONN_ID.to_le_bytes());
+        chunk_info_data.extend_from_slice(&message_count.to_le_bytes());
+        write_record(
+            &mut writer,
+            &chunk_info_fields(chunk_pos as u64, start_us, end_us),
+            &chunk_info_data,
+        )
+        .map_err(IoError::Io)?;
+        writer.flush().map_err(IoError::Io)
+    }
 }
 
 /// Splits a microsecond timestamp into the ROS `sec`/`nsec` pair (8 bytes, little-endian) the

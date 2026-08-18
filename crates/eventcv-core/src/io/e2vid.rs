@@ -162,6 +162,28 @@ impl E2vidWriter {
     }
 }
 
+/// E2VID's text export is append-only by nature — a header and then lines — so the sink form is
+/// the inherent one and the inventory methods just forward. `flush` is a no-op for the zip case:
+/// a partially written deflate stream is not a readable archive either way, and the central
+/// directory only exists after [`finish`](Self::finish).
+impl super::EventSink for E2vidWriter {
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
+        E2vidWriter::append(self, stream)
+    }
+
+    fn n_events(&self) -> usize {
+        E2vidWriter::n_events(self)
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        self.sink.flush().map_err(IoError::Io)
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), IoError> {
+        E2vidWriter::finish(*self)
+    }
+}
+
 /// Writes a whole stream in one call — the eager form of [`E2vidWriter`].
 pub fn write_e2vid(path: impl AsRef<Path>, stream: &EventStream) -> Result<(), IoError> {
     let mut writer = E2vidWriter::create(path)?;

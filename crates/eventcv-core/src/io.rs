@@ -13,11 +13,13 @@ mod prophesee;
 mod prophesee_raw;
 mod text;
 
-pub use aedat::{open_aedat_slice, read_aedat};
-pub use aedat4::{open_aedat4_slice, read_aedat4};
+pub use aedat::{open_aedat_slice, read_aedat, AedatEventSink};
+pub use aedat4::{
+    open_aedat4_slice, read_aedat4, Aedat4EventSink, Compression as PacketCompression,
+};
 pub use bag::{
     bag_topics, open_bag_slice, read_bag, read_bag_camera_info, read_bag_frames, read_bag_imu,
-    write_bag, BagSliceSource, ImuSample,
+    write_bag, BagEventSink, BagSliceSource, ImuSample,
 };
 pub use e2vid::{write_e2vid, E2vidWriter};
 #[cfg(feature = "hdf5")]
@@ -25,12 +27,12 @@ pub use h5::{
     open_hdf5_slice, read_hdf5, read_hdf5_frame, write_hdf5_frame, write_hdf5_stream,
     Hdf5EventSink, Hdf5FrameSink, Hdf5SliceSource,
 };
-pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream};
-pub use prophesee::read_dat;
-pub use prophesee_raw::{open_raw_slice, read_raw};
+pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream, NpzEventSink};
+pub use prophesee::{read_dat, DatEventSink};
+pub use prophesee_raw::{open_raw_slice, read_raw, EvtVersion, RawEventSink};
 pub use text::{
-    load_rows, open_text_slice, read_text, write_text_stream, ColumnOrder, RawRow, TextOptions,
-    TextReader, TimeUnit,
+    load_rows, open_text_slice, read_text, write_text_stream, ColumnOrder, RawRow, TextEventSink,
+    TextOptions, TextReader, TimeUnit,
 };
 
 use crate::representation::{EventFrame, EventFrameData};
@@ -223,11 +225,81 @@ fn detect_format(path: &Path) -> Result<Format, IoError> {
     }
 }
 
-/// Whether `path`'s format can be written incrementally with [`Hdf5EventSink`] — currently only
-/// HDF5. The live recorder uses this to stream a camera to disk window-by-window when it can, and
-/// fall back to buffering the whole recording in memory (then [`save_stream`]) when it can't.
+/// A writer that takes an event recording a window at a time, so a session longer than memory can
+/// be streamed to disk as it is captured. The counterpart of [`SliceSource`] on the read side.
+///
+/// Every event format eventcv writes implements this — the bulk writers in [`save_stream`] are the
+/// same sinks driven from a single stream. What differs is where the cost falls: HDF5, text, AEDAT
+/// and the Prophesee formats append straight to the file, while npz and rosbag have to fix up a
+/// header or an index at the end, which is what [`finish`](Self::finish) is for.
+pub trait EventSink: Send {
+    /// Appends one window's events. Empty windows are a no-op. The first non-empty window fixes
+    /// the sensor size and time base for the whole file.
+    fn append(&mut self, stream: &EventStream) -> Result<(), IoError>;
+
+    /// Total events written so far.
+    fn n_events(&self) -> usize;
+
+    /// Pushes buffered data at the file without closing it, so a crash mid-recording keeps
+    /// everything appended so far. Formats that only become readable at [`finish`](Self::finish)
+    /// (npz, rosbag) still flush their bytes, but the file stays incomplete until then.
+    fn flush(&mut self) -> Result<(), IoError>;
+
+    /// Writes whatever the format keeps for last — an index, a patched header — and closes.
+    fn finish(self: Box<Self>) -> Result<(), IoError>;
+}
+
+/// Opens `path` for window-by-window writing, the format chosen exactly as [`save_stream`] chooses
+/// it. Every event format is supported; `.png` is not an event container and is rejected.
+pub fn open_sink(
+    path: impl AsRef<Path>,
+    options: &SaveOptions,
+) -> Result<Box<dyn EventSink>, IoError> {
+    let path = path.as_ref();
+    match requested_format(path, options)? {
+        Format::Npz => Ok(Box::new(npz::NpzEventSink::create(path)?)),
+        Format::Text => Ok(Box::new(text::TextEventSink::create(path)?)),
+        Format::E2vid => Ok(Box::new(e2vid::E2vidWriter::create(path)?)),
+        Format::Rosbag => Ok(Box::new(bag::BagEventSink::create(
+            path,
+            options.topic.as_deref(),
+        )?)),
+        Format::Aedat => Ok(Box::new(aedat::AedatEventSink::create(path)?)),
+        Format::Aedat4 => Ok(Box::new(aedat4::Aedat4EventSink::create(
+            path,
+            options.packet_compression,
+        )?)),
+        Format::PropheseeDat => Ok(Box::new(prophesee::DatEventSink::create(path)?)),
+        Format::PropheseeRaw => Ok(Box::new(prophesee_raw::RawEventSink::create(
+            path,
+            options.evt_version(),
+        )?)),
+        Format::Hdf5 => {
+            #[cfg(feature = "hdf5")]
+            {
+                Ok(Box::new(h5::Hdf5EventSink::open(path, options.compression)?))
+            }
+            #[cfg(not(feature = "hdf5"))]
+            {
+                Err(IoError::Unsupported(
+                    "HDF5 support is not built in; rebuild with --features hdf5".to_owned(),
+                ))
+            }
+        }
+        Format::Png => Err(IoError::Unsupported(
+            "PNG is a frame export format, not an event container".to_owned(),
+        )),
+    }
+}
+
+/// Whether `path`'s format can be written incrementally with [`open_sink`] — every event format,
+/// which is to say everything but `.png`. The live recorder and the simulator use this to stream
+/// to disk window-by-window rather than buffering a whole session in memory.
 pub fn supports_event_append(path: impl AsRef<Path>) -> bool {
-    matches!(detect_format(path.as_ref()), Ok(Format::Hdf5))
+    !matches!(
+        detect_format(path.as_ref()),
+        Err(_) | Ok(Format::Png)
+    )
 }
 
 /// Whether `path` (with an optional explicit `format`) names an E2VID export — the target
@@ -506,12 +578,29 @@ pub struct SaveOptions {
     pub colormap: Colormap,
     /// PNG frame export only: auto-contrast the field to its data range. `None` = `true`.
     pub normalize: Option<bool>,
-    /// Overrides the format the extension implies. The one case that needs it is writing E2VID's
-    /// layout to a `.txt` (which otherwise means eventcv's own text format); `.zip` already
-    /// implies it. `None` follows the extension.
+    /// Overrides the format the extension implies. Two cases need it: writing E2VID's layout to a
+    /// `.txt` (which otherwise means eventcv's own text format — `.zip` already implies it), and
+    /// choosing between the two Prophesee `.raw` encodings with `"evt2"` / `"evt3"`. `None`
+    /// follows the extension.
     pub format: Option<String>,
     /// HDF5 only: how the event columns are filtered. Defaults to [`Compression::Gzip`] at level 4.
     pub compression: Compression,
+    /// AEDAT 4 only: how each packet body is compressed. Defaults to LZ4, which is what DV writes.
+    pub packet_compression: PacketCompression,
+}
+
+impl SaveOptions {
+    /// The Prophesee `.raw` encoding [`format`](Self::format) asks for, defaulting to EVT2.
+    ///
+    /// EVT2 is the default because it is the encoding a reader can decode without carrying state
+    /// across words, so a file eventcv writes stays the easiest thing for another tool to open;
+    /// EVT3 is smaller and is chosen explicitly.
+    pub fn evt_version(&self) -> EvtVersion {
+        match self.format.as_deref() {
+            Some("evt3") => EvtVersion::Evt3,
+            _ => EvtVersion::Evt2,
+        }
+    }
 }
 
 /// The format `path` and `options` together ask for: an explicit `format` name, else the
@@ -524,9 +613,16 @@ fn requested_format(path: &Path, options: &SaveOptions) -> Result<Format, IoErro
         Some("txt") | Some("csv") | Some("text") => Ok(Format::Text),
         Some("h5") | Some("hdf5") => Ok(Format::Hdf5),
         Some("bag") | Some("rosbag") => Ok(Format::Rosbag),
+        Some("aedat") | Some("aedat2") => Ok(Format::Aedat),
+        Some("aedat4") => Ok(Format::Aedat4),
+        Some("dat") => Ok(Format::PropheseeDat),
+        // The two `.raw` encodings name the same container, so they resolve to one format and are
+        // told apart later by `SaveOptions::evt_version`.
+        Some("raw") | Some("evt2") | Some("evt3") => Ok(Format::PropheseeRaw),
         Some("png") => Ok(Format::Png),
         Some(other) => Err(IoError::Unsupported(format!(
-            "unknown format: {other} (expected npz, txt, h5, bag, png, or e2vid)"
+            "unknown format: {other} (expected npz, txt, h5, bag, aedat, aedat4, dat, raw, evt2, \
+             evt3, png, or e2vid)"
         ))),
     }
 }
@@ -559,9 +655,17 @@ pub fn save_stream(
                 ))
             }
         }
-        other => Err(IoError::Unsupported(format!(
-            "saving an event stream as {other:?} is not supported"
-        ))),
+        // The formats whose writers are sinks first and bulk writers second: one window in, one
+        // window out. Driving them through `open_sink` keeps a single code path, so `save` and a
+        // window-by-window recording cannot drift apart.
+        Format::Aedat | Format::Aedat4 | Format::PropheseeDat | Format::PropheseeRaw => {
+            let mut sink = open_sink(path, options)?;
+            sink.append(stream)?;
+            sink.finish()
+        }
+        Format::Png => Err(IoError::Unsupported(
+            "PNG is a frame export format; use save_frame".to_owned(),
+        )),
     }
 }
 
@@ -813,9 +917,167 @@ impl From<io::Error> for IoError {
 #[cfg(test)]
 mod tests {
     use super::{
-        load, open, read_mask, write_mask, IoError, LoadOptions, MemorySliceSource, SliceSource,
+        load, open, open_sink, read_mask, save_stream, supports_event_append, write_mask, Format,
+        IoError, LoadOptions, MemorySliceSource, SaveOptions, SliceSource,
     };
-    use crate::EventStreamBuilder;
+    use crate::{EventStream, EventStreamBuilder};
+
+    /// A DAVIS346-sized recording, since AEDAT 2.0 can only name a real chip's geometry.
+    ///
+    /// Events are grouped twenty to a timestamp, and every other group is an ascending run along
+    /// one row — the shape that makes the EVT3 writer choose its vector encoding, so both of its
+    /// paths are covered. The span is deliberately over a second: the text reader infers its time
+    /// unit from the span, and a shorter recording would come back as milliseconds.
+    fn round_trip_stream() -> EventStream {
+        let mut builder = EventStreamBuilder::new(346, 260, 0.001);
+        for index in 0..500i64 {
+            let group = index / 20;
+            let (x, y, polarity) = if group % 2 == 0 {
+                ((index % 20) as u16, group as u16, true)
+            } else {
+                (((index * 7) % 300) as u16, ((index * 13) % 200) as u16, index % 3 == 0)
+            };
+            builder.push(x, y, group * 50_000, polarity);
+        }
+        builder.build()
+    }
+
+    fn assert_same(written: &EventStream, read: &EventStream, what: &str) {
+        assert_eq!(written.len(), read.len(), "{what}: event count");
+        assert_eq!(written.xs(), read.xs(), "{what}: x");
+        assert_eq!(written.ys(), read.ys(), "{what}: y");
+        assert_eq!(written.ts(), read.ts(), "{what}: t");
+        assert_eq!(written.ps(), read.ps(), "{what}: p");
+    }
+
+    /// Every event format eventcv reads, and the `SaveOptions.format` name for it when the
+    /// extension alone does not pick the encoding.
+    const ROUND_TRIP_FORMATS: &[(&str, Option<&str>)] = &[
+        ("npz", None),
+        ("txt", None),
+        ("aedat", None),
+        ("aedat4", None),
+        ("dat", None),
+        ("raw", Some("evt2")),
+        ("raw", Some("evt3")),
+        ("bag", None),
+        #[cfg(feature = "hdf5")]
+        ("h5", None),
+    ];
+
+    fn scratch(name: &str, extension: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "eventcv_sink_{}_{}_{name}.{extension}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0),
+        ))
+    }
+
+    #[test]
+    fn every_format_round_trips_through_save_and_load() {
+        let stream = round_trip_stream();
+        for (extension, format) in ROUND_TRIP_FORMATS {
+            let path = scratch(format.unwrap_or("plain"), extension);
+            let options = SaveOptions {
+                format: format.map(str::to_owned),
+                ..SaveOptions::default()
+            };
+            save_stream(&path, &stream, &options).expect(extension);
+            // Text carries no sensor size, so it is the one format that needs telling.
+            let load_options = LoadOptions {
+                sensor_size: Some(stream.sensor_size()),
+                ..LoadOptions::default()
+            };
+            let read = load(&path, load_options).expect(extension);
+            assert_same(&stream, &read, format.unwrap_or(extension));
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn appending_windows_matches_saving_the_whole_stream() {
+        let stream = round_trip_stream();
+        for (extension, format) in ROUND_TRIP_FORMATS {
+            let path = scratch("append", extension);
+            let options = SaveOptions {
+                format: format.map(str::to_owned),
+                ..SaveOptions::default()
+            };
+            let mut sink = open_sink(&path, &options).expect(extension);
+            // Three windows, in time order — a recording arriving as a live camera would deliver it.
+            for window in [0..100, 100..340, 340..stream.len()] {
+                sink.append(&slice(&stream, window)).expect(extension);
+            }
+            assert_eq!(sink.n_events(), stream.len());
+            sink.finish().expect(extension);
+            let read = load(
+                &path,
+                LoadOptions {
+                    sensor_size: Some(stream.sensor_size()),
+                    ..LoadOptions::default()
+                },
+            )
+            .expect(extension);
+            assert_same(&stream, &read, format.unwrap_or(extension));
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    fn slice(stream: &EventStream, range: std::ops::Range<usize>) -> EventStream {
+        let (width, height) = stream.sensor_size();
+        let mut builder = EventStreamBuilder::new(width, height, stream.timestamp_scale_ms());
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for index in range {
+            builder.push(xs[index], ys[index], ts[index], ps[index]);
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn every_event_format_can_be_appended_but_png_cannot() {
+        for (extension, _) in ROUND_TRIP_FORMATS {
+            assert!(
+                supports_event_append(format!("recording.{extension}")),
+                ".{extension} should be appendable"
+            );
+        }
+        assert!(supports_event_append("export.zip")); // E2VID streams too
+        assert!(!supports_event_append("frame.png"));
+        assert!(!supports_event_append("clip.mp4"));
+    }
+
+    #[test]
+    fn raw_encoding_follows_the_requested_format() {
+        let evt3 = SaveOptions {
+            format: Some("evt3".to_owned()),
+            ..SaveOptions::default()
+        };
+        assert_eq!(evt3.evt_version(), super::EvtVersion::Evt3);
+        // Anything else — including a bare `.raw` — is EVT2, the encoding a reader needs no state
+        // to decode.
+        assert_eq!(SaveOptions::default().evt_version(), super::EvtVersion::Evt2);
+        assert!(matches!(
+            super::requested_format(std::path::Path::new("out.raw"), &evt3),
+            Ok(Format::PropheseeRaw)
+        ));
+    }
+
+    #[test]
+    fn out_of_order_events_are_refused_by_the_raw_writer() {
+        let mut builder = EventStreamBuilder::new(64, 64, 0.001);
+        builder.push(1, 1, 500, true);
+        builder.push(2, 2, 100, false);
+        let path = scratch("unsorted", "raw");
+        let error = save_stream(&path, &builder.build(), &SaveOptions::default()).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        match error {
+            IoError::Unsupported(message) => assert!(message.contains("time order"), "{message}"),
+            other => panic!("expected an ordering error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn unknown_extension_is_unsupported() {

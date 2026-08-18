@@ -113,6 +113,13 @@ with ecv.stream(dt_ms=50) as cam, ecv.EventSink("session.h5") as sink:
         track(events)           # ...and process the same window live
 ```
 
+Any event format can be recorded this way, not just HDF5: `record=` and {class}`~eventcv.EventSink`
+take `.h5`, `.npz`, `.txt`/`.csv`, `.bag`, `.aedat`, `.aedat4`, `.dat` and `.raw`, chosen by the
+extension exactly as {func}`eventcv.save` chooses it. What differs is *when* the file becomes
+readable — HDF5, text, AEDAT and the Prophesee formats append straight to disk, so an interrupted
+capture keeps everything written so far, while npz and rosbag have a header or an index to write at
+the end and are only complete once the sink is closed.
+
 Only events are saved either way. A DAVIS346's APS frames and IMU samples are not written to the
 recording, but they are no longer thrown away: pass `frames=True` / `imu=True` to
 {func}`~eventcv.stream` and collect them as you read.

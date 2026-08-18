@@ -59,14 +59,58 @@ impl Representation for VoxelGrid {
             }
         }
 
-        Ok(EventFrame {
+        Ok(self.frame(values, width, height))
+    }
+
+    /// The GPU twin scatters the same signed, linearly split contributions, but accumulates them in
+    /// Q16.16 integers rather than `f32`. That makes the result independent of the order the
+    /// invocations landed — where the CPU's float sum is order-dependent in its last bits — at the
+    /// cost of a per-event quantisation below `f32`'s own resolution here. The two agree to about
+    /// 1e-4 on a cell, which `tests/test_gpu.py` pins.
+    fn generate_on(
+        &self,
+        stream: &EventStream,
+        device: crate::accel::Device,
+    ) -> Result<EventFrame, RepresentationError> {
+        if device == crate::accel::Device::Cpu {
+            return self.generate(stream);
+        }
+        if self.bins == 0 {
+            return Err(RepresentationError::InvalidParameter("bins"));
+        }
+        validate_positive(self.window_ms, "window_ms")?;
+        let (width, height, length) = frame_len(stream, self.bins)?;
+        let cells = super::on_gpu(
+            stream,
+            &crate::accel::GpuDispatch {
+                entry: "voxel",
+                cells: length,
+                initial: 0,
+                bins: self.bins as u32,
+                span_ms: self.window_ms as f32,
+                fixed_one: crate::accel::FIXED_ONE,
+                window_ms: Some(self.window_ms),
+                needs_ages: true,
+            },
+        )?;
+        let values = cells
+            .iter()
+            .map(|cell| *cell as f32 / crate::accel::FIXED_ONE)
+            .collect();
+        Ok(self.frame(values, width, height))
+    }
+}
+
+impl VoxelGrid {
+    fn frame(&self, values: Vec<f32>, width: usize, height: usize) -> EventFrame {
+        EventFrame {
             data: EventFrameData::F32(values),
             channels: self.bins,
             width,
             height,
             kind: RepresentationKind::Voxel,
             channel_names: (0..self.bins).map(|bin| format!("bin_{bin}")).collect(),
-        })
+        }
     }
 }
 

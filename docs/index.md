@@ -9,6 +9,10 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
   A DAVIS recording also yields its APS frames and IMU, not just its events, whether it
   arrives as a rosbag or as AEDAT: {func}`eventcv.read_frames`, {func}`eventcv.read_imu`
   and {func}`eventcv.read_camera_info` take a path or an open reader either way.
+- **Write every format it reads** — {func}`eventcv.save` is symmetric with {func}`eventcv.load`,
+  and every event container can also be written *a window at a time* with
+  {class}`~eventcv.EventSink`, so a capture longer than memory streams to disk in whichever format
+  the rest of your pipeline wants.
 - **Stream** multi-gigabyte recordings without loading them whole via
   {func}`eventcv.open`, with on-disk indexed slicing.
 - **Capture live** from a USB event camera with {func}`eventcv.stream` — representations
@@ -25,8 +29,11 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
 - **Visualise** — colormapped frames, animated `.gif` / `.apng` / `.mp4` export, and
   event-rate analytics.
 - **Run a model** — feed a representation to any ONNX network with {class}`~eventcv.Model`.
-- **Simulate** events from video with a v2e-grade sensor model, and **reconstruct** intensity video
-  back from events.
+- **Simulate** events from video with a v2e-grade sensor model — optionally with learned frame
+  interpolation in front of it — and **reconstruct** intensity video back from events.
+- **Move the heavy work to a GPU** when it pays, with `device="gpu"` or
+  {func}`eventcv.set_device`. Off by default: the CPU implementations are the reference, and on a
+  modern machine they win for everything but the simulator. See {doc}`representations`.
 - **Call it your way** — every operation is available both as a method
   (`stream.voxel()`) and as an OpenCV-style free function (`eventcv.voxel(stream)`).
 
