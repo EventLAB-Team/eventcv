@@ -15,6 +15,7 @@ use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::EventLoopProxy;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
@@ -42,8 +43,20 @@ const DEFAULT_PITCH: f32 = -0.55;
 /// Live viewer refresh cadence (~60 FPS).
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// Events shared by every app using the process-global event loop. The old viewers ignore these;
+/// the GUI uses the AccessKit event to expose egui's labelled controls to platform screen readers.
+pub(super) enum UserEvent {
+    AccessKit(egui_winit::accesskit_winit::Event),
+}
+
+impl From<egui_winit::accesskit_winit::Event> for UserEvent {
+    fn from(event: egui_winit::accesskit_winit::Event) -> Self {
+        Self::AccessKit(event)
+    }
+}
+
 thread_local! {
-    static EVENT_LOOP: RefCell<Option<EventLoop<()>>> = const { RefCell::new(None) };
+    static EVENT_LOOP: RefCell<Option<EventLoop<UserEvent>>> = const { RefCell::new(None) };
 }
 
 /// Opens a window and renders `scene` until the user closes it (Esc / window close).
@@ -57,9 +70,8 @@ pub(crate) fn run(scene: Scene) -> Result<(), String> {
 /// changed since the last call, or `Err` to abort. Reuses the same process-global event loop as
 /// [`run`], so a session mixes `.view()` and streaming freely (one window at a time).
 ///
-/// Not camera-specific: a recorded file played back at a chosen rate is the same loop with a
-/// different producer, which is why `interval` is a parameter rather than the live viewer's
-/// hardcoded 60 FPS.
+/// `interval` is explicit so each live source can choose its display cadence.
+#[cfg(feature = "camera")]
 pub(crate) fn run_live<P>(
     producer: P,
     width: u32,
@@ -98,13 +110,20 @@ where
 }
 
 /// Runs an app to completion on the process-global event loop, surfacing whatever error ended it.
-fn run_app(mut app: impl ApplicationHandler + Failable) -> Result<(), String> {
+pub(super) fn run_app(
+    mut app: impl ApplicationHandler<UserEvent> + Failable,
+) -> Result<(), String> {
     EVENT_LOOP.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            *slot = Some(EventLoop::new().map_err(|error| error.to_string())?);
+            *slot = Some(
+                EventLoop::<UserEvent>::with_user_event()
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            );
         }
         let event_loop = slot.as_mut().expect("event loop just initialised");
+        app.set_event_loop_proxy(event_loop.create_proxy());
         event_loop
             .run_app_on_demand(&mut app)
             .map_err(|error| error.to_string())?;
@@ -116,8 +135,10 @@ fn run_app(mut app: impl ApplicationHandler + Failable) -> Result<(), String> {
 }
 
 /// An app that can end on a fatal error, so [`run_app`] can report it.
-trait Failable {
+pub(super) trait Failable {
     fn take_error(&mut self) -> Option<String>;
+
+    fn set_event_loop_proxy(&mut self, _proxy: EventLoopProxy<UserEvent>) {}
 }
 
 /// The live counterpart to [`App`]: instead of one static [`Scene`] it pulls a frame from `producer`
@@ -246,7 +267,7 @@ where
     }
 }
 
-impl<P> ApplicationHandler for LiveApp<'_, P>
+impl<P> ApplicationHandler<UserEvent> for LiveApp<'_, P>
 where
     P: FnMut() -> Result<Option<super::Rgb8Image>, String>,
 {
@@ -394,7 +415,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Idle between events; a prior `shutdown` on a reused loop left it in `Poll`.
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -488,6 +509,70 @@ impl ApplicationHandler for App {
 
 // ---- GPU state -------------------------------------------------------------------------
 
+/// The window surface and device setup shared by the plain viewer and the egui player.
+pub(super) struct GpuContext {
+    pub(super) surface: wgpu::Surface<'static>,
+    pub(super) device: wgpu::Device,
+    pub(super) queue: wgpu::Queue,
+    pub(super) config: wgpu::SurfaceConfiguration,
+}
+
+pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
+    // `all()` (not just `PRIMARY`) so machines with no native Vulkan/Metal/DX12 GPU — headless
+    // boxes, VMs, remote desktops — can still reach an OpenGL or software adapter.
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|error| error.to_string())?;
+    let adapter = request_adapter(&instance, &surface)
+        .ok_or_else(|| "no compatible GPU or software adapter found".to_owned())?;
+    if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        eprintln!(
+            "eventcv: no GPU found — falling back to software rendering ({}); the viewer will be slow.",
+            adapter.get_info().name
+        );
+    }
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("eventcv-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+        },
+        None,
+    ))
+    .map_err(|error| error.to_string())?;
+
+    let size = window.inner_size();
+    let caps = surface.get_capabilities(&adapter);
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(wgpu::TextureFormat::is_srgb)
+        .unwrap_or(caps.formats[0]);
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::AutoVsync,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+    surface.configure(&device, &config);
+    Ok(GpuContext {
+        surface,
+        device,
+        queue,
+        config,
+    })
+}
+
 struct Render {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -539,70 +624,30 @@ fn request_adapter(
         (wgpu::PowerPreference::LowPower, false),
         (wgpu::PowerPreference::None, true),
     ];
-    attempts.into_iter().find_map(|(power_preference, force_fallback_adapter)| {
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference,
-            compatible_surface: Some(surface),
-            force_fallback_adapter,
-        }))
-    })
+    attempts
+        .into_iter()
+        .find_map(|(power_preference, force_fallback_adapter)| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference,
+                compatible_surface: Some(surface),
+                force_fallback_adapter,
+            }))
+        })
 }
 
 impl Render {
     fn new(window: Arc<Window>, scene: Scene) -> Result<Self, String> {
-        // `all()` (not just `PRIMARY`) so machines with no native Vulkan/Metal/DX12 GPU — headless
-        // boxes, VMs, remote desktops — can still reach an OpenGL or software adapter and render,
-        // slowly, instead of failing outright. A real GPU is still preferred (see `request_adapter`).
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-        let surface = instance
-            .create_surface(window.clone())
-            .map_err(|error| error.to_string())?;
-        let adapter = request_adapter(&instance, &surface)
-            .ok_or_else(|| "no compatible GPU or software adapter found".to_owned())?;
-        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
-            eprintln!(
-                "eventcv: no GPU found — falling back to software rendering ({}); the viewer will be slow.",
-                adapter.get_info().name
-            );
-        }
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("eventcv-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .map_err(|error| error.to_string())?;
-
-        let size = window.inner_size();
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .unwrap_or(caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
+        let GpuContext {
+            surface,
+            device,
+            queue,
+            config,
+        } = create_gpu(window)?;
         let depth = depth_view(&device, config.width, config.height);
 
         let content = match scene {
-            Scene::Cloud { points, .. } => build_cloud(&device, format, &points),
-            Scene::Image(image) => build_image(&device, &queue, format, &image),
+            Scene::Cloud { points, .. } => build_cloud(&device, config.format, &points),
+            Scene::Image(image) => build_image(&device, &queue, config.format, &image),
         };
 
         Ok(Self {

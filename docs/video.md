@@ -114,16 +114,19 @@ into a paper — use {func}`eventcv.export_png`.
 {meth}`~eventcv.EventCamera.show`, and the same raw polarity-and-decay view by default:
 
 ```python
+ecv.play()                                             # open empty, then choose or drop a file
 ecv.play("recording.h5", dt_ms=5)                    # raw
 ecv.play("recording.h5", dt_ms=20, repr="count")     # a representation
 ecv.play(events, speed=0.25)                         # an in-memory stream, quarter speed
 ```
 
-It blocks on the main thread until the window is closed (`Esc` or the close button). `speed`
-multiplies the playback rate and `loop_=True` restarts at the end instead of closing. Frames are
-decoded and rendered as they are shown, so a file larger than memory plays without being loaded —
-and unlike the live camera viewer, nothing is dropped to keep up: a slow decode plays slower rather
-than skipping events, because a file has no ring buffer to overflow.
+The window provides play/pause, stepping, seeking, accumulation time, refresh rate, loop and speed
+controls, raw/processed statistics, and an ordered denoising pipeline. Accumulation and refresh are
+independent: the default 30 ms window advances about every 16.7 ms at 60 Hz, retaining the overlap
+and processing only its new tail. At `speed=1`, recording time matches wall time; explicit `fps=`
+keeps the old fixed-frame-rate calculation but is deprecated. One render is kept in flight, so a
+file larger than memory stays lazy and slow processing lowers playback speed instead of building a
+work queue.
 
 A single still image of the raw view, without a window:
 
@@ -135,6 +138,7 @@ events.view("raw")                      # or show it
 From the command line:
 
 ```console
+$ eventcv play
 $ eventcv play recording.h5 --dt-ms 5
 $ eventcv play recording.h5 --dt-ms 5 --speed 0.25 --loop
 ```

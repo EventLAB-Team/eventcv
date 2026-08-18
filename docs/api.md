@@ -40,7 +40,7 @@ Where representations and the simulator run. The CPU is the default and the refe
 .. autofunction:: save_video
 ```
 
-See :doc:`video` for the raw view, and how ``dt_ms`` and ``fps`` combine into playback speed.
+See :doc:`video` for the raw view and the interactive player's controls.
 
 ## Simulation and reconstruction
 

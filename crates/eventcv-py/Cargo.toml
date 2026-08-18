@@ -17,6 +17,15 @@ wgpu = "22"
 winit = "0.30"
 pollster = "0.3"   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", features = ["derive"] }
+# Immediate-mode controls drawn into the viewer's existing winit/wgpu event loop. 0.29.1 is the
+# release that uses the same winit 0.30 / wgpu 22 pair as the renderer above, so Cargo links one
+# graphics stack rather than two.
+egui = "=0.29.1"
+egui-winit = { version = "=0.29.1", features = ["accesskit"] }
+egui-wgpu = "=0.29.1"
+# Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and
+# the CLI path remain available when a desktop portal is absent.
+rfd = "=0.17.2"
 
 [features]
 # Build `.h5`/`.hdf5` support into the extension (forwards to eventcv-core, which
