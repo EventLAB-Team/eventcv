@@ -38,10 +38,43 @@ impl EventStream {
             ) else {
                 continue;
             };
+            // One bounds test per event, not two. It has to happen here rather than in the
+            // builder because the coordinates are still `i64` — a negative one would wrap into
+            // range on the cast — and testing here also lets an off-sensor event be rejected
+            // before the second coordinate is looked at, which is most of them for a `crop`.
             if (0..width as i64).contains(&x) && (0..height as i64).contains(&y) {
-                builder.push(x as u16, y as u16, t, p);
+                builder.push_in_bounds(x as u16, y as u16, t, p);
             }
         }
         builder.build()
+    }
+
+    /// Builds a new stream over a `(width, height)` grid by editing the columns in place, for the
+    /// transforms that map every event onto the new grid and so cannot drop one.
+    ///
+    /// [`remap`](Self::remap) exists to *select*: it pays a closure, an `Option`, a bounds check
+    /// and four `Vec::push`es per event so that an event can land off the sensor and be dropped. A
+    /// flip, a rotation, a transpose, a rebin or a timestamp shift never does — each is onto the
+    /// grid it declares — so all of that machinery is dead weight, and what is left is one pass
+    /// over one column. `edit` gets the whole stream rather than a coordinate mapper so that it can
+    /// touch only the columns it changes: the others are shared, not copied, and a transpose is a
+    /// swap of two handles.
+    ///
+    /// A zero-width or zero-height grid can hold no events at all; `remap` expressed that by
+    /// dropping every event at the bounds check, and this expresses it directly.
+    pub(crate) fn map_columns(
+        &self,
+        width: usize,
+        height: usize,
+        edit: impl FnOnce(&mut EventStream),
+    ) -> EventStream {
+        if width == 0 || height == 0 {
+            return EventStreamBuilder::new(width, height, self.timestamp_scale_ms()).build();
+        }
+        let mut out = self.clone();
+        out.width = width;
+        out.height = height;
+        edit(&mut out);
+        out
     }
 }

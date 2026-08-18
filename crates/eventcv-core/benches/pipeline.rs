@@ -16,7 +16,7 @@ use eventcv_core::cmax::{CmaxConfig, Objective, WarpModel};
 use eventcv_core::representation::Representation;
 use eventcv_core::simulate::{Simulator, SimulatorConfig, Upsample};
 use eventcv_core::track::{Tracker, TrackerConfig};
-use eventcv_core::EventStream;
+use eventcv_core::{EventStream, EventStreamBuilder};
 
 /// A moving-bar recording, simulated. Deterministic for a given size and frame count.
 fn scene(width: usize, height: usize, frames: usize) -> EventStream {
@@ -70,6 +70,48 @@ fn representations(c: &mut Criterion) {
     });
     group.bench_function("time_surface", |b| {
         b.iter(|| black_box(eventcv_core::representation::TimeSurface::new(30.0).generate(&stream)))
+    });
+    group.bench_function("atsurf", |b| {
+        b.iter(|| {
+            black_box(
+                eventcv_core::representation::AveragedTimeSurface::new(30.0).generate(&stream),
+            )
+        })
+    });
+    group.finish();
+}
+
+/// What a representation costs before it has looked at a single event.
+///
+/// Ten events on a 640x480 sensor: everything measured here is per-call overhead, which is what a
+/// real-time loop pays on every short accumulation window and what the dense `representations`
+/// group amortises away. `tsurf` and `atsurf` used to allocate sensor-sized scratch and then walk
+/// the whole plane, so they cost twenty times what `count` did per output byte.
+fn representation_fixed_cost(c: &mut Criterion) {
+    let mut builder = EventStreamBuilder::new(640, 480, 0.001);
+    for index in 0..10_u16 {
+        builder.push(index, index, i64::from(index) * 10, index.is_multiple_of(2));
+    }
+    let stream = builder.build();
+
+    let mut group = c.benchmark_group("representation_fixed_cost");
+    group.bench_function("count", |b| {
+        b.iter(|| black_box(eventcv_core::representation::EventCount::new(false).generate(&stream)))
+    });
+    group.bench_function("voxel_5", |b| {
+        b.iter(|| {
+            black_box(eventcv_core::representation::VoxelGrid::new(5, 30.0).generate(&stream))
+        })
+    });
+    group.bench_function("time_surface", |b| {
+        b.iter(|| black_box(eventcv_core::representation::TimeSurface::new(30.0).generate(&stream)))
+    });
+    group.bench_function("atsurf", |b| {
+        b.iter(|| {
+            black_box(
+                eventcv_core::representation::AveragedTimeSurface::new(30.0).generate(&stream),
+            )
+        })
     });
     group.finish();
 }
@@ -165,15 +207,36 @@ fn filters_and_transforms(c: &mut Criterion) {
     let mut group = c.benchmark_group("stream_ops");
     group.throughput(Throughput::Elements(stream.len() as u64));
 
+    // `clone` is the floor every transform is measured against: the cost of producing a second
+    // handle on the same recording.
+    group.bench_function("clone", |b| b.iter(|| black_box(stream.clone())));
     group.bench_function("flip_x", |b| b.iter(|| black_box(stream.flip_x())));
+    // The transform that touches no column at all — it swaps two handles.
+    group.bench_function("transpose", |b| b.iter(|| black_box(stream.transpose())));
+    group.bench_function("crop", |b| {
+        b.iter(|| black_box(stream.crop(0, 0, 173, 130)))
+    });
+    // The stream is time-ordered, so this takes the binary-search path.
+    group.bench_function("time_window", |b| {
+        b.iter(|| black_box(stream.time_window(5_000, 25_000)))
+    });
     group.bench_function("hot_pixel_filter", |b| {
         b.iter(|| black_box(stream.hot_pixel_filter(3.0)))
+    });
+    group.bench_function("background_activity_filter", |b| {
+        b.iter(|| black_box(stream.background_activity_filter(1_000)))
     });
     group.bench_function("refractory_filter", |b| {
         b.iter(|| black_box(stream.refractory_filter(1_000)))
     });
     group.bench_function("event_drop", |b| {
         b.iter(|| black_box(stream.event_drop(0.5, 0)))
+    });
+    // Two ops that are nothing but a per-event `EventStreamBuilder::push` loop — the shape that
+    // every filter and reader slice shares, and the one to watch when the stream's storage changes.
+    group.bench_function("decimate", |b| b.iter(|| black_box(stream.decimate(2))));
+    group.bench_function("sort_by_time", |b| {
+        b.iter(|| black_box(stream.sort_by_time()))
     });
     group.finish();
 }
@@ -251,6 +314,7 @@ fn representations_on_gpu(_: &mut Criterion) {}
 criterion_group!(
     benches,
     representations,
+    representation_fixed_cost,
     representations_on_gpu,
     filters_and_transforms,
     simulation,

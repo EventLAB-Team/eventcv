@@ -60,6 +60,13 @@ const COLUMN_COUNT: usize = 4;
 /// A stream of events stored column-wise (struct-of-arrays). Columns compress and
 /// transform far better than interleaved rows, and timestamps use `i64` (µs) so
 /// real multi-second recordings fit. See `TASKS.md` §3.
+///
+/// The columns are shared, not owned: a transform that rewrites one column hands the other three
+/// on untouched, and `clone` is four refcount bumps rather than a copy of the whole recording.
+/// `Arc<Vec<T>>` rather than `Arc<[T]>` because the latter cannot reuse a `Vec`'s allocation (the
+/// refcount header sits in the same block), so every `EventStreamBuilder::build` — every reader
+/// slice, every subsetting transform — would copy all four columns; and because `Arc::make_mut`
+/// gives copy-on-write for free on a `Vec` and is not available on an unsized `[T]`.
 #[derive(Clone, Debug)]
 pub struct EventStream {
     xs: Vec<u16>,
@@ -113,11 +120,14 @@ impl EventStream {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Event> + '_ {
+        // Bind the columns once rather than re-projecting them per event: every representation
+        // consumes the stream through here.
+        let (xs, ys, ts, ps) = (self.xs(), self.ys(), self.ts(), self.ps());
         (0..self.len()).map(move |index| Event {
-            x: self.xs[index] as usize,
-            y: self.ys[index] as usize,
-            timestamp: self.ts[index] as u64,
-            polarity: self.ps[index],
+            x: xs[index] as usize,
+            y: ys[index] as usize,
+            timestamp: ts[index] as u64,
+            polarity: ps[index],
         })
     }
 
@@ -203,6 +213,23 @@ impl EventStreamBuilder {
         true
     }
 
+    /// Appends an event already known to lie on this builder's sensor, skipping the test
+    /// [`push`](Self::push) makes. For the callers that have just made that test themselves —
+    /// `EventStream::remap`, which has to range-check in `i64` before it can cast to `u16` — and
+    /// would otherwise pay for it twice on every surviving event.
+    ///
+    /// The four pushes are spelled out again rather than shared with [`push`](Self::push): having
+    /// `push` delegate here cost its callers about 25% on a per-event loop (measured on
+    /// `decimate`), `#[inline]` included, and `push` is on the hot path of every reader. Inlined
+    /// here so that `remap`'s call site pays nothing for the split.
+    #[inline]
+    pub(crate) fn push_in_bounds(&mut self, x: u16, y: u16, timestamp: i64, polarity: bool) {
+        self.xs.push(x);
+        self.ys.push(y);
+        self.ts.push(timestamp);
+        self.ps.push(polarity);
+    }
+
     /// Appends every event of `stream`, dropping any that fall outside this builder's sensor.
     ///
     /// The bulk counterpart of [`push`](Self::push), for the callers that join streams rather than
@@ -218,10 +245,7 @@ impl EventStreamBuilder {
             .zip(stream.ys())
             .all(|(&x, &y)| usize::from(x) < self.width && usize::from(y) < self.height);
         if fits {
-            self.xs.extend_from_slice(stream.xs());
-            self.ys.extend_from_slice(stream.ys());
-            self.ts.extend_from_slice(stream.ts());
-            self.ps.extend_from_slice(stream.ps());
+            self.extend_from_columns(stream.xs(), stream.ys(), stream.ts(), stream.ps());
             return;
         }
         for index in 0..stream.len() {
@@ -232,6 +256,17 @@ impl EventStreamBuilder {
                 stream.ps()[index],
             );
         }
+    }
+
+    /// Appends events whose coordinates are already known to lie on this builder's sensor —
+    /// four `extend_from_slice` calls and no per-event check. The four slices must share a length.
+    /// Callers that cannot make that guarantee want [`push`](Self::push) or
+    /// [`extend_from_stream`](Self::extend_from_stream) instead.
+    pub(crate) fn extend_from_columns(&mut self, xs: &[u16], ys: &[u16], ts: &[i64], ps: &[bool]) {
+        self.xs.extend_from_slice(xs);
+        self.ys.extend_from_slice(ys);
+        self.ts.extend_from_slice(ts);
+        self.ps.extend_from_slice(ps);
     }
 
     /// Reserves room for `additional` more events across every column.

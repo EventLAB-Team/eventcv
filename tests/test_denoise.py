@@ -88,6 +88,43 @@ class DenoiseTests(unittest.TestCase):
         self.assertNotIn((0, 0), surviving)
         self.assertLess(len(out), len(stream))
 
+    def test_cross_neighbourhood_is_stricter_than_the_block_default(self):
+        block = self.stream.background_activity_filter(1_000)
+        cross = self.stream.background_activity_filter(1_000, neighbourhood="cross")
+
+        # The surface is seeded by every event regardless of what is kept, so each event's fate is
+        # independent of the others' — the cross result is a strict subset, not merely smaller.
+        as_set = lambda s: {tuple(row) for row in s.numpy().tolist()}
+        self.assertTrue(as_set(cross).issubset(as_set(block)))
+        self.assertEqual(
+            len(block),
+            len(self.stream.background_activity_filter(1_000, neighbourhood="block")),
+        )
+
+        # This fixture's signal is a solid 4x4 block, so every event has an edge-adjacent
+        # neighbour and the two agree on it. Where they differ is a diagonal-only neighbour:
+        # (6,6) follows (5,5) with nothing else nearby.
+        diagonal = _load([(0, 5, 5, 1), (10, 6, 6, 1)])
+        self.assertEqual(len(diagonal.background_activity_filter(1_000)), 1)
+        self.assertEqual(
+            len(diagonal.background_activity_filter(1_000, neighbourhood="cross")), 0
+        )
+
+        with self.assertRaises(ValueError):
+            self.stream.background_activity_filter(1_000, neighbourhood="diamond")
+
+    def test_refresh_all_restarts_the_dead_time_on_suppressed_events(self):
+        # One pixel firing every 50 µs. Under "kept" the clock runs from the last *emitted* event,
+        # so t=100 gets through; under "all" every arrival pushes it out and only t=0 survives.
+        burst = _load([(t, 5, 5, 1) for t in (0, 50, 100, 150)])
+        times = lambda s: s.numpy()[:, 2].tolist()
+
+        self.assertEqual(times(burst.refractory_filter(100)), [0, 100])
+        self.assertEqual(times(burst.refractory_filter(100, refresh="kept")), [0, 100])
+        self.assertEqual(times(burst.refractory_filter(100, refresh="all")), [0])
+        with self.assertRaises(ValueError):
+            burst.refractory_filter(100, refresh="sometimes")
+
     def test_filters_chain_and_handle_empty(self):
         out = self.stream.hot_pixel_filter().refractory_filter(10).background_activity_filter(500)
         self.assertIsInstance(out, eventcv.EventStream)

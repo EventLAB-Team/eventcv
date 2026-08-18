@@ -57,10 +57,13 @@ class CornerTests(unittest.TestCase):
 
     def test_harris_returns_subset_and_threshold_is_monotone(self):
         stream = _moving_corner()
-        loose = stream.harris_corners(-1e9)   # keep essentially everything scored
-        tight = stream.harris_corners(1e6)    # strict
+        # The response is `det/trace² - k`, bounded to [-0.04, 0.21]: -0.04 keeps everything
+        # scored, 0.1 is strict, and above 0.21 nothing can pass.
+        loose = stream.harris_corners(-0.04)
+        tight = stream.harris_corners(0.1)
         self.assertLessEqual(len(tight), len(loose))
         self.assertLessEqual(len(loose), len(stream))
+        self.assertEqual(len(stream.harris_corners(0.25)), 0)
 
     def test_harris_rejects_a_straight_moving_edge(self):
         # A lone vertical edge sweeping +x has no corner; threshold=0 (default) should keep ~none.

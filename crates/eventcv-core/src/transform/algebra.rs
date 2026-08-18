@@ -14,7 +14,11 @@ impl EventStream {
     /// Flips every event's polarity. Sensor and timestamps unchanged.
     pub fn invert_polarity(&self) -> EventStream {
         let (width, height) = self.sensor_size();
-        self.remap(width, height, |x, y, t, p| Some((x, y, t, !p)))
+        self.map_columns(width, height, |out| {
+            for p in &mut out.ps {
+                *p = !*p;
+            }
+        })
     }
 
     /// Returns a copy reordered by ascending timestamp (stable for equal timestamps).
@@ -45,10 +49,7 @@ impl EventStream {
         let mut builder =
             EventStreamBuilder::with_capacity(width, height, self.timestamp_scale_ms(), total);
         for stream in std::iter::once(self).chain(others.iter().copied()) {
-            let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
-            for index in 0..stream.len() {
-                builder.push(xs[index], ys[index], ts[index], ps[index]);
-            }
+            builder.extend_from_stream(stream);
         }
         builder.build()
     }

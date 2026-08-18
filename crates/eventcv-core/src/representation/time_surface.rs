@@ -28,21 +28,53 @@ impl Representation for TimeSurface {
         validate_positive(self.tau_ms, "tau_ms")?;
         let (width, height, length) = frame_len(stream, 2)?;
         let plane_len = width * height;
-        let mut latest = vec![None; length];
+        // Two zeroed planes rather than a `Vec<Option<u64>>`: `vec![0; n]` is one `alloc_zeroed`,
+        // so a cell no event touches is never written or even faulted in, where the `Option` was
+        // 16 bytes a cell and had to be filled end to end before the first event was read — about
+        // a millisecond at 640x480, however few events the window held. `seen` rather than a
+        // sentinel timestamp because 0 is a timestamp a stream can hold.
+        //
+        // `touched` then drives the exponential over just those cells. A window cannot touch more
+        // cells than it has events, so `stream.len()` says before the loop whether that is worth
+        // doing: a dense window would reach most cells anyway, and scattering through a
+        // sensor-sized list costs more than one sequential pass. See `AveragedTimeSurface` for the
+        // measurement behind the threshold.
+        let track_touched = stream.len().saturating_mul(4) <= length;
+        let mut latest = vec![0_u64; length];
+        let mut seen = vec![false; length];
+        let mut touched = if track_touched {
+            Vec::with_capacity(stream.len())
+        } else {
+            Vec::new()
+        };
 
         for event in stream.iter() {
             let index =
                 event_index(event, width, height)? + if event.polarity { 0 } else { plane_len };
-            if latest[index].is_none_or(|timestamp| event.timestamp > timestamp) {
-                latest[index] = Some(event.timestamp);
+            if !seen[index] {
+                seen[index] = true;
+                if track_touched {
+                    touched.push(index);
+                }
+                latest[index] = event.timestamp;
+            } else if event.timestamp > latest[index] {
+                latest[index] = event.timestamp;
             }
         }
 
         let mut values = vec![0_f32; length];
         if let Some(reference) = reference_time(stream) {
-            for (value, timestamp) in values.iter_mut().zip(latest) {
-                if let Some(timestamp) = timestamp {
-                    *value = (-age_ms(stream, reference, timestamp) / self.tau_ms).exp() as f32;
+            if track_touched {
+                for index in touched {
+                    values[index] =
+                        (-age_ms(stream, reference, latest[index]) / self.tau_ms).exp() as f32;
+                }
+            } else {
+                for (index, value) in values.iter_mut().enumerate() {
+                    if seen[index] {
+                        *value =
+                            (-age_ms(stream, reference, latest[index]) / self.tau_ms).exp() as f32;
+                    }
                 }
             }
         }
@@ -126,5 +158,21 @@ mod tests {
         assert_eq!(values[0], 1.0);
         assert_eq!(values[1], 0.0);
         assert!((values[3] - (-1.0_f32).exp()).abs() < 1e-6);
+    }
+
+    /// `0` is a timestamp a stream can hold, and it is also what the zeroed scratch plane holds
+    /// for a cell no event reached. The two must not be confused.
+    #[test]
+    fn a_timestamp_of_zero_is_an_event_not_an_empty_pixel() {
+        let stream = EventStream::from_array2(array![[0, 0, 0, 1]], 2, 1, 0.001);
+
+        let frame = TimeSurface::new(10.0).generate(&stream).unwrap();
+        let EventFrameData::F32(values) = frame.data() else {
+            panic!("time surfaces must use float32 data");
+        };
+
+        assert_eq!(values[0], 1.0); // the event, at age 0
+        assert_eq!(values[1], 0.0); // no event ever landed here
+        assert!(values[2..].iter().all(|&value| value == 0.0)); // nor on the negative plane
     }
 }

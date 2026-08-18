@@ -98,13 +98,14 @@ impl EventStream {
     }
 
     /// **Harris corner score on the Surface of Active Events.** For each event it updates a
-    /// merged SAE of raw latest timestamps, then computes the Harris response
-    /// `det(M) - k·trace(M)²` of the structure tensor `M = Σ ∇T ∇Tᵀ` of the SAE's spatial
+    /// merged SAE of raw latest timestamps, then computes the normalised Harris response
+    /// `det(M)/trace(M)² - k` of the structure tensor `M = Σ ∇T ∇Tᵀ` of the SAE's spatial
     /// gradient over a 9×9 window. Because the SAE is a local time *ramp*, a straight moving edge
     /// has a constant gradient direction (rank-1 `M`, `R < 0`) while a corner mixes gradient
     /// directions (rank-2 `M`, `R > 0`) — so the default `threshold = 0` keeps corners and rejects
-    /// edges. Raise `threshold` to be stricter. Returns the corner events as a new stream; a
-    /// score-based complement to [`Self::efast`].
+    /// edges. The score is bounded to `[-k, 0.25 - k]` = `[-0.04, 0.21]`, so raising `threshold`
+    /// within that range is what makes it stricter; anything above `0.21` keeps nothing. Returns
+    /// the corner events as a new stream; a score-based complement to [`Self::efast`].
     pub fn harris_corners(&self, threshold: f64) -> EventStream {
         let (width, height) = self.sensor_size();
         let (xs, ys, ts, ps) = (self.xs(), self.ys(), self.ts(), self.ps());
@@ -177,10 +178,18 @@ const HARRIS_MIN_SAMPLES: usize = 3;
 
 /// Harris response of the raw SAE ramp over the `(2R+1)²` window around `(cx, cy)`. Reads the SAE
 /// as a time surface `T` (in ms), takes central-difference gradients wherever both neighbours have
-/// fired, and returns `det(M) - k·trace(M)²` for the structure tensor `M = Σ ∇T ∇Tᵀ`. Unfired
+/// fired, and returns `det(M)/trace(M)² - k` for the structure tensor `M = Σ ∇T ∇Tᵀ`. Unfired
 /// pixels are skipped (their gradient is undefined), so a window with too little structure returns
 /// `-∞` (never a corner). The caller guarantees the window lies `HARRIS_RADIUS + 1` inside every
 /// border, so the `x ± 1` / `y ± 1` reads are in bounds.
+///
+/// Dividing by `trace²` is what makes the score a usable *knob* rather than only a sign. `M` is a
+/// plain sum over up to 81 samples of a gradient measured in milliseconds, so `det - k·trace²` is
+/// quartic in that gradient and unbounded — in practice `1e3`..`1e7`, which no caller can guess.
+/// `det/trace²` is `λ₁λ₂/(λ₁+λ₂)²`: dimensionless, independent of how many pixels in the window
+/// happened to have fired, and bounded by `0.25`. The score therefore lands in `[-k, 0.25 - k]`.
+/// The sign is unchanged — for `trace > 0`, `det - k·trace² > 0` iff `det/trace² - k > 0` — so the
+/// default `threshold = 0` selects exactly the same events it always did.
 fn harris_response(sae: &[i64], cx: usize, cy: usize, width: usize, scale: f64) -> f64 {
     let t_at = |x: usize, y: usize| -> Option<f64> {
         let t = sae[y * width + x];
@@ -211,7 +220,10 @@ fn harris_response(sae: &[i64], cx: usize, cy: usize, width: usize, scale: f64) 
     }
     let det = sxx * syy - sxy * sxy;
     let trace = sxx + syy;
-    det - HARRIS_K * trace * trace
+    if trace <= 0.0 {
+        return f64::NEG_INFINITY; // every gradient in the window was zero
+    }
+    det / (trace * trace) - HARRIS_K
 }
 
 #[cfg(test)]
@@ -321,6 +333,49 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// An L-shaped corner sweeping across the sensor, as `(events, sensor_size)`.
+    fn moving_corner() -> (Array2<u64>, usize) {
+        let mut rows = Vec::new();
+        let mut t = 0_u64;
+        for step in 0..24u64 {
+            let c = 6 + step;
+            for offset in 0..10u64 {
+                rows.push([c, c + offset, t, 1]); // vertical arm
+                rows.push([c + offset, c, t, 1]); // horizontal arm
+            }
+            t += 100;
+        }
+        let len = rows.len();
+        (Array2::from_shape_vec((len, 4), rows.concat()).unwrap(), 48)
+    }
+
+    /// The response is `det/trace² - k`, which is a ratio of two quantities that scale together —
+    /// so re-expressing the same recording in different time units must not move the score. Before
+    /// it was normalised, the raw `det - k·trace²` differed by `10¹²` between these two, and any
+    /// non-zero threshold meant something different for each.
+    #[test]
+    fn harris_is_invariant_to_the_timestamp_unit() {
+        let (events, size) = moving_corner();
+        let in_ms = EventStream::from_array2(events.clone(), size, size, 1.0);
+        // The same instants in microseconds: 1000× the raw ticks, each worth a thousandth as much.
+        let in_us = EventStream::from_array2(events, size, size, 0.001).time_scale(1000.0);
+
+        for threshold in [0.0, 0.05, 0.1] {
+            assert_eq!(
+                in_ms.harris_corners(threshold).len(),
+                in_us.harris_corners(threshold).len(),
+                "threshold {threshold} disagreed between ms and µs timestamps"
+            );
+        }
+
+        // And the knob has to actually discriminate somewhere inside its range.
+        let all = in_ms.harris_corners(-0.04).len();
+        let some = in_ms.harris_corners(0.0).len();
+        let none = in_ms.harris_corners(0.25).len();
+        assert!(some > 0 && some < all, "got {some} of {all}");
+        assert_eq!(none, 0);
     }
 
     /// A straight edge sweeping across the sensor is rank-1 on the SAE ramp (`R < 0`), so the

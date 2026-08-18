@@ -26,7 +26,7 @@ corners.count().view()               # corners feed any representation
 | Detector | Method | Keeps an event when… |
 |----------|--------|----------------------|
 | eFAST  | {meth}`~eventcv.EventStream.efast` | its recent neighbours form a contiguous arc on both Bresenham rings — a moving corner, not an edge (Mueggler et al., BMVC 2017). |
-| Harris | {meth}`~eventcv.EventStream.harris_corners` | the SAE Harris response exceeds `threshold` (default `0.0`; raise to be stricter). |
+| Harris | {meth}`~eventcv.EventStream.harris_corners` | the normalised SAE Harris response `det/trace² - k` exceeds `threshold` (default `0.0`; the score is bounded to `[-0.04, 0.21]`, so raise `threshold` within that range to be stricter). |
 
 Over an {class}`~eventcv.EventReader` they apply per slice: `ecv.open(...).efast()` returns a reader
 of corner sub-streams, ready for {func}`~eventcv.export_png`.
