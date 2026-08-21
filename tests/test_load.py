@@ -405,60 +405,7 @@ class LoadTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "exceeds sensor size 640x480"):
                 eventcv.load(str(path))
-    def test_text_accepts_scientific_notation(self):
-        # N-CARS writes its `.txt` columns in scientific notation; the same events spelled as
-        # plain integers must load identically.
-        scientific = (
-            "3.000000000000000000e+01 4.000000000000000000e+01 "
-            "0.000000000000000000e+00 1.000000000000000000e+00\n"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "scientific.txt"
-            path.write_text(scientific)
-            events = eventcv.load(
-                str(path), sensor_size=(120, 100), order="xytp", time_unit="microseconds"
-            ).numpy()
 
-            plain = Path(directory) / "plain.txt"
-            plain.write_text("30 40 0 1\n")
-            expected = eventcv.load(
-                str(plain), sensor_size=(120, 100), order="xytp", time_unit="microseconds"
-            ).numpy()
-
-        np.testing.assert_array_equal(events, expected)
-
-    def test_explicit_time_unit_accepts_what_inference_does(self):
-        # The two paths diverged: omitting `time_unit` infers it from the timestamps and parsed
-        # these bytes, while passing it took a stricter path that rejected the x column.
-        scientific = (
-            "3.000000000000000000e+01 4.000000000000000000e+01 "
-            "0.000000000000000000e+00 1.000000000000000000e+00\n"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "scientific.txt"
-            path.write_text(scientific)
-            inferred = eventcv.load(
-                str(path), sensor_size=(120, 100), order="xytp"
-            ).numpy()
-            explicit = eventcv.load(
-                str(path), sensor_size=(120, 100), order="xytp", time_unit="seconds"
-            ).numpy()
-
-        # t is scaled by the unit, so only the coordinates and polarity are comparable.
-        np.testing.assert_array_equal(inferred[:, [0, 1, 3]], explicit[:, [0, 1, 3]])
-
-    def test_fractional_text_coordinate_raises_value_error(self):
-        # Reading x/y as floats to admit `3.0e+01` must not also admit `3.7`, which a bare cast
-        # would silently truncate to 3.
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "fractional.txt"
-            path.write_text("3.7 40 0 1\n")
-
-            with self.assertRaisesRegex(ValueError, "x"):
-                eventcv.load(
-                    str(path), sensor_size=(120, 100), order="xytp",
-                    time_unit="microseconds",
-                )
 
 if __name__ == "__main__":
     unittest.main()

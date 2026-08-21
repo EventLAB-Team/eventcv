@@ -369,40 +369,13 @@ impl<R: BufRead> TextReader<R> {
             })
         };
         Ok(RawEvent {
-            x: {
-                let v = self.parse::<f64>(pick(map.x, "x")?, "x")?;
-                if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > u16::MAX as f64 {
-                    return Err(IoError::Parse {
-                        line: self.line,
-                        message: "invalid x: coordinate out of range or not an integer".to_string(),
-                    });
-                }
-                v as u16
-            },
-            y: {
-                let v = self.parse::<f64>(pick(map.y, "y")?, "y")?;
-                if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > u16::MAX as f64 {
-                    return Err(IoError::Parse {
-                        line: self.line,
-                        message: "invalid y: coordinate out of range or not an integer".to_string(),
-                    });
-                }
-                v as u16
-            },
+            x: parse_coord(pick(map.x, "x")?, "x", self.line)?,
+            y: parse_coord(pick(map.y, "y")?, "y", self.line)?,
             t: self
                 .options
                 .time_unit
                 .to_microseconds(self.parse::<f64>(pick(map.t, "t")?, "t")?),
-            p: {
-                let v = self.parse::<f64>(pick(map.p, "p")?, "p")?;
-                if !v.is_finite() {
-                    return Err(IoError::Parse {
-                        line: self.line,
-                        message: "invalid p: not a finite number".to_string(),
-                    });
-                }
-                v > 0.0
-            },
+            p: parse_polarity(pick(map.p, "p")?, "p", self.line)?,
         })
     }
 
@@ -554,6 +527,45 @@ fn infer_time_unit(rows: &[RawRow]) -> TimeUnit {
     }
 }
 
+/// A numeric field that must denote an exact `u16`. Datasets spell integer columns as floats
+/// (`3.0`, `3.000000e+01` — N-CARS does), so those are accepted; a genuine fraction or an
+/// out-of-range value is a malformed coordinate, not something to silently truncate.
+///
+/// Shared by both text parsers so that a load which infers `sensor_size`/`time_unit` and one
+/// that is told them read the same bytes the same way.
+fn parse_coord(value: &str, field: &str, line: usize) -> Result<u16, IoError> {
+    if let Ok(coord) = value.parse::<u16>() {
+        return Ok(coord); // ordinary integer text never pays for the float path
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| {
+            number.is_finite()
+                && number.fract() == 0.0
+                && *number >= 0.0
+                && *number <= f64::from(u16::MAX)
+        })
+        .map(|number| number as u16)
+        .ok_or_else(|| IoError::Parse {
+            line,
+            message: format!("invalid {field}: {value:?}"),
+        })
+}
+
+/// Polarity is any number: positive is ON, everything else (`0`, `-1`, `0.0`) is OFF.
+fn parse_polarity(value: &str, field: &str, line: usize) -> Result<bool, IoError> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+        .map(|number| number > 0.0)
+        .ok_or_else(|| IoError::Parse {
+            line,
+            message: format!("invalid {field}: {value:?}"),
+        })
+}
+
 /// Parses one non-blank line into a [`RawRow`] (no unit conversion or bounds check).
 /// Shared by the buffered [`load_text`] and the [`TextSliceSource`] index scan.
 fn parse_raw_row(trimmed: &str, map: ColumnMap, number: usize) -> Result<RawRow, IoError> {
@@ -571,10 +583,10 @@ fn parse_raw_row(trimmed: &str, map: ColumnMap, number: usize) -> Result<RawRow,
         })
     };
     Ok(RawRow {
-        x: parse(pick(map.x, "x")?, "x")? as u16,
-        y: parse(pick(map.y, "y")?, "y")? as u16,
+        x: parse_coord(pick(map.x, "x")?, "x", number)?,
+        y: parse_coord(pick(map.y, "y")?, "y", number)?,
         t: parse(pick(map.t, "t")?, "t")?,
-        p: parse(pick(map.p, "p")?, "p")? > 0.0,
+        p: parse_polarity(pick(map.p, "p")?, "p", number)?,
     })
 }
 
@@ -1187,6 +1199,106 @@ mod tests {
             source.slice_time(2000, 5000).unwrap().ts(),
             &[2000, 3000, 4000]
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// N-CARS spells every `.txt` column in scientific notation. The strict streaming path
+    /// (both `sensor_size` and `time_unit` given) has to read it as the same events the plain
+    /// integer spelling produces.
+    #[test]
+    fn parses_scientific_notation_columns() {
+        let data = "3.000000000000000000e+01 4.000000000000000000e+01 \
+                    0.000000000000000000e+00 1.000000000000000000e+00\n";
+        let options = TextOptions {
+            map: ColumnMap::from_order(ColumnOrder::Xytp),
+            ..TextOptions::new(120, 100)
+        };
+        let stream = read(data, options).unwrap();
+
+        assert_eq!(stream.xs(), &[30]);
+        assert_eq!(stream.ys(), &[40]);
+        assert_eq!(stream.ps(), &[true]);
+    }
+
+    /// The bug behind #26: whether `time_unit` is given picks the parser, so the two paths have
+    /// to accept and reject exactly the same coordinates.
+    #[test]
+    fn both_paths_read_the_same_coordinates() {
+        let path = write_temp(
+            "txtsci",
+            "3.000000e+01 4.000000e+01 0.000000e+00 1.000000e+00\n",
+        );
+        let inferred = LoadOptions {
+            sensor_size: Some((120, 100)),
+            order: ColumnOrder::Xytp,
+            ..LoadOptions::default()
+        };
+        let explicit = LoadOptions {
+            time_unit: Some(TimeUnit::Seconds),
+            ..inferred.clone()
+        };
+
+        for options in [&inferred, &explicit] {
+            let stream = load_text(&path, options).unwrap();
+            assert_eq!(stream.xs(), &[30]);
+            assert_eq!(stream.ys(), &[40]);
+            assert_eq!(stream.ps(), &[true]);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Reading coordinates as floats to admit `3.0e+01` must not also admit a real fraction or
+    /// a value past the grid — silently truncating those is how a bad file becomes bad data.
+    #[test]
+    fn both_paths_reject_coordinates_that_are_not_exact_u16() {
+        for (tag, data) in [
+            ("frac", "3.7 40 0 1\n"),
+            ("huge", "70000 40 0 1\n"),
+            ("neg", "-1 40 0 1\n"),
+        ] {
+            let path = write_temp(&format!("txtbad{tag}"), data);
+            let inferred = LoadOptions {
+                sensor_size: Some((120, 100)),
+                order: ColumnOrder::Xytp,
+                ..LoadOptions::default()
+            };
+            let explicit = LoadOptions {
+                time_unit: Some(TimeUnit::Microseconds),
+                ..inferred.clone()
+            };
+
+            for options in [&inferred, &explicit] {
+                match load_text(&path, options) {
+                    Err(IoError::Parse { line, message }) => {
+                        assert_eq!(line, 1);
+                        assert!(message.starts_with("invalid x:"), "{message}");
+                    }
+                    other => panic!("{tag}: expected a parse error, got {other:?}"),
+                }
+            }
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    /// `TextSliceSource` seeks and then re-parses through `TextReader`, so scientific notation
+    /// used to index cleanly and fail on every slice.
+    #[test]
+    fn text_slice_reads_scientific_notation() {
+        let path = write_temp(
+            "txtslicesci",
+            "0.000000e+00 3.000000e+01 4.000000e+01 1.000000e+00\n\
+             1.000000e+03 3.100000e+01 4.100000e+01 0.000000e+00\n",
+        );
+        let options = LoadOptions {
+            sensor_size: Some((120, 100)),
+            time_unit: Some(TimeUnit::Microseconds),
+            ..LoadOptions::default()
+        };
+        let source = open_text_slice(&path, &options).unwrap();
+
+        assert_eq!(source.n_events(), 2);
+        assert_eq!(source.slice_index(0, 2).unwrap().xs(), &[30, 31]);
+        assert_eq!(source.slice_time(0, 1000).unwrap().ys(), &[40]);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
