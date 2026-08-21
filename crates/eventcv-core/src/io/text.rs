@@ -369,13 +369,40 @@ impl<R: BufRead> TextReader<R> {
             })
         };
         Ok(RawEvent {
-            x: self.parse(pick(map.x, "x")?, "x")?,
-            y: self.parse(pick(map.y, "y")?, "y")?,
+            x: {
+                let v = self.parse::<f64>(pick(map.x, "x")?, "x")?;
+                if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > u16::MAX as f64 {
+                    return Err(IoError::Parse {
+                        line: self.line,
+                        message: "invalid x: coordinate out of range or not an integer".to_string(),
+                    });
+                }
+                v as u16
+            },
+            y: {
+                let v = self.parse::<f64>(pick(map.y, "y")?, "y")?;
+                if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > u16::MAX as f64 {
+                    return Err(IoError::Parse {
+                        line: self.line,
+                        message: "invalid y: coordinate out of range or not an integer".to_string(),
+                    });
+                }
+                v as u16
+            },
             t: self
                 .options
                 .time_unit
                 .to_microseconds(self.parse::<f64>(pick(map.t, "t")?, "t")?),
-            p: self.parse::<i32>(pick(map.p, "p")?, "p")? > 0,
+            p: {
+                let v = self.parse::<f64>(pick(map.p, "p")?, "p")?;
+                if !v.is_finite() {
+                    return Err(IoError::Parse {
+                        line: self.line,
+                        message: "invalid p: not a finite number".to_string(),
+                    });
+                }
+                v > 0.0
+            },
         })
     }
 
