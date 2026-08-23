@@ -1150,7 +1150,9 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     // `extend_from_slice` (a length check plus a memcpy call for each 3-byte chunk) adds up at that
     // rate on cores with less headroom to hide it.
     let mut rgba = vec![0u8; rgb.len() / 3 * 4];
-    for (src, dst) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+    let (sources, _) = rgb.as_chunks::<3>();
+    let (destinations, _) = rgba.as_chunks_mut::<4>();
+    for (src, dst) in sources.iter().zip(destinations.iter_mut()) {
         dst[0] = src[0];
         dst[1] = src[1];
         dst[2] = src[2];

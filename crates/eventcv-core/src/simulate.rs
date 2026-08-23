@@ -756,12 +756,13 @@ pub fn linear_luma(r: u8, g: u8, b: u8) -> f32 {
 
 /// Converts a decoded RGB frame into the linear luma the simulator consumes.
 pub fn luma_from_rgb(image: &Rgb8Image) -> Vec<f32> {
-    let convert = |pixel: &[u8]| linear_luma(pixel[0], pixel[1], pixel[2]);
-    if image.pixels.len() / 3 < PARALLEL_PIXEL_THRESHOLD {
-        return image.pixels.chunks_exact(3).map(convert).collect();
+    let convert = |pixel: &[u8; 3]| linear_luma(pixel[0], pixel[1], pixel[2]);
+    let (pixels, _) = image.pixels.as_chunks::<3>();
+    if pixels.len() < PARALLEL_PIXEL_THRESHOLD {
+        return pixels.iter().map(convert).collect();
     }
-    // `par_chunks_exact` is indexed, so collecting preserves pixel order.
-    image.pixels.par_chunks_exact(3).map(convert).collect()
+    // `par_iter` is indexed, so collecting preserves pixel order.
+    pixels.par_iter().map(convert).collect()
 }
 
 /// How far a [`simulate_video_with_progress`] run has got.

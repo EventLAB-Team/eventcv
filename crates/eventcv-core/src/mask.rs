@@ -65,7 +65,7 @@ pub fn polygon(width: usize, height: usize, points: &[(f64, f64)]) -> Vec<bool> 
             }
         }
         crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-        for pair in crossings.chunks_exact(2) {
+        for pair in crossings.as_chunks::<2>().0 {
             for x in span(pair[0], pair[1], width) {
                 mask[y * width + x] = true;
             }

@@ -783,7 +783,9 @@ mod tests {
         assert_eq!(pixel(&image, 0, 0), [68, 1, 84]);
         assert!(image
             .pixels
-            .chunks_exact(3)
-            .all(|rgb| rgb == pixel(&image, 0, 0)));
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|rgb| *rgb == pixel(&image, 0, 0)));
     }
 }
