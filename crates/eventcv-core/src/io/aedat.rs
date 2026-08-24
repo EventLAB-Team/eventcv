@@ -649,7 +649,7 @@ fn scan_span(
         ..Span::default()
     };
     let mut clock = Clock::default();
-    for record in buffer.chunks_exact(RECORD) {
+    for record in buffer.as_chunks::<RECORD>().0 {
         let (address, t) = clock.read(record);
         let Record::Event { x, y, .. } = classify(address) else {
             continue;

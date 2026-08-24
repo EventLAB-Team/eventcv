@@ -105,6 +105,58 @@ class TextLoadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eventcv.load(path, sensor_size=(0, 4))
 
+    def test_scientific_notation_columns(self):
+        # N-CARS writes every `.txt` column in scientific notation; it has to read as the
+        # same events the plain integer spelling gives.
+        sci = self._write(
+            "3.000000000000000000e+01 4.000000000000000000e+01 "
+            "0.000000000000000000e+00 1.000000000000000000e+00\n",
+            "scientific.txt",
+        )
+        plain = self._write("30 40 0 1\n", "plain.txt")
+        options = dict(sensor_size=(120, 100), order="xytp", time_unit="us")
+
+        np.testing.assert_array_equal(
+            eventcv.load(sci, **options).numpy(), eventcv.load(plain, **options).numpy()
+        )
+
+    def test_scientific_notation_reads_the_same_with_or_without_time_unit(self):
+        # Whether `time_unit` is passed picks which parser runs, so the two have to agree.
+        path = self._write(
+            "3.000000e+01 4.000000e+01 5.000000e-01 1.000000e+00\n", "scientific.txt"
+        )
+        inferred = eventcv.load(path, sensor_size=(120, 100), order="xytp").numpy()
+        explicit = eventcv.load(
+            path, sensor_size=(120, 100), order="xytp", time_unit="seconds"
+        ).numpy()
+
+        np.testing.assert_array_equal(inferred, explicit)  # 0.5 s -> 500000 µs on both
+        np.testing.assert_array_equal(explicit[0], [30, 40, 500000, 1])
+
+    def test_coordinates_that_are_not_exact_integers_are_rejected(self):
+        # Reading x/y as floats to admit `3.0e+01` must not also admit `3.7` or `70000`,
+        # which a bare cast would silently turn into 3 and 65535 — on either parser.
+        for text in ("3.7 40 0 1\n", "70000 40 0 1\n", "-1 40 0 1\n"):
+            path = self._write(text)
+            for unit in (None, "us"):
+                with self.subTest(text=text, time_unit=unit):
+                    with self.assertRaisesRegex(ValueError, "invalid x"):
+                        eventcv.load(
+                            path, sensor_size=(120, 100), order="xytp", time_unit=unit
+                        )
+
+    def test_reader_slices_scientific_notation(self):
+        # `open()` indexes with one parser and slices with another; scientific notation used
+        # to index cleanly and then fail on every slice.
+        path = self._write(
+            "0.000000e+00 3.000000e+01 4.000000e+01 1.000000e+00\n"
+            "1.000000e+03 3.100000e+01 4.100000e+01 0.000000e+00\n"
+        )
+        reader = eventcv.open(path, sensor_size=(120, 100), time_unit="us")
+
+        self.assertEqual(reader.n_events, 2)
+        np.testing.assert_array_equal(reader.slice_count(0, 2).numpy()[:, 0], [30, 31])
+
     def test_missing_file_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
             eventcv.load("does-not-exist.txt", sensor_size=(4, 4))

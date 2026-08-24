@@ -278,10 +278,11 @@ impl UdpReceiver {
         builder: &mut EventStreamBuilder,
         arrival_index: i64,
     ) -> i64 {
-        let mut words = payload.chunks_exact(4).map(|bytes| {
-            self.format
-                .decode_word([bytes[0], bytes[1], bytes[2], bytes[3]])
-        });
+        let mut words = payload
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| self.format.decode_word(*bytes));
         let mut count = 0;
         while let Some(word) = words.next() {
             // Bit 31 tells us whether a timestamp word follows, so a receiver reads either format

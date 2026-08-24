@@ -219,6 +219,12 @@ impl EventFrame {
         &self.data
     }
 
+    /// Takes the frame's samples, for a caller that owns the frame and wants the buffer rather
+    /// than a copy of it — handing a just-generated frame straight to numpy, say.
+    pub fn into_data(self) -> EventFrameData {
+        self.data
+    }
+
     pub fn shape(&self) -> (usize, usize, usize) {
         (self.channels, self.height, self.width)
     }

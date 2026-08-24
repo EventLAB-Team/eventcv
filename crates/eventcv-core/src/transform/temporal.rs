@@ -5,24 +5,55 @@ use crate::{EventStream, EventStreamBuilder};
 
 impl EventStream {
     /// Keeps events whose timestamp lies in the half-open window `[t0, t1)`.
+    ///
+    /// In a time-ordered stream — what every reader and the simulator produce — the window is a
+    /// contiguous range, so this is two binary searches and a slice rather than a predicate per
+    /// event; a window covering the whole stream copies nothing at all. The scan that establishes
+    /// the ordering is one pass over the timestamps and vectorises, and an unordered stream falls
+    /// back to the general path rather than being silently mis-windowed.
     pub fn time_window(&self, t0: i64, t1: i64) -> EventStream {
         let (width, height) = self.sensor_size();
-        self.remap(width, height, |x, y, t, p| {
-            (t >= t0 && t < t1).then_some((x, y, t, p))
-        })
+        let ts = self.ts();
+        if !ts.is_sorted() {
+            return self.remap(width, height, |x, y, t, p| {
+                (t >= t0 && t < t1).then_some((x, y, t, p))
+            });
+        }
+        let (lo, hi) = (
+            ts.partition_point(|&t| t < t0),
+            ts.partition_point(|&t| t < t1),
+        );
+        if (lo, hi) == (0, self.len()) {
+            return self.clone();
+        }
+        let mut builder =
+            EventStreamBuilder::with_capacity(width, height, self.timestamp_scale_ms(), hi - lo);
+        builder.extend_from_columns(
+            &self.xs()[lo..hi],
+            &self.ys()[lo..hi],
+            &ts[lo..hi],
+            &self.ps()[lo..hi],
+        );
+        builder.build()
     }
 
     /// Shifts every timestamp by `dt` (same units as the stored timestamps).
     pub fn time_shift(&self, dt: i64) -> EventStream {
         let (width, height) = self.sensor_size();
-        self.remap(width, height, |x, y, t, p| Some((x, y, t + dt, p)))
+        self.map_columns(width, height, |out| {
+            for t in &mut out.ts {
+                *t += dt;
+            }
+        })
     }
 
     /// Scales every timestamp by `factor` (rounded), e.g. to change playback speed.
     pub fn time_scale(&self, factor: f64) -> EventStream {
         let (width, height) = self.sensor_size();
-        self.remap(width, height, |x, y, t, p| {
-            Some((x, y, (t as f64 * factor).round() as i64, p))
+        self.map_columns(width, height, |out| {
+            for t in &mut out.ts {
+                *t = (*t as f64 * factor).round() as i64;
+            }
         })
     }
 
@@ -68,6 +99,30 @@ mod tests {
     fn time_window_is_half_open() {
         let windowed = sample().time_window(110, 140); // keeps t = 110, 120, 130
         assert_eq!(windowed.ts(), &[110, 120, 130]);
+    }
+
+    /// The sorted fast path is a different code path from the general one, so both have to agree
+    /// — including on a stream whose timestamps are out of order, where only the general one is
+    /// correct.
+    #[test]
+    fn time_window_agrees_on_unordered_streams() {
+        let mut builder = EventStreamBuilder::new(4, 3, 0.001);
+        for (index, t) in [130_i64, 100, 150, 110, 140, 120].into_iter().enumerate() {
+            let index = index as u16;
+            builder.push(index % 4, index % 3, t, index.is_multiple_of(2));
+        }
+        let unordered = builder.build();
+
+        let windowed = unordered.time_window(110, 140);
+        assert_eq!(windowed.ts(), &[130, 110, 120]); // input order kept, window applied per event
+
+        // Sorting first must select the same events, only ordered.
+        let sorted = unordered.sort_by_time().time_window(110, 140);
+        assert_eq!(sorted.ts(), &[110, 120, 130]);
+
+        // A window covering everything is the stream itself, on either path.
+        assert_eq!(unordered.time_window(0, 1_000).ts(), unordered.ts());
+        assert_eq!(sample().time_window(0, 1_000).ts(), sample().ts());
     }
 
     #[test]

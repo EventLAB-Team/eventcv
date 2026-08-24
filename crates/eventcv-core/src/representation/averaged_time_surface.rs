@@ -4,10 +4,15 @@ use super::{
 };
 use crate::EventStream;
 
-/// Averaged time surface (HATS-style): where [`super::TimeSurface`] keeps only each pixel's
-/// *latest* exponential response, this averages `exp(-age / τ)` over **all** events that hit
-/// the pixel, so recurring activity reads brighter than a single stale hit. Two channels
-/// (positive / negative), `f32`, each pixel the mean response of its events (0 where none).
+/// Averaged time surface: where [`super::TimeSurface`] keeps only each pixel's *latest*
+/// exponential response, this averages `exp(-age / τ)` over **all** events that hit the pixel, so
+/// recurring activity reads brighter than a single stale hit. Two channels (positive / negative),
+/// `f32`, each pixel the mean response of its events (0 where none).
+///
+/// Related in spirit to HATS (Sironi et al., CVPR 2018) but deliberately not named after it: HATS
+/// partitions the sensor into cells, keeps a local memory per cell and polarity, and builds a
+/// local neighbourhood surface for every event before averaging into per-cell histograms. This is
+/// a per-pixel mean in a single pass, with a different output shape.
 #[derive(Clone, Copy, Debug)]
 pub struct AveragedTimeSurface {
     tau_ms: f64,
@@ -32,30 +37,80 @@ impl Representation for AveragedTimeSurface {
         validate_positive(self.tau_ms, "tau_ms")?;
         let (width, height, length) = frame_len(stream, 2)?;
         let plane_len = width * height;
+        // The accumulators stay `f64`/`u64` — the output is bit-identical either way. What changes
+        // is how the means are written out at the end.
+        //
+        // A short window touches a handful of cells out of hundreds of thousands, and the old
+        // `sums.zip(counts).map().collect()` walked every one of them and allocated a third
+        // sensor-sized buffer to hold the result — about 0.7 ms at 640x480 before a single event
+        // was read. Listing the cells an event reached and dividing only those removes it.
+        //
+        // A *dense* window is the opposite case: it reaches most cells, the list becomes a
+        // sensor-sized allocation of its own, and scattering through it at the end is a random
+        // walk over the plane that costs more than the single sequential pass it replaced. A
+        // window cannot touch more cells than it has events, so `stream.len()` decides which case
+        // this is before the loop starts — the dense path then never builds a list at all.
+        // Mispredicting can only cost the optimisation, never correctness: a stream whose events
+        // pile onto a few pixels is called dense and simply walks the plane, as it always did.
+        let track_touched = stream.len().saturating_mul(4) <= length;
         let mut sums = vec![0.0_f64; length];
         let mut counts = vec![0_u64; length];
+        let mut touched = if track_touched {
+            Vec::with_capacity(stream.len())
+        } else {
+            Vec::new()
+        };
 
         if let Some(reference) = reference_time(stream) {
-            for event in stream.iter() {
+            // Split rather than testing `track_touched` per event: the dense loop is then exactly
+            // the accumulation this has always done, with nothing added to a path that runs once
+            // per event over a whole recording.
+            let cell = |event: crate::Event| -> Result<(usize, f64), RepresentationError> {
                 let index =
                     event_index(event, width, height)? + if event.polarity { 0 } else { plane_len };
-                let response = (-age_ms(stream, reference, event.timestamp) / self.tau_ms).exp();
-                sums[index] += response;
-                counts[index] += 1;
+                Ok((
+                    index,
+                    (-age_ms(stream, reference, event.timestamp) / self.tau_ms).exp(),
+                ))
+            };
+            if track_touched {
+                for event in stream.iter() {
+                    let (index, response) = cell(event)?;
+                    if counts[index] == 0 {
+                        touched.push(index);
+                    }
+                    sums[index] += response;
+                    counts[index] += 1;
+                }
+            } else {
+                for event in stream.iter() {
+                    let (index, response) = cell(event)?;
+                    sums[index] += response;
+                    counts[index] += 1;
+                }
             }
         }
 
-        let values = sums
-            .into_iter()
-            .zip(counts)
-            .map(|(sum, count)| {
-                if count == 0 {
-                    0.0
-                } else {
-                    (sum / count as f64) as f32
-                }
-            })
-            .collect();
+        let values = if track_touched {
+            let mut values = vec![0.0_f32; length];
+            for index in touched {
+                values[index] = (sums[index] / counts[index] as f64) as f32;
+            }
+            values
+        } else {
+            // Writing every cell anyway, so build the buffer straight from the accumulators
+            // rather than zeroing one first and then testing each cell.
+            sums.into_iter()
+                .zip(counts)
+                .map(|(sum, count)| {
+                    if count == 0 {
+                        0.0
+                    } else {
+                        (sum / count as f64) as f32
+                    }
+                })
+                .collect()
+        };
 
         Ok(frame(values, width, height))
     }

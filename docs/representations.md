@@ -26,7 +26,7 @@ all three forms; each is flagged in its section below.
 | `count`    | {func}`~eventcv.count`   | 1  | `uint64`/`uint8`   | Total events per pixel, both polarities summed. |
 | `voxel`    | {func}`~eventcv.voxel`   | `bins` | `float32`      | Signed, time-interpolated polarity across `bins` temporal bins over the last `window_ms`. |
 | `tsurf`    | {func}`~eventcv.tsurf`   | 2  | `float32`          | Time surface: `exp(-age/tau_ms)` of the *latest* event per pixel/polarity. |
-| `atsurf`   | {func}`~eventcv.atsurf`  | 2  | `float32`          | Averaged (HATS-style) time surface: mean of `exp(-age/tau_ms)` over *all* events per pixel/polarity. |
+| `atsurf`   | {func}`~eventcv.atsurf`  | 2  | `float32`          | Averaged time surface: mean of `exp(-age/tau_ms)` over *all* events per pixel/polarity. |
 | `tencode`  | {func}`~eventcv.tencode` | 3  | `uint8`            | Latest polarity + normalized age within `window_ms`, as an RGB-like image. |
 | `countmask`| {func}`~eventcv.countmask` | 3 | `uint8`           | Positive/negative event counts in red/blue, jointly normalized by a percentile of the non-zero counts, plus a binary activity mask in green. Timestamps unused. |
 | `mcts`     | {func}`~eventcv.mcts`    | 10 | `float32`          | Multi-channel time surface: 5 log-spaced windows up to `max_window_ms`, per polarity. |
@@ -123,8 +123,13 @@ ecv.atsurf(stream, tau_ms=30.0)
 - `tau_ms` (`float`, default `30.0`) — exponential decay constant; must be finite and positive.
 
 Two channels, `[positive, negative]`, `float32`. Same exponential response as `tsurf`, but
-**averaged over every event** that hit the pixel (HATS-style) rather than keeping only the
-latest — recurring activity reads brighter than a single stale hit.
+**averaged over every event** that hit the pixel rather than keeping only the latest — recurring
+activity reads brighter than a single stale hit.
+
+Related in spirit to HATS (Sironi et al., CVPR 2018), but not that paper's scheme: HATS partitions
+the sensor into cells, keeps a local memory per cell and polarity, and builds a local neighbourhood
+surface for every event before averaging into per-cell histograms. `atsurf` is a per-pixel mean in a
+single pass, with a different output shape.
 
 ## Tencode
 

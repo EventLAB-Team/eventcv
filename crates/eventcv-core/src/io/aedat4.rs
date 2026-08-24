@@ -497,7 +497,8 @@ impl Aedat4SliceSource {
         let Some((bytes, elements)) = table.vector(slot::ELEMENTS, EVENT_STRIDE) else {
             return Ok(());
         };
-        for (index, event) in bytes.chunks_exact(EVENT_STRIDE).enumerate().take(elements) {
+        let (events, _) = bytes.as_chunks::<EVENT_STRIDE>();
+        for (index, event) in events.iter().enumerate().take(elements) {
             let t = i64::from_le_bytes(event[0..8].try_into().expect("eight bytes"));
             let x = i16::from_le_bytes(event[8..10].try_into().expect("two bytes"));
             let y = i16::from_le_bytes(event[10..12].try_into().expect("two bytes"));

@@ -9,6 +9,7 @@ use eventcv_core::{
     camera::Camera,
     cluster::ClusterError,
     feast::{Feast, FeastConfig, FeastError},
+    filter::{Neighbourhood, RefreshOn},
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
@@ -552,15 +553,38 @@ impl PyEventStream {
     // ---- Denoising filters (Phase 3). Each drops noise events and returns a new EventStream.
     // The neighbourhood/dead-time filters assume ascending time (call sort_by_time first if not).
 
-    /// Background-activity (nearest-neighbour) noise filter: keeps an event only if a 3×3
-    /// neighbour fired within `dt` (raw timestamp units, e.g. microseconds).
-    fn background_activity_filter(&self, py: Python<'_>, dt: i64) -> PyEventStream {
-        self.wrap(py.detach(|| self.inner.background_activity_filter(dt)))
+    /// Background-activity (nearest-neighbour) noise filter: keeps an event only if a
+    /// neighbouring pixel fired within `dt` (raw timestamp units, e.g. microseconds).
+    ///
+    /// `neighbourhood="block"` (the default) counts all eight surrounding pixels; `"cross"` counts
+    /// only the four edge-adjacent ones, which is the stricter test and retains measurably more
+    /// signal at matched noise rejection on uncorrelated shot noise — it is what tonic and jAER
+    /// use. The default is `"block"` because that is what this filter has always done.
+    #[pyo3(signature = (dt, *, neighbourhood="block"))]
+    fn background_activity_filter(
+        &self,
+        py: Python<'_>,
+        dt: i64,
+        neighbourhood: &str,
+    ) -> PyResult<PyEventStream> {
+        let neighbourhood = parse_neighbourhood(neighbourhood)?;
+        Ok(self.wrap(py.detach(|| {
+            self.inner
+                .background_activity_filter_with(dt, neighbourhood)
+        })))
     }
 
     /// Refractory-period filter: suppresses a pixel's events for `dt` after it fires.
-    fn refractory_filter(&self, py: Python<'_>, dt: i64) -> PyEventStream {
-        self.wrap(py.detach(|| self.inner.refractory_filter(dt)))
+    ///
+    /// `refresh="kept"` (the default) measures the dead time from the pixel's last *emitted*
+    /// event, the hardware definition — a suppressed event does not restart it. `refresh="all"`
+    /// restarts it on every arriving event, so the pixel must fall silent for `dt` before it emits
+    /// again; that is what tonic and evlib do, and it suppresses more under a noise burst. The two
+    /// are indistinguishable on clean data.
+    #[pyo3(signature = (dt, *, refresh="kept"))]
+    fn refractory_filter(&self, py: Python<'_>, dt: i64, refresh: &str) -> PyResult<PyEventStream> {
+        let refresh = parse_refresh_on(refresh)?;
+        Ok(self.wrap(py.detach(|| self.inner.refractory_filter_with(dt, refresh))))
     }
 
     /// Hot-pixel removal: drops pixels whose event count exceeds `mean + n_std·std` over the
@@ -579,10 +603,11 @@ impl PyEventStream {
         self.wrap(py.detach(|| self.inner.efast()))
     }
 
-    /// Harris corner score on the Surface of Active Events: keeps events whose Harris response
-    /// `det - k·trace²` of the SAE-ramp structure tensor exceeds `threshold`. The default
-    /// `threshold=0` keeps corners (rank-2, R>0) and rejects straight edges (rank-1, R<0); raise
-    /// it to be stricter.
+    /// Harris corner score on the Surface of Active Events: keeps events whose normalised Harris
+    /// response `det/trace² - k` of the SAE-ramp structure tensor exceeds `threshold`. The default
+    /// `threshold=0` keeps corners (rank-2, R>0) and rejects straight edges (rank-1, R<0). The
+    /// score is bounded to `[-0.04, 0.21]`, so raise `threshold` within that range to be stricter;
+    /// above `0.21` nothing is kept.
     #[pyo3(signature = (threshold=0.0))]
     fn harris_corners(&self, py: Python<'_>, threshold: f64) -> PyEventStream {
         self.wrap(py.detach(|| self.inner.harris_corners(threshold)))
@@ -2190,7 +2215,7 @@ impl PyEventReader {
                 let frame = py
                     .detach(|| spec.generate(&stream.inner))
                     .map_err(map_representation_error)?;
-                Ok(frame_numpy(py, &frame).unbind())
+                Ok(frame_into_numpy(py, frame).unbind())
             }
             None => Ok(Bound::new(py, stream)?.into_any().unbind()),
         }
@@ -2629,16 +2654,24 @@ impl PyEventReader {
         self.with_slice_op(Arc::new(|_, s: EventStream| s.sort_by_time()))
     }
 
-    /// Background-activity (nearest-neighbour) noise filter, per slice.
-    fn background_activity_filter(&self, dt: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |_, s: EventStream| {
-            s.background_activity_filter(dt)
-        }))
+    /// Background-activity (nearest-neighbour) noise filter, per slice. `neighbourhood` is
+    /// `"block"` (default, all eight neighbours) or `"cross"` (the four edge-adjacent ones).
+    #[pyo3(signature = (dt, *, neighbourhood="block"))]
+    fn background_activity_filter(&self, dt: i64, neighbourhood: &str) -> PyResult<PyEventReader> {
+        let neighbourhood = parse_neighbourhood(neighbourhood)?;
+        Ok(self.with_slice_op(Arc::new(move |_, s: EventStream| {
+            s.background_activity_filter_with(dt, neighbourhood)
+        })))
     }
 
-    /// Refractory-period filter, per slice.
-    fn refractory_filter(&self, dt: i64) -> PyEventReader {
-        self.with_slice_op(Arc::new(move |_, s: EventStream| s.refractory_filter(dt)))
+    /// Refractory-period filter, per slice. `refresh` is `"kept"` (default, the dead time runs
+    /// from the last emitted event) or `"all"` (every arriving event restarts it).
+    #[pyo3(signature = (dt, *, refresh="kept"))]
+    fn refractory_filter(&self, dt: i64, refresh: &str) -> PyResult<PyEventReader> {
+        let refresh = parse_refresh_on(refresh)?;
+        Ok(self.with_slice_op(Arc::new(move |_, s: EventStream| {
+            s.refractory_filter_with(dt, refresh)
+        })))
     }
 
     /// Hot-pixel removal applied to each slice (per-slice statistics; distinct from
@@ -4429,24 +4462,35 @@ fn map_cluster_error(error: ClusterError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
-/// Copies an [`EventFrame`] into an owned `[C, H, W]` numpy array of its native dtype —
-/// shared by `EventFrame.numpy()` and the reader's dense dataset path.
+/// Copies an [`EventFrame`] into an owned `[C, H, W]` numpy array of its native dtype.
+///
+/// For a caller that only borrows the frame — `EventFrame.numpy()`, where the frame stays alive
+/// behind a `frozen` pyclass and may be read again. A caller that *owns* the frame should use
+/// [`frame_into_numpy`] instead and skip the copy.
 fn frame_numpy<'py>(py: Python<'py>, frame: &EventFrame) -> Bound<'py, PyAny> {
+    frame_into_numpy(py, frame.clone())
+}
+
+/// Moves an [`EventFrame`]'s samples into a `[C, H, W]` numpy array — no copy: the frame's buffer
+/// becomes the array's. The reader's dataset path generates a frame per `reader[i]` and hands it
+/// straight on, so copying it first was a full plane per sample (4.9 MB for a 640x480 count frame)
+/// for nothing.
+fn frame_into_numpy<'py>(py: Python<'py>, frame: EventFrame) -> Bound<'py, PyAny> {
     let shape = frame.shape();
-    match frame.data() {
-        EventFrameData::U8(data) => numpy::ndarray::Array3::from_shape_vec(shape, data.clone())
+    match frame.into_data() {
+        EventFrameData::U8(data) => numpy::ndarray::Array3::from_shape_vec(shape, data)
             .expect("EventFrame shape must match its data")
             .into_pyarray(py)
             .into_any(),
-        EventFrameData::U16(data) => numpy::ndarray::Array3::from_shape_vec(shape, data.clone())
+        EventFrameData::U16(data) => numpy::ndarray::Array3::from_shape_vec(shape, data)
             .expect("EventFrame shape must match its data")
             .into_pyarray(py)
             .into_any(),
-        EventFrameData::U64(data) => numpy::ndarray::Array3::from_shape_vec(shape, data.clone())
+        EventFrameData::U64(data) => numpy::ndarray::Array3::from_shape_vec(shape, data)
             .expect("EventFrame shape must match its data")
             .into_pyarray(py)
             .into_any(),
-        EventFrameData::F32(data) => numpy::ndarray::Array3::from_shape_vec(shape, data.clone())
+        EventFrameData::F32(data) => numpy::ndarray::Array3::from_shape_vec(shape, data)
             .expect("EventFrame shape must match its data")
             .into_pyarray(py)
             .into_any(),
@@ -4655,6 +4699,20 @@ fn resolve_device(name: Option<&str>) -> PyResult<eventcv_core::accel::Device> {
             PyValueError::new_err(format!("device must be \"cpu\" or \"gpu\", not {name:?}"))
         }),
     }
+}
+
+fn parse_neighbourhood(name: &str) -> PyResult<Neighbourhood> {
+    Neighbourhood::parse(name).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "neighbourhood must be \"block\" or \"cross\", not {name:?}"
+        ))
+    })
+}
+
+fn parse_refresh_on(name: &str) -> PyResult<RefreshOn> {
+    RefreshOn::parse(name).ok_or_else(|| {
+        PyValueError::new_err(format!("refresh must be \"kept\" or \"all\", not {name:?}"))
+    })
 }
 
 fn map_resize_error(error: ResizeError) -> PyErr {

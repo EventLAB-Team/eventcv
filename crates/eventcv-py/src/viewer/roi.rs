@@ -142,7 +142,8 @@ impl MaskEditor {
             return;
         }
         let preview = self.drag.as_ref().map(|drag| (self.shape(drag), drag.subtract));
-        for (index, pixel) in image.pixels.chunks_exact_mut(3).enumerate() {
+        let (pixels, _) = image.pixels.as_chunks_mut::<3>();
+        for (index, pixel) in pixels.iter_mut().enumerate() {
             let keep = match &preview {
                 Some((shape, true)) => self.mask[index] && !shape[index],
                 Some((shape, false)) => self.mask[index] || shape[index],
@@ -151,7 +152,7 @@ impl MaskEditor {
             if !keep {
                 // Halve the brightness and cast it red, so an excluded region still shows its
                 // events (you can see what you are cutting out) but never reads as kept.
-                pixel.copy_from_slice(&[pixel[0] / 2 + 48, pixel[1] / 3, pixel[2] / 3]);
+                *pixel = [pixel[0] / 2 + 48, pixel[1] / 3, pixel[2] / 3];
             }
         }
     }

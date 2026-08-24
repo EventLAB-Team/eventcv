@@ -203,7 +203,9 @@ fn mcts_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
 fn point_set_cloud(points: &EventPointSet) -> Vec<CloudPoint> {
     points
         .data()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|point| CloudPoint {
             x: f64::from(point[0]) * 2.0 - 1.0,
             y: 1.0 - f64::from(point[1]) * 2.0,

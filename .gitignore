@@ -245,3 +245,4 @@ data/test/*
 !data/test/example.npz
 !data/test/sample.aedat4
 !data/test/sample_zstd.aedat4
+examples/

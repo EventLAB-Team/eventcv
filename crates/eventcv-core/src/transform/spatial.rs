@@ -14,35 +14,66 @@ impl EventStream {
     /// Mirrors horizontally (`x → width-1-x`). Sensor size unchanged.
     pub fn flip_x(&self) -> EventStream {
         let (width, height) = self.sensor_size();
-        let max_x = width as i64 - 1;
-        self.remap(width, height, |x, y, t, p| Some((max_x - x, y, t, p)))
+        let max_x = width.saturating_sub(1) as u16;
+        self.map_columns(width, height, |out| {
+            for x in &mut out.xs {
+                *x = max_x - *x;
+            }
+        })
     }
 
     /// Mirrors vertically (`y → height-1-y`). Sensor size unchanged.
     pub fn flip_y(&self) -> EventStream {
         let (width, height) = self.sensor_size();
-        let max_y = height as i64 - 1;
-        self.remap(width, height, |x, y, t, p| Some((x, max_y - y, t, p)))
+        let max_y = height.saturating_sub(1) as u16;
+        self.map_columns(width, height, |out| {
+            for y in &mut out.ys {
+                *y = max_y - *y;
+            }
+        })
     }
 
     /// Rotates by `k * 90°` clockwise. `k` is taken mod 4; quarter turns swap the sensor dims.
+    ///
+    /// A quarter turn swaps the two coordinate columns before rewriting one of them, so it copies
+    /// one column rather than four.
     pub fn rotate90(&self, k: i32) -> EventStream {
         let (width, height) = self.sensor_size();
-        let (max_x, max_y) = (width as i64 - 1, height as i64 - 1);
+        let (max_x, max_y) = (
+            width.saturating_sub(1) as u16,
+            height.saturating_sub(1) as u16,
+        );
         match k.rem_euclid(4) {
-            0 => self.remap(width, height, |x, y, t, p| Some((x, y, t, p))),
-            1 => self.remap(height, width, |x, y, t, p| Some((max_y - y, x, t, p))),
-            2 => self.remap(width, height, |x, y, t, p| {
-                Some((max_x - x, max_y - y, t, p))
+            0 => self.map_columns(width, height, |_| {}),
+            1 => self.map_columns(height, width, |out| {
+                std::mem::swap(&mut out.xs, &mut out.ys);
+                for x in &mut out.xs {
+                    *x = max_y - *x;
+                }
             }),
-            _ => self.remap(height, width, |x, y, t, p| Some((y, max_x - x, t, p))),
+            2 => self.map_columns(width, height, |out| {
+                for x in &mut out.xs {
+                    *x = max_x - *x;
+                }
+                for y in &mut out.ys {
+                    *y = max_y - *y;
+                }
+            }),
+            _ => self.map_columns(height, width, |out| {
+                std::mem::swap(&mut out.xs, &mut out.ys);
+                for y in &mut out.ys {
+                    *y = max_x - *y;
+                }
+            }),
         }
     }
 
     /// Reflects across the main diagonal (`(x, y) → (y, x)`); swaps the sensor dims.
     pub fn transpose(&self) -> EventStream {
         let (width, height) = self.sensor_size();
-        self.remap(height, width, |x, y, t, p| Some((y, x, t, p)))
+        self.map_columns(height, width, |out| {
+            std::mem::swap(&mut out.xs, &mut out.ys)
+        })
     }
 
     /// Translates by `(dx, dy)`; events shifted off the sensor are dropped. Sensor unchanged.
@@ -66,13 +97,13 @@ impl EventStream {
         } else {
             0.0
         };
-        self.remap(w, h, |x, y, t, p| {
-            Some((
-                (x as f64 * sx).floor() as i64,
-                (y as f64 * sy).floor() as i64,
-                t,
-                p,
-            ))
+        self.map_columns(w, h, |out| {
+            for x in &mut out.xs {
+                *x = (f64::from(*x) * sx).floor() as u16;
+            }
+            for y in &mut out.ys {
+                *y = (f64::from(*y) * sy).floor() as u16;
+            }
         })
     }
 
@@ -267,6 +298,85 @@ mod tests {
         assert_eq!(out.sensor_size(), (4, 3));
         assert!(out.len() <= s.len());
         assert!(out.xs().iter().all(|&x| x < 4) && out.ys().iter().all(|&y| y < 3));
+    }
+
+    /// The count-preserving transforms bypass `remap` and edit the columns directly, so the one
+    /// thing that has to stay true is that they still agree with `remap` event for event.
+    #[test]
+    fn bijective_transforms_agree_with_the_general_path() {
+        let mut builder = EventStreamBuilder::new(13, 7, 0.001);
+        for index in 0..60_u16 {
+            builder.push(index % 13, index % 7, i64::from(index) * 3, index % 3 == 0);
+        }
+        let s = builder.build();
+        let (w, h) = s.sensor_size();
+        let (max_x, max_y) = (w as i64 - 1, h as i64 - 1);
+        let (sx, sy) = (5.0 / w as f64, 4.0 / h as f64);
+
+        let cases: [(EventStream, EventStream); 6] = [
+            (
+                s.flip_x(),
+                s.remap(w, h, |x, y, t, p| Some((max_x - x, y, t, p))),
+            ),
+            (
+                s.flip_y(),
+                s.remap(w, h, |x, y, t, p| Some((x, max_y - y, t, p))),
+            ),
+            (
+                s.transpose(),
+                s.remap(h, w, |x, y, t, p| Some((y, x, t, p))),
+            ),
+            (
+                s.rotate90(1),
+                s.remap(h, w, |x, y, t, p| Some((max_y - y, x, t, p))),
+            ),
+            (
+                s.rotate90(3),
+                s.remap(h, w, |x, y, t, p| Some((y, max_x - x, t, p))),
+            ),
+            (
+                s.resize(5, 4),
+                s.remap(5, 4, |x, y, t, p| {
+                    Some((
+                        (x as f64 * sx).floor() as i64,
+                        (y as f64 * sy).floor() as i64,
+                        t,
+                        p,
+                    ))
+                }),
+            ),
+        ];
+
+        for (fast, general) in cases {
+            assert_eq!(fast.sensor_size(), general.sensor_size());
+            assert_eq!(coords(&fast), coords(&general));
+            assert_eq!(fast.ts(), general.ts());
+            assert_eq!(fast.ps(), general.ps());
+        }
+    }
+
+    /// Every transform that bypasses `remap` claims to map onto the grid it declares. If one ever
+    /// did not, it would silently produce out-of-range coordinates instead of dropping the event.
+    #[test]
+    fn bijective_transforms_keep_every_event_in_bounds() {
+        let s = sample();
+        for out in [
+            s.flip_x(),
+            s.flip_y(),
+            s.transpose(),
+            s.rotate90(1),
+            s.rotate90(2),
+            s.rotate90(3),
+            s.resize(2, 2),
+            s.resize(9, 7),
+            s.time_shift(-5),
+            s.invert_polarity(),
+        ] {
+            let (width, height) = out.sensor_size();
+            assert_eq!(out.len(), s.len());
+            assert!(out.xs().iter().all(|&x| (x as usize) < width));
+            assert!(out.ys().iter().all(|&y| (y as usize) < height));
+        }
     }
 
     #[test]
