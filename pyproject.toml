@@ -95,3 +95,18 @@ exclude = [
 
 [tool.uv.extra-build-dependencies]
 eventcv = ["maturin"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "win-64"]
+
+[tool.pixi.tasks]
+build = "maturin build"
+develop = "maturin develop"
+
+[tool.pixi.dependencies]
+cmake = ">=3.18"
+maturin = ">=1.8,<2"
+onnxruntime-cpp = ">=1.28,<1.29"
+pip = ">=26.2.1,<27"
+rust = ">=1.97.1,<1.98"

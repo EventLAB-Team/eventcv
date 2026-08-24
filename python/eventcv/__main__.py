@@ -172,19 +172,24 @@ def _cmd_render(args: argparse.Namespace) -> int:
 
 def _cmd_play(args: argparse.Namespace) -> int:
     """Play a recording in an interactive window."""
-    from . import open as open_reader
+    from . import open as open_reader, play
 
-    reader = open_reader(args.input, **_source_options(args))
-    reader.play(
+    kwargs = dict(
         fps=args.fps,
         dt_ms=args.dt_ms,
         decay_ms=args.decay_ms,
         repr=args.repr,
         colormap=args.colormap,
+        clim=args.clim,
         speed=args.speed,
+        refresh_hz=args.refresh_hz,
         loop_=args.loop,
         max_frames=args.max_frames,
     )
+    if args.input is None:
+        play(**kwargs)
+    else:
+        open_reader(args.input, **_source_options(args)).play(**kwargs)
     return 0
 
 
@@ -322,14 +327,23 @@ def build_parser() -> argparse.ArgumentParser:
     render.set_defaults(func=_cmd_render)
 
     play = subparsers.add_parser(
-        "play", help="play a recording in an interactive window"
+        "play", help="open the interactive recording player"
     )
-    play.add_argument("input", help="source recording")
+    play.add_argument("input", nargs="?", default=None, help="source recording (optional)")
     _add_source_options(play)
     play.add_argument(
-        "--dt-ms", type=float, default=30.0, metavar="MS", help="time per frame (default: 30)"
+        "--dt-ms",
+        type=float,
+        default=30.0,
+        metavar="MS",
+        help="sliding accumulation width (default: 30)",
     )
-    play.add_argument("--fps", type=float, default=30.0, help="display frame rate (default: 30)")
+    play.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="deprecated fixed display rate; use --speed (default: recording time)",
+    )
     play.add_argument(
         "--repr",
         default="raw",
@@ -341,7 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     play.add_argument("--colormap", default="viridis", help="colormap for scalar representations")
     play.add_argument(
+        "--clim", type=float, default=None, metavar="MAX", help="fixed colormap upper limit"
+    )
+    play.add_argument(
         "--speed", type=float, default=1.0, help="playback rate multiplier (default: 1)"
+    )
+    play.add_argument(
+        "--refresh-hz",
+        type=float,
+        default=60.0,
+        metavar="HZ",
+        help="maximum sliding-window refresh rate (default: 60)",
     )
     play.add_argument("--loop", action="store_true", help="restart at the end instead of closing")
     play.add_argument(

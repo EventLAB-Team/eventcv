@@ -8,6 +8,7 @@ use eventcv_core::representation::{EventFrame, EventFrameData, EventPointSet, Re
 use eventcv_core::viz::{render_frame, Colormap, Rgb8Image};
 
 mod gpu;
+pub(crate) mod gui;
 pub(crate) mod roi;
 
 // Polarity colours shared by every cloud (positive = warm, negative = cool).
@@ -40,9 +41,8 @@ pub(crate) enum Scene {
 /// the raw view, or a colour-mapped representation), so the viewer just uploads and displays the
 /// latest.
 ///
-/// The producer is the only thing that knows where the frames come from, so a live camera and a
-/// recording played back from disk both run through here — the latter simply asks for a different
-/// `interval`.
+/// Used by the live-camera path; recorded playback has its own egui app and worker thread.
+#[cfg(feature = "camera")]
 pub(crate) fn run_live<P>(
     producer: P,
     width: u32,
@@ -271,9 +271,13 @@ mod tests {
         // Mirrors `view` without opening a window: image vs cloud dispatch.
         use eventcv_core::representation::RepresentationKind::*;
         match frame.kind() {
-            Polarity | Binary | Count | CountMask | Flow | Intensity | Labels | Tencode => Scene::Image(
-                eventcv_core::viz::render_frame(frame, Colormap::Viridis, true),
-            ),
+            Polarity | Binary | Count | CountMask | Flow | Intensity | Labels | Tencode => {
+                Scene::Image(eventcv_core::viz::render_frame(
+                    frame,
+                    Colormap::Viridis,
+                    true,
+                ))
+            }
             Voxel => Scene::Cloud {
                 points: voxel_cloud(frame).unwrap(),
                 name: String::new(),

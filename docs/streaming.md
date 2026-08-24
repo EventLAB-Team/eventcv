@@ -104,8 +104,9 @@ npz and rosbag both have something to write at the end — a header stating the 
 index — so they spill to a scratch file beside the target while the capture runs and assemble it on
 close. Pick one of the others for a session you might have to kill.
 
-Only windows that are actually **read** are recorded, since `show()` doesn't poll them. To record
-without a loop, use {func}`~eventcv.record`, which opens the camera, captures, and closes it:
+Iteration and the event GUI archive every decoded window before display backpressure is applied.
+To record without a loop or window, use {func}`~eventcv.record`, which opens the camera, captures,
+and closes it:
 
 ```python
 ecv.record("session.h5", seconds=10)     # blocks 10 s (or Ctrl+C); returns the event count
@@ -158,9 +159,9 @@ driver's ring drains continuously whatever your loop is doing, and the loop only
 that are already decoded — so the per-window budget is yours to spend. On an EVK4 at `dt_ms=50`,
 40 ms of processing per frame still holds 19.9 of an ideal 20 fps with the ring empty.
 
-{meth}`~eventcv.EventCamera.show`, {meth}`~eventcv.EventCamera.record`, and
-{meth}`~eventcv.EventCamera.close` pause the thread to take the camera back; it restarts on the next
-read.
+The event GUI uses the same pump. {meth}`~eventcv.EventCamera.record`, APS viewing,
+{meth}`~eventcv.EventCamera.draw_mask`, and {meth}`~eventcv.EventCamera.close` take the camera back
+directly; normal reads restart the pump when needed.
 
 Four counters tell you what the pipeline is doing:
 
@@ -289,10 +290,13 @@ to render that instead:
 
 ```python
 ecv.stream().show()                     # raw polarity view (the default)
-ecv.stream(dt_ms=30).show("count")      # a representation, colour-mapped
+ecv.stream(dt_ms=30).show("count", refresh_hz=60)
 ```
 
-It blocks on the main thread until the window closes, then the camera is usable again.
+The same accumulation, refresh-rate, statistics, and ordered processor controls used for recordings
+work live. Capture and `record=` continue while display is paused; the source panel reports windows
+the freshness queue skipped. It blocks on the main thread until the window closes, then the camera
+is usable again. `show("aps")` keeps the specialized APS viewer.
 
 ## Reference
 

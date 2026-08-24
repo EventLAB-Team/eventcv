@@ -431,7 +431,7 @@ def stream(
     ``.csv``, ``.bag``, ``.aedat``, ``.aedat4``, ``.dat``, ``.raw``) to archive the session while you
     work: every window the loop reads has its **raw** events appended to that file first, so a
     ``repr=`` loop processes representations live and still keeps the full-resolution recording for
-    later. Writing happens in Rust as each window is polled — no per-window Python round trip — and
+    later. Writing happens in Rust as each window is decoded — no per-window Python round trip — and
     is flushed about once a second, so a crash keeps everything up to a second ago.
 
     Formats differ in *when* the file becomes readable, which matters for a capture that might be
@@ -439,9 +439,9 @@ def stream(
     recording after every window, while npz and rosbag have a header or an index to write at the end
     and are only complete once the camera is closed. ``compression`` is an optional gzip level
     (``0..=9``) for HDF5; omit it for the fastest writes. The file is closed by :meth:`EventCamera.close` or
-    the ``with`` block, and :attr:`EventCamera.n_recorded` counts what has been written. Only windows
-    that are actually read are recorded (``show()`` doesn't poll them); to record without a loop, use
-    :meth:`EventCamera.record` instead.
+    the ``with`` block, and :attr:`EventCamera.n_recorded` counts what has been written. Iteration and
+    the event GUI both keep this background recorder running; :meth:`EventCamera.record` is the
+    blocking alternative when no interactive view or loop is needed.
 
     **Capping the source.** Every event costs time to decode, window, and render, so the cheapest
     event is one the camera never sends. ``max_event_rate`` (events per second) enables the sensor's
@@ -529,9 +529,9 @@ def stream(
     the driver's ring is drained continuously no matter what your loop is doing — the loop only
     collects windows that are already decoded. On a Prophesee EVK4 at ``dt_ms=50`` this leaves
     ~80% of each window's wall-clock budget free for your own work: 40 ms of per-frame processing
-    still holds 19.9 of an ideal 20 fps with the ring empty. (:meth:`EventCamera.show`,
-    :meth:`EventCamera.record`, and :meth:`EventCamera.close` pause the thread and take the camera
-    back, then it restarts on the next read.)
+    still holds 19.9 of an ideal 20 fps with the ring empty. The event GUI uses this same pump;
+    :meth:`EventCamera.record`, :meth:`EventCamera.draw_mask`, APS viewing, and
+    :meth:`EventCamera.close` take the camera back directly.
 
     Windows are delivered in order, so a loop whose per-window work is slower than the camera still
     falls behind — the thread buffers a few windows, then applies backpressure, and under *sustained*
@@ -545,10 +545,10 @@ def stream(
     The returned camera is a context manager and an iterator::
 
         # Live raw event view (the default) — polarity dots with exponential decay:
-        eventcv.stream().show()
+        eventcv.stream().show()                      # 30 ms window, up to 60 refreshes/s
 
         # Live representation view:
-        eventcv.stream(dt_ms=30).show("count")
+        eventcv.stream(dt_ms=30).show("count", refresh_hz=60)
 
         # Iterate windows and run any eventcv op on the live feed:
         with eventcv.stream(dt_ms=30) as cam:
@@ -966,22 +966,26 @@ def save_video(
     return source.save_video(path, **kwargs)
 
 
-def play(source, **kwargs) -> None:
-    """Open an interactive window playing ``source`` — an :class:`EventReader`, an
-    :class:`EventStream`, or a path.
+def play(source=None, **kwargs) -> None:
+    """Open the interactive player, optionally with an :class:`EventReader`,
+    :class:`EventStream`, or path already loaded.
 
     The offline twin of :meth:`EventCamera.show`: with no ``repr`` it shows the raw event stream,
     polarity dots fading by age, so watching a recording takes no more setup than watching a
     camera::
 
-        ecv.play("rec.h5", dt_ms=5)             # raw, six times slower than real time at 30 fps
+        ecv.play()                              # choose a recording in the GUI
+        ecv.play("rec.h5", dt_ms=5)
         ecv.play("rec.h5", repr="count", dt_ms=20)
         ecv.play(events, speed=0.25)
 
-    Blocks on the main thread until the window is closed (``Esc`` or the close button). Keyword
-    arguments are those of :meth:`EventReader.play` / :meth:`EventStream.play` — ``fps``,
-    ``dt_ms``, ``decay_ms``, ``speed``, ``loop_``, and for a reader also ``repr``/``colormap``.
+    At ``speed=1`` recording time matches wall time. ``dt_ms`` is the accumulation width while
+    ``refresh_hz`` (default 60) controls how often that window advances, so overlapping windows are
+    cheap. ``fps`` remains accepted for compatibility but is deprecated. The call blocks on the
+    main thread until the window is closed.
     """
+    if source is None:
+        return _rust.play_gui(**kwargs)
     if isinstance(source, str):
         source = open(source)
     return source.play(**kwargs)

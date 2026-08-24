@@ -83,17 +83,20 @@ Useful flags:
 ## `eventcv play`
 
 ```console
+$ eventcv play
 $ eventcv play recording.h5 --dt-ms 5
 ```
 
-Opens an interactive window and plays the recording — the offline twin of a camera's live view, and
-raw by default for the same reason `render` is. It blocks until the window is closed (`Esc` or the
-close button).
+Opens the interactive player, empty when no recording is supplied. A file can also be opened from
+the window or dropped onto it. The view is raw by default for the same reason `render` is.
 
-Takes `--dt-ms`, `--fps`, `--repr`, `--decay-ms` and `--colormap` exactly as `render` does, plus:
+At `--speed 1`, recording time matches wall time. `--fps` is accepted only for compatibility and
+is deprecated. The player also takes `--dt-ms`, `--refresh-hz`, `--repr`, `--decay-ms`,
+`--colormap`, and `--clim`.
 
 - `--speed` — playback rate multiplier; `--speed 0.25` for a slow look at a fast scene.
-- `--loop` — restart at the end instead of closing.
+- `--refresh-hz` — sliding-window refresh cap; defaults to 60 Hz independently of `--dt-ms`.
+- `--loop` — restart at the end instead of pausing on the final frame.
 
 ## `eventcv simulate`
 

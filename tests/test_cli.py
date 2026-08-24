@@ -10,6 +10,7 @@ import io
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -138,6 +139,52 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(".gif", err)
         self.assertNotIn("Traceback", err)
+
+
+class PlayTests(unittest.TestCase):
+    def test_play_without_a_file_opens_the_empty_player(self):
+        with mock.patch("eventcv.play") as play:
+            code, _, _ = _run("play", "--speed", "0.5", "--refresh-hz", "120")
+        self.assertEqual(code, 0)
+        play.assert_called_once()
+        self.assertEqual(play.call_args.kwargs["speed"], 0.5)
+        self.assertEqual(play.call_args.kwargs["refresh_hz"], 120.0)
+        self.assertIsNone(play.call_args.kwargs["fps"])
+
+    def test_play_file_preserves_source_and_view_options(self):
+        reader = mock.Mock()
+        with mock.patch("eventcv.open", return_value=reader) as open_reader:
+            code, _, _ = _run(
+                "play",
+                str(EXAMPLE_NPZ),
+                "--time-unit",
+                "us",
+                "--repr",
+                "count",
+                "--clim",
+                "4",
+                "--fps",
+                "20",
+            )
+        self.assertEqual(code, 0)
+        open_reader.assert_called_once_with(str(EXAMPLE_NPZ), time_unit="us")
+        reader.play.assert_called_once()
+        self.assertEqual(reader.play.call_args.kwargs["repr"], "count")
+        self.assertEqual(reader.play.call_args.kwargs["clim"], 4.0)
+        self.assertEqual(reader.play.call_args.kwargs["fps"], 20.0)
+
+    def test_public_play_accepts_no_source(self):
+        with mock.patch.object(eventcv._rust, "play_gui") as player:
+            eventcv.play(speed=2.0)
+        player.assert_called_once_with(speed=2.0)
+
+    def test_refresh_rate_is_bounded_before_launch(self):
+        with self.assertRaisesRegex(ValueError, "between 1 and 240"):
+            eventcv.play(refresh_hz=0)
+
+    def test_legacy_fps_warns_before_launching(self):
+        with self.assertWarns(DeprecationWarning), self.assertRaises(ValueError):
+            eventcv.play(fps=30.0, max_frames=0)
 
 
 class SimulateCommandTests(unittest.TestCase):
