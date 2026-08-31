@@ -21,6 +21,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use super::{ImuSample, IoError, LoadOptions, SliceSource};
 use crate::representation::{EventFrame, EventFrameData};
 use crate::{EventStream, EventStreamBuilder};
@@ -243,22 +245,34 @@ impl Compression {
         }
     }
 
-    fn decode(self, body: Vec<u8>) -> Result<Vec<u8>, IoError> {
+    fn decode(self, body: &[u8]) -> Result<Vec<u8>, IoError> {
+        let mut out = Vec::new();
+        self.decode_into(body, &mut out)?;
+        Ok(out)
+    }
+
+    /// Decompresses into a caller-owned buffer. A recording is a few hundred packets of similar
+    /// size, so one buffer that keeps its capacity replaces a few hundred Vecs that each grow to
+    /// the packet size by doubling.
+    fn decode_into(self, body: &[u8], out: &mut Vec<u8>) -> Result<(), IoError> {
+        out.clear();
         match self {
-            Self::None => Ok(body),
+            Self::None => out.extend_from_slice(body),
             // DV writes LZ4 in its frame format, not raw blocks.
             Self::Lz4 => {
-                let mut out = Vec::new();
-                lz4::Decoder::new(body.as_slice())
-                    .and_then(|mut decoder| decoder.read_to_end(&mut out))
+                lz4::Decoder::new(body)
+                    .and_then(|mut decoder| decoder.read_to_end(out))
                     .map_err(|error| {
                         IoError::Format(format!("AEDAT4 LZ4 packet is corrupt: {error}"))
                     })?;
-                Ok(out)
             }
-            Self::Zstd => zstd::stream::decode_all(body.as_slice())
-                .map_err(|error| IoError::Format(format!("AEDAT4 zstd packet is corrupt: {error}"))),
+            Self::Zstd => {
+                zstd::stream::copy_decode(body, &mut *out).map_err(|error| {
+                    IoError::Format(format!("AEDAT4 zstd packet is corrupt: {error}"))
+                })?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -391,10 +405,68 @@ fn read_body(
     size: usize,
 ) -> Result<Vec<u8>, IoError> {
     let mut file = File::open(path)?;
+    let mut buffers = Buffers::default();
+    read_body_with(&mut file, compression, offset, size, &mut buffers)?;
+    Ok(std::mem::take(&mut buffers.plain))
+}
+
+/// The same, on a handle the caller already holds and a buffer it reuses. Reading a recording's
+/// events touches one packet after another, so opening the file per packet is one `open` and one
+/// `close` syscall per few thousand events, and `vec![0u8; size]` zeroes a buffer that is about to
+/// be overwritten in full.
+fn read_body_with(
+    file: &mut File,
+    compression: Compression,
+    offset: u64,
+    size: usize,
+    buffers: &mut Buffers,
+) -> Result<(), IoError> {
     file.seek(SeekFrom::Start(offset))?;
-    let mut body = vec![0u8; size];
-    file.read_exact(&mut body)?;
-    compression.decode(body)
+    buffers.compressed.clear();
+    buffers.compressed.resize(size, 0);
+    file.read_exact(&mut buffers.compressed)?;
+    let (compressed, plain) = (&buffers.compressed, &mut buffers.plain);
+    compression.decode_into(compressed, plain)
+}
+
+/// The two buffers a packet-by-packet read reuses: the compressed bytes off disk, and the
+/// decompressed body they expand into.
+#[derive(Default)]
+struct Buffers {
+    compressed: Vec<u8>,
+    plain: Vec<u8>,
+}
+
+/// Above this many packets, `slice_index` decodes them in parallel. One window of a recording is
+/// a packet or two, and paying for a thread-pool hand-off there would slow down the case a
+/// real-time loop actually runs.
+const PARALLEL_PACKET_THRESHOLD: usize = 8;
+
+/// One packet's decoded events, before they are appended to the stream in packet order.
+struct Columns {
+    xs: Vec<u16>,
+    ys: Vec<u16>,
+    ts: Vec<i64>,
+    ps: Vec<bool>,
+}
+
+impl Columns {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            xs: Vec::with_capacity(capacity),
+            ys: Vec::with_capacity(capacity),
+            ts: Vec::with_capacity(capacity),
+            ps: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, x: u16, y: u16, t: i64, p: bool) {
+        self.xs.push(x);
+        self.ys.push(y);
+        self.ts.push(t);
+        self.ps.push(p);
+    }
 }
 
 /// Lazy, indexed source for an AEDAT 4 recording.
@@ -485,14 +557,38 @@ impl Aedat4SliceSource {
         read_body(&self.path, self.compression, packet.offset, packet.size)
     }
 
+    /// `body`, reusing a handle and a scratch buffer across packets.
+    fn body_with(
+        &self,
+        file: &mut File,
+        buffers: &mut Buffers,
+        packet: &Packet,
+    ) -> Result<(), IoError> {
+        read_body_with(file, self.compression, packet.offset, packet.size, buffers)
+    }
+
     /// Decodes every event in `packet`, handing each to `visit` with its index in the stream.
     fn each_event(
         &self,
         packet: &Packet,
+        visit: impl FnMut(usize, u16, u16, i64, bool),
+    ) -> Result<(), IoError> {
+        let mut file = File::open(&self.path)?;
+        let mut buffers = Buffers::default();
+        self.each_event_with(&mut file, &mut buffers, packet, visit)
+    }
+
+    /// `each_event`, on a handle and scratch buffer the caller reuses across packets.
+    fn each_event_with(
+        &self,
+        file: &mut File,
+        buffers: &mut Buffers,
+        packet: &Packet,
         mut visit: impl FnMut(usize, u16, u16, i64, bool),
     ) -> Result<(), IoError> {
-        let body = self.body(packet)?;
-        let table = Table::size_prefixed_root(&body)
+        self.body_with(file, buffers, packet)?;
+        let body = &buffers.plain;
+        let table = Table::size_prefixed_root(body)
             .ok_or_else(|| IoError::Format("AEDAT4 event packet is not readable".to_owned()))?;
         let Some((bytes, elements)) = table.vector(slot::ELEMENTS, EVENT_STRIDE) else {
             return Ok(());
@@ -531,24 +627,79 @@ impl SliceSource for Aedat4SliceSource {
     fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError> {
         let i0 = i0.min(self.n_events);
         let i1 = i1.clamp(i0, self.n_events);
-        let mut builder = EventStreamBuilder::new(self.width, self.height, TIMESTAMP_SCALE_MS);
-        for packet in &self.events {
-            if packet.first >= i1 || packet.first + packet.elements <= i0 {
-                continue;
+        let selected: Vec<&Packet> = self
+            .events
+            .iter()
+            .filter(|packet| packet.first < i1 && packet.first + packet.elements > i0)
+            .collect();
+
+        // AEDAT 4 packets are self-contained -- a compressed body, a flatbuffer, and absolute
+        // timestamps -- so decoding them does not have to be sequential the way a stateful EVT3
+        // stream does. Above a handful of packets the decompression, which is most of the cost,
+        // goes wide. Below it the thread-pool hand-off costs more than it saves, which is the case
+        // that matters most: a robot pulling one window.
+        if selected.len() < PARALLEL_PACKET_THRESHOLD {
+            let mut builder = EventStreamBuilder::with_capacity(
+                self.width,
+                self.height,
+                TIMESTAMP_SCALE_MS,
+                i1 - i0,
+            );
+            let mut file = File::open(&self.path)?;
+            let mut buffers = Buffers::default();
+            for packet in selected {
+                self.each_event_with(&mut file, &mut buffers, packet, |index, x, y, t, p| {
+                    if index >= i0 && index < i1 {
+                        builder.push(x, y, t, p);
+                    }
+                })?;
             }
-            self.each_event(packet, |index, x, y, t, p| {
-                if index >= i0 && index < i1 {
-                    builder.push(x, y, t, p);
-                }
-            })?;
+            return Ok(builder.build());
+        }
+
+        let columns: Result<Vec<Columns>, IoError> = selected
+            .par_iter()
+            .map_init(
+                || (File::open(&self.path), Buffers::default()),
+                |(file, buffers), packet| {
+                    let file = file.as_mut().map_err(|error| {
+                        IoError::Io(std::io::Error::new(error.kind(), error.to_string()))
+                    })?;
+                    let mut out = Columns::with_capacity(packet.elements);
+                    self.each_event_with(file, buffers, packet, |index, x, y, t, p| {
+                        if index >= i0
+                            && index < i1
+                            && usize::from(x) < self.width
+                            && usize::from(y) < self.height
+                        {
+                            out.push(x, y, t, p);
+                        }
+                    })?;
+                    Ok(out)
+                },
+            )
+            .collect();
+
+        let columns = columns?;
+        let mut builder = EventStreamBuilder::with_capacity(
+            self.width,
+            self.height,
+            TIMESTAMP_SCALE_MS,
+            columns.iter().map(|c| c.ts.len()).sum(),
+        );
+        // Packets are in time order, so appending their columns in order preserves it.
+        for c in &columns {
+            builder.extend_from_columns(&c.xs, &c.ys, &c.ts, &c.ps);
         }
         Ok(builder.build())
     }
 
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {
         let mut builder = EventStreamBuilder::new(self.width, self.height, TIMESTAMP_SCALE_MS);
+        let mut file = File::open(&self.path)?;
+        let mut buffers = Buffers::default();
         for packet in overlapping(&self.events, t0, t1) {
-            self.each_event(packet, |_, x, y, t, p| {
+            self.each_event_with(&mut file, &mut buffers, packet, |_, x, y, t, p| {
                 if t >= t0 && t < t1 {
                     builder.push(x, y, t, p);
                 }
