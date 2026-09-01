@@ -108,6 +108,17 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # The ROS 2 example turns this on with RUST_LOG=…; hiroz and zenoh both log through `tracing`.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The ROS 2 examples do not compile without the module they exercise, and
+# `cargo test` builds every example — so they declare what they need rather
+# than breaking a default-feature build.
+[[example]]
+name = "ros2_node"
+required-features = ["ros2"]
+
+[[example]]
+name = "hz_probe"
+required-features = ["ros2"]
+
 [[bench]]
 name = "pipeline"
 harness = false
