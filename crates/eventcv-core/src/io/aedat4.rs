@@ -217,7 +217,7 @@ impl Compression {
     }
 
     /// Compresses one packet body for writing. LZ4 goes out in the *frame* format DV expects,
-    /// which is what [`decode`](Self::decode) reads back.
+    /// which is what [`decode_into`](Self::decode_into) reads back.
     fn encode(self, body: &[u8]) -> Result<Vec<u8>, IoError> {
         match self {
             Self::None => Ok(body.to_vec()),
@@ -243,12 +243,6 @@ impl Compression {
                 "unknown AEDAT4 compression type {other}"
             ))),
         }
-    }
-
-    fn decode(self, body: &[u8]) -> Result<Vec<u8>, IoError> {
-        let mut out = Vec::new();
-        self.decode_into(body, &mut out)?;
-        Ok(out)
     }
 
     /// Decompresses into a caller-owned buffer. A recording is a few hundred packets of similar
@@ -567,18 +561,8 @@ impl Aedat4SliceSource {
         read_body_with(file, self.compression, packet.offset, packet.size, buffers)
     }
 
-    /// Decodes every event in `packet`, handing each to `visit` with its index in the stream.
-    fn each_event(
-        &self,
-        packet: &Packet,
-        visit: impl FnMut(usize, u16, u16, i64, bool),
-    ) -> Result<(), IoError> {
-        let mut file = File::open(&self.path)?;
-        let mut buffers = Buffers::default();
-        self.each_event_with(&mut file, &mut buffers, packet, visit)
-    }
-
-    /// `each_event`, on a handle and scratch buffer the caller reuses across packets.
+    /// Decodes every event in `packet`, handing each to `visit` with its index in the stream,
+    /// on a file handle and scratch buffer the caller reuses across packets.
     fn each_event_with(
         &self,
         file: &mut File,
