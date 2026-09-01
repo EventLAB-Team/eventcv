@@ -303,6 +303,7 @@ impl Ros2Context {
             encoding: EvtVersion::Evt3,
             clock_offset_ns: 0,
             frame_id: "event_camera".to_owned(),
+            bytes: 0,
         })
     }
 
@@ -323,6 +324,7 @@ impl Ros2Context {
             _node: node,
             received: 0,
             last_seq: None,
+            last_time_base_ns: 0,
             dropped: 0,
         })
     }
@@ -376,6 +378,7 @@ pub struct EventPublisher {
     encoding: EvtVersion,
     clock_offset_ns: i64,
     frame_id: String,
+    bytes: usize,
 }
 
 impl EventPublisher {
@@ -409,6 +412,7 @@ impl EventPublisher {
             self.clock_offset_ns,
             &self.frame_id,
         )?;
+        self.bytes += packet.events.len();
         self.runtime
             .block_on(self.publisher.async_publish(&packet))
             .map_err(|e| Ros2Error::Transport(e.to_string()))?;
@@ -418,6 +422,15 @@ impl EventPublisher {
     /// How many packets have gone out.
     pub fn published(&self) -> u64 {
         self.seq
+    }
+
+    /// Bytes of encoded events put on the wire, not counting the rest of each message.
+    ///
+    /// Worth having outside a benchmark: it is what sizing a radio link comes down to, and the
+    /// answer depends on the recording — EVT3's vector words pay off on dense rows and cost on
+    /// sparse ones, so a number from someone else's data is not yours.
+    pub fn bytes_published(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -437,6 +450,7 @@ pub struct EventSubscriber {
     _node: hiroz::node::ZNode,
     received: u64,
     last_seq: Option<u64>,
+    last_time_base_ns: u64,
     dropped: u64,
 }
 
@@ -463,6 +477,7 @@ impl EventSubscriber {
             self.dropped += packet.seq.saturating_sub(previous + 1);
         }
         self.last_seq = Some(packet.seq);
+        self.last_time_base_ns = packet.time_base;
         Ok(Some(packet))
     }
 
@@ -477,6 +492,15 @@ impl EventSubscriber {
     /// How many packets have arrived.
     pub fn received(&self) -> u64 {
         self.received
+    }
+
+    /// The ROS time on the most recent packet, in nanoseconds; zero before the first one.
+    ///
+    /// Kept because it is the only thing a decoded [`EventStream`] does not carry: the stream has
+    /// the sensor's clock, and this is where that clock sat in ROS time. Comparing it with the
+    /// clock now is how a consumer knows how old the events in its hands are.
+    pub fn last_time_base_ns(&self) -> u64 {
+        self.last_time_base_ns
     }
 
     /// How many packets the sequence numbers say went missing on the way. Reported rather than

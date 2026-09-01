@@ -7010,6 +7010,16 @@ impl PyRos2Publisher {
     fn published(&self) -> u64 {
         self.inner.lock().expect("publisher mutex").published()
     }
+
+    /// Bytes of encoded events put on the wire, not counting the rest of each message — what
+    /// sizing a link comes down to.
+    #[getter]
+    fn bytes_published(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("publisher mutex")
+            .bytes_published()
+    }
 }
 
 /// Receives `event_camera_msgs/msg/EventPacket` and hands back streams.
@@ -7060,6 +7070,16 @@ impl PyRos2Subscriber {
     #[getter]
     fn received(&self) -> u64 {
         self.inner.lock().expect("subscriber mutex").received()
+    }
+
+    /// The ROS time the most recent packet carried, in nanoseconds; 0 before the first one.
+    /// Comparing it with the clock now is how a consumer knows how old its events are.
+    #[getter]
+    fn last_time_base_ns(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("subscriber mutex")
+            .last_time_base_ns()
     }
 
     /// How many packets the sequence numbers say went missing. Reported rather than hidden.
