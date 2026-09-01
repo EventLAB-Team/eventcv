@@ -473,16 +473,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.last_cursor = None;
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if self.dragging && self.is_cloud {
-                    if let Some((last_x, last_y)) = self.last_cursor {
-                        self.yaw += (position.x - last_x) as f32 * 0.008;
-                        self.pitch =
-                            (self.pitch + (position.y - last_y) as f32 * 0.008).clamp(-1.45, 1.45);
-                        self.redraw();
-                    }
-                    self.last_cursor = Some((position.x, position.y));
+            // Guarded rather than tested inside the arm: the only arm that could otherwise
+            // catch a cursor move is the final `_ => {}`, so this is the same behaviour and
+            // clippy stops asking.
+            WindowEvent::CursorMoved { position, .. } if self.dragging && self.is_cloud => {
+                if let Some((last_x, last_y)) = self.last_cursor {
+                    self.yaw += (position.x - last_x) as f32 * 0.008;
+                    self.pitch =
+                        (self.pitch + (position.y - last_y) as f32 * 0.008).clamp(-1.45, 1.45);
+                    self.redraw();
                 }
+                self.last_cursor = Some((position.x, position.y));
             }
             WindowEvent::MouseWheel { delta, .. } if self.is_cloud => {
                 // Positive scroll (wheel up / two-finger up) zooms in. Multiplicative so each
