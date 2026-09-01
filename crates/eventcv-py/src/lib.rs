@@ -6846,7 +6846,252 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(stream, m)?)?;
         m.add_function(wrap_pyfunction!(record, m)?)?;
     }
+    #[cfg(feature = "ros2")]
+    {
+        m.add_class::<PyRos2Context>()?;
+        m.add_class::<PyRos2Publisher>()?;
+        m.add_class::<PyRos2Subscriber>()?;
+        m.add_class::<PyRos2ImagePublisher>()?;
+    }
     Ok(())
+}
+
+// ------------------------------------------------------------------------------- ROS 2 ----
+
+#[cfg(feature = "ros2")]
+use pyo3::exceptions::PyConnectionError;
+#[cfg(feature = "ros2")]
+use std::path::PathBuf as Ros2Path;
+#[cfg(feature = "ros2")]
+use std::time::Duration as Ros2Duration;
+
+#[cfg(feature = "ros2")]
+fn map_ros2_error(error: eventcv_core::ros2::Ros2Error) -> PyErr {
+    use eventcv_core::ros2::Ros2Error;
+    match error {
+        Ros2Error::Io(error) => map_io_error(error),
+        Ros2Error::Payload(message) => PyValueError::new_err(message),
+        Ros2Error::Session(message) | Ros2Error::Transport(message) => {
+            PyConnectionError::new_err(message)
+        }
+    }
+}
+
+/// A ROS 2 context: one Zenoh session shared by every node made from it.
+///
+/// Nothing here links a ROS 2 library, so a node is `pip install eventcv` and a Python file — no
+/// ROS installation, no colcon workspace, no second build system. The wire is Zenoh, so the ROS 2
+/// side must be running `rmw_zenoh_cpp` (or a `zenoh-bridge-ros2dds` in front of a DDS one).
+#[cfg(feature = "ros2")]
+#[pyclass(name = "Ros2Context")]
+struct PyRos2Context {
+    inner: eventcv_core::ros2::Ros2Context,
+}
+
+#[cfg(feature = "ros2")]
+#[pymethods]
+impl PyRos2Context {
+    /// `router` names the Zenoh router (`"tcp/host:7447"`); the default is the local `rmw_zenohd`
+    /// that an `rmw_zenoh_cpp` deployment already runs. `mode` is the Zenoh session mode and
+    /// defaults to `"client"`, which is what the C++ ROS 2 nodes use.
+    #[new]
+    #[pyo3(signature = (*, router=None, mode=None))]
+    fn new(router: Option<&str>, mode: Option<&str>) -> PyResult<Self> {
+        eventcv_core::ros2::Ros2Context::with_endpoint_and_mode(router, mode)
+            .map(|inner| Self { inner })
+            .map_err(map_ros2_error)
+    }
+
+    /// A publisher of `event_camera_msgs/msg/EventPacket` on `topic`.
+    #[pyo3(signature = (topic="/event_camera/events", *, node="eventcv_publisher", encoding="evt3", frame_id="event_camera"))]
+    fn publisher(
+        &self,
+        topic: &str,
+        node: &str,
+        encoding: &str,
+        frame_id: &str,
+    ) -> PyResult<PyRos2Publisher> {
+        let version = parse_evt_version(encoding)?;
+        let inner = self
+            .inner
+            .event_publisher(node, topic)
+            .map_err(map_ros2_error)?
+            .with_encoding(version)
+            .with_frame_id(frame_id);
+        Ok(PyRos2Publisher {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// A subscriber to `event_camera_msgs/msg/EventPacket` on `topic`.
+    #[pyo3(signature = (topic="/event_camera/events", *, node="eventcv_subscriber"))]
+    fn subscriber(&self, topic: &str, node: &str) -> PyResult<PyRos2Subscriber> {
+        self.inner
+            .event_subscriber(node, topic)
+            .map(|inner| PyRos2Subscriber {
+                inner: Mutex::new(inner),
+            })
+            .map_err(map_ros2_error)
+    }
+
+    /// A publisher of `sensor_msgs/msg/Image` on `topic` — where a representation goes.
+    #[pyo3(signature = (topic="/event_camera/image", *, node="eventcv_image_publisher", frame_id="event_camera"))]
+    fn image_publisher(
+        &self,
+        topic: &str,
+        node: &str,
+        frame_id: &str,
+    ) -> PyResult<PyRos2ImagePublisher> {
+        self.inner
+            .image_publisher(node, topic)
+            .map(|inner| PyRos2ImagePublisher {
+                inner: inner.with_frame_id(frame_id),
+            })
+            .map_err(map_ros2_error)
+    }
+}
+
+#[cfg(feature = "ros2")]
+fn parse_evt_version(name: &str) -> PyResult<eventcv_core::io::EvtVersion> {
+    match name {
+        "evt3" => Ok(eventcv_core::io::EvtVersion::Evt3),
+        "evt2" => Ok(eventcv_core::io::EvtVersion::Evt2),
+        other => Err(PyValueError::new_err(format!(
+            "encoding must be \"evt3\" or \"evt2\", got {other:?}"
+        ))),
+    }
+}
+
+/// Publishes windows of events as `event_camera_msgs/msg/EventPacket`.
+///
+/// Behind a `Mutex` because publishing advances the sequence number and a `#[pyclass]` must be
+/// `Sync`; it is a single-writer object in practice.
+#[cfg(feature = "ros2")]
+#[pyclass(name = "Ros2Publisher")]
+struct PyRos2Publisher {
+    inner: Mutex<eventcv_core::ros2::EventPublisher>,
+}
+
+#[cfg(feature = "ros2")]
+#[pymethods]
+impl PyRos2Publisher {
+    /// Publishes one window; returns its sequence number.
+    fn publish(&self, py: Python<'_>, stream: PyRef<'_, PyEventStream>) -> PyResult<u64> {
+        let inner = &stream.inner;
+        py.detach(|| self.inner.lock().expect("publisher mutex").publish(inner))
+            .map_err(map_ros2_error)
+    }
+
+    /// Replays a recording onto the topic, one `window_ms` slice at a time.
+    ///
+    /// `wall_clock=True` stamps against the current time and paces to match, which is what you
+    /// want when something downstream times itself against the header.
+    #[pyo3(signature = (path, *, window_ms=33.0, wall_clock=false))]
+    fn replay(
+        &self,
+        py: Python<'_>,
+        path: Ros2Path,
+        window_ms: f64,
+        wall_clock: bool,
+    ) -> PyResult<(u64, usize)> {
+        py.detach(|| {
+            eventcv_core::ros2::replay_file(
+                &mut self.inner.lock().expect("publisher mutex"),
+                &path,
+                window_ms,
+                wall_clock,
+            )
+        })
+        .map(|report| (report.packets, report.events))
+        .map_err(map_ros2_error)
+    }
+
+    #[getter]
+    fn published(&self) -> u64 {
+        self.inner.lock().expect("publisher mutex").published()
+    }
+}
+
+/// Receives `event_camera_msgs/msg/EventPacket` and hands back streams.
+#[cfg(feature = "ros2")]
+#[pyclass(name = "Ros2Subscriber")]
+struct PyRos2Subscriber {
+    inner: Mutex<eventcv_core::ros2::EventSubscriber>,
+}
+
+#[cfg(feature = "ros2")]
+#[pymethods]
+impl PyRos2Subscriber {
+    /// The next packet as an `EventStream`, or `None` if none arrived inside `timeout_ms`.
+    ///
+    /// A timeout is `None` rather than an exception: a subscriber on a quiet topic is doing its
+    /// job, and `while (s := sub.recv()) is not None` reads the way it should.
+    #[pyo3(signature = (*, timeout_ms=1000.0))]
+    fn recv(&self, py: Python<'_>, timeout_ms: f64) -> PyResult<Option<PyEventStream>> {
+        let timeout = Ros2Duration::from_secs_f64((timeout_ms / 1000.0).max(0.0));
+        py.detach(|| self.inner.lock().expect("subscriber mutex").recv(timeout))
+            .map(|stream| stream.map(|inner| PyEventStream { inner, repr: None }))
+            .map_err(map_ros2_error)
+    }
+
+    /// Records the topic to `path` until it goes quiet for `idle_ms`, or `max_packets` arrive.
+    /// Returns `(packets, events, dropped)`.
+    #[pyo3(signature = (path, *, idle_ms=5000.0, max_packets=None))]
+    fn record(
+        &self,
+        py: Python<'_>,
+        path: Ros2Path,
+        idle_ms: f64,
+        max_packets: Option<u64>,
+    ) -> PyResult<(u64, usize, u64)> {
+        let idle = Ros2Duration::from_secs_f64((idle_ms / 1000.0).max(0.0));
+        py.detach(|| {
+            eventcv_core::ros2::record_topic(
+                &mut self.inner.lock().expect("subscriber mutex"),
+                &path,
+                idle,
+                max_packets,
+            )
+        })
+        .map(|report| (report.packets, report.events, report.dropped))
+        .map_err(map_ros2_error)
+    }
+
+    #[getter]
+    fn received(&self) -> u64 {
+        self.inner.lock().expect("subscriber mutex").received()
+    }
+
+    /// How many packets the sequence numbers say went missing. Reported rather than hidden.
+    #[getter]
+    fn dropped(&self) -> u64 {
+        self.inner.lock().expect("subscriber mutex").dropped()
+    }
+}
+
+/// Publishes an `EventFrame` as `sensor_msgs/msg/Image`, so a representation shows up in rviz.
+#[cfg(feature = "ros2")]
+#[pyclass(name = "Ros2ImagePublisher")]
+struct PyRos2ImagePublisher {
+    inner: eventcv_core::ros2::ImagePublisher,
+}
+
+#[cfg(feature = "ros2")]
+#[pymethods]
+impl PyRos2ImagePublisher {
+    /// `stamp_ns` is the ROS time to put on the header; pass a packet's `time_base` to keep the
+    /// image aligned with the events it came from.
+    #[pyo3(signature = (frame, *, stamp_ns=0))]
+    fn publish(
+        &self,
+        py: Python<'_>,
+        frame: PyRef<'_, PyEventFrame>,
+        stamp_ns: u64,
+    ) -> PyResult<()> {
+        let inner = &frame.inner;
+        py.detach(|| self.inner.publish(inner, stamp_ns))
+            .map_err(map_ros2_error)
+    }
 }
 
 #[cfg(test)]

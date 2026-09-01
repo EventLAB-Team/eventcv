@@ -40,3 +40,6 @@ onnx = ["eventcv-core/onnx"]
 # Build the GPU compute kernels into the extension (forwards to eventcv-core). The viewer's wgpu is
 # the same dependency, so this adds shaders rather than a second graphics stack.
 gpu = ["eventcv-core/gpu"]
+# Build the ROS 2 nodes into the extension (forwards to eventcv-core, which goes over hiroz — a
+# pure-Rust Zenoh-native ROS 2 stack, so this needs no ROS installation at build time).
+ros2 = ["eventcv-core/ros2"]

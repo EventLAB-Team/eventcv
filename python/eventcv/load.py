@@ -321,6 +321,14 @@ SimulationResult = _rust.SimulationResult
 # USB camera support (the published wheels do); keep imports resilient otherwise.
 EventCamera = getattr(_rust, "EventCamera", None)
 
+# The ROS 2 nodes are built when the extension includes the `ros2` feature. They need no ROS
+# installation — the wire is Zenoh, over hiroz — but the ROS 2 side must be running
+# `rmw_zenoh_cpp`, or have a `zenoh-bridge-ros2dds` in front of a DDS one.
+Ros2Context = getattr(_rust, "Ros2Context", None)
+Ros2Publisher = getattr(_rust, "Ros2Publisher", None)
+Ros2Subscriber = getattr(_rust, "Ros2Subscriber", None)
+Ros2ImagePublisher = getattr(_rust, "Ros2ImagePublisher", None)
+
 # Sentinel for "to the end of the recording" — i64::MAX on the Rust side.
 _MAX_US = (1 << 63) - 1
 
@@ -1347,6 +1355,10 @@ __all__ = [
     "FrameSink",
     "Model",
     "Polarity",
+    "Ros2Context",
+    "Ros2ImagePublisher",
+    "Ros2Publisher",
+    "Ros2Subscriber",
     "SimulationResult",
     "StatefulModel",
     "Tracker",
