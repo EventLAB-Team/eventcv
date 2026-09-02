@@ -5578,6 +5578,20 @@ impl PyEventCamera {
     /// Times the driver's ring overflowed and dropped events before a window — the loss `n_skipped`
     /// can't prevent, because it happens upstream of eventcv. Non-zero means the camera outran the
     /// decoder or the recording; lower the event rate, or record uncompressed.
+    /// Events discarded on purpose by `latest=True`, counted exactly.
+    ///
+    /// `n_skipped` counts whole windows the consumer never saw; this counts the events inside the
+    /// ones dropped before a window was ever built. Together they are the whole of what this
+    /// library throws away deliberately — `n_overflows` is the part the driver threw away, which
+    /// only it can see.
+    #[getter]
+    fn n_skimmed_events(&self) -> PyResult<usize> {
+        match &self.state {
+            CameraState::Pumping(pump) => Ok(pump.n_skimmed_events()),
+            _ => Ok(0),
+        }
+    }
+
     #[getter]
     fn n_overflows(&self) -> usize {
         self.overflows + self.pump().map_or(0, capture::Pump::n_overflows)

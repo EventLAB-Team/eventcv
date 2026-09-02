@@ -388,6 +388,25 @@ impl Windower {
         self.advance_to(t_now);
     }
 
+    /// Throws away the window currently filling, and any aux riding with it.
+    ///
+    /// For [`Capture::skim_next`], which discards a span of events on purpose: whatever had already
+    /// accumulated into the current window covers part of that span, so delivering it would mean
+    /// handing back a window with a hole in it. A window that is missing is honest; a window that
+    /// silently under-counts is not, and nothing downstream could tell.
+    fn discard_partial(&mut self) {
+        if !self.builder.is_empty() {
+            self.builder = EventStreamBuilder::with_capacity(
+                self.width,
+                self.height,
+                TIMESTAMP_SCALE_MS,
+                self.builder.len(),
+            );
+        }
+        self.frames.clear();
+        self.imu.clear();
+    }
+
     /// Seals the current window into `pending` and starts a fresh one.
     ///
     /// The replacement is sized from the window just sealed: consecutive windows hold similar event
@@ -441,14 +460,12 @@ impl AdaptiveBias {
         // The defaults the request lands on are the sensor's own: rates scale with pixel count, and
         // the registers are a 2041-step current ladder on one sensor and plain bytes on the other.
         let (base, start) = match device.current_configuration() {
-            nd::Configuration::InivationDavis346(configuration) => (
-                BiasConfig::davis346(),
-                davis346_biases(&configuration)?,
-            ),
-            nd::Configuration::PropheseeEvk4(configuration) => (
-                BiasConfig::prophesee_evk4(),
-                evk4_biases(&configuration),
-            ),
+            nd::Configuration::InivationDavis346(configuration) => {
+                (BiasConfig::davis346(), davis346_biases(&configuration)?)
+            }
+            nd::Configuration::PropheseeEvk4(configuration) => {
+                (BiasConfig::prophesee_evk4(), evk4_biases(&configuration))
+            }
             _ => {
                 return Err(format!(
                     "adaptive_bias is not supported on the {} — it is implemented for the \
@@ -794,6 +811,52 @@ impl Capture {
         Ok(decoded)
     }
 
+    /// Decodes one queued buffer for its state alone, discarding its events. Returns how many were
+    /// discarded, or `None` when the ring was empty.
+    ///
+    /// EVT3 is a stateful stream — timestamps arrive as `TIME_HIGH`/`TIME_LOW` words and rows as
+    /// `ADDR_Y`, each applying to every event that follows — so a buffer cannot simply be dropped
+    /// without leaving the decoder misaligned for the events after it. Skimming decodes the words
+    /// and keeps that state exact, and skips only the windowing and column building, which is the
+    /// half that allocates.
+    ///
+    /// For `stream(latest=True)`, where the windows behind the freshest one are going to be thrown
+    /// away regardless: building them first is work spent on a result nobody reads, and the time it
+    /// costs is time the ring spends filling.
+    pub fn skim_next(&mut self, timeout: Duration) -> Result<Option<usize>, String> {
+        self.flag.load_error().map_err(|error| error.to_string())?;
+        let mut events = 0;
+        // Scoped like `decode_next`'s: the view borrows the device and frees its ring slot when
+        // dropped, so it has to go before the bias controller is handed the device below.
+        {
+            let Some(view) = self.device.next_with_timeout(&timeout) else {
+                return Ok(None);
+            };
+            if view.first_after_overflow {
+                self.windower.mark_overflow();
+            }
+            convert_buffer(
+                &mut self.adapter,
+                view.slice,
+                self.mask.as_deref(),
+                (self.width, self.height),
+                |_x, _y, _t, _polarity| events += 1,
+                &mut self.aux,
+            );
+        }
+        // Frames and IMU decoded over a span whose events are being discarded belong to that span,
+        // so they go with it rather than riding out on the next window as if they were part of it.
+        let _ = self.aux.take();
+        self.windower.discard_partial();
+        let current_t = self.adapter.current_t() as i64;
+        self.windower.seal_until(current_t);
+        // The events were real and were counted exactly, so the bias controller is told the truth:
+        // marking this as an undercount would have it read a deliberately discarded span as a quiet
+        // scene and open the sensor up, which is the opposite of what an overloaded pipeline needs.
+        self.tick_bias(events, false);
+        Ok(Some(events as usize))
+    }
+
     /// Takes the next window that has **already** completed, without touching the device. Returns
     /// `None` once the queue sealed by [`poll`] / [`catch_up`] is empty.
     pub fn take_pending(&mut self) -> Option<CaptureWindow> {
@@ -973,8 +1036,8 @@ fn plan_limits(device: &nd::devices::ListedDevice, limits: Limits) -> Result<Lim
 /// per period still admits one, since the register cannot express "none".
 fn rate_limiter(max_event_rate: Option<u64>) -> Option<(u16, u32)> {
     let rate = max_event_rate?;
-    let per_period = (rate * RATE_LIMIT_PERIOD_US as u64 / 1_000_000)
-        .clamp(1, RATE_LIMIT_MAX_PER_PERIOD) as u32;
+    let per_period =
+        (rate * RATE_LIMIT_PERIOD_US as u64 / 1_000_000).clamp(1, RATE_LIMIT_MAX_PER_PERIOD) as u32;
     Some((RATE_LIMIT_PERIOD_US, per_period))
 }
 
@@ -1223,7 +1286,7 @@ fn device_dimensions(device: &nd::Device) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{rate_limiter, region_masks, Window, Windower};
+    use super::{rate_limiter, region_masks, ImuSample, Window, Windower};
 
     #[test]
     fn rate_limiter_converts_events_per_second_to_a_period_budget() {
@@ -1291,6 +1354,48 @@ mod tests {
         assert!(region_masks::<20, 12>((0, 0, 0, 100), 1280, 720).is_err());
         // The same rectangle is off a 640x480 sensor, so the check is per sensor, not per model.
         assert!(region_masks::<10, 8>((0, 0, 1280, 720), 640, 480).is_err());
+    }
+
+    #[test]
+    fn a_discarded_partial_window_is_never_delivered() {
+        // What `skim_next` relies on: events accumulated into the window that is currently
+        // filling belong to the span being thrown away, so that window must go with them rather
+        // than arrive short. A missing window is honest; one that quietly under-counts is not.
+        let mut windower = Windower::new(10, 10, Window::Duration(1.0));
+        windower.push(1, 1, 0, true); // anchors the grid: boundary -> 1000
+        windower.push(2, 2, 100, true);
+        assert_eq!(windower.pending.len(), 0, "still filling");
+
+        windower.discard_partial();
+        // The grid keeps moving, but nothing half-filled comes out of it.
+        windower.seal_until(5_000);
+        assert_eq!(windower.pending.len(), 0, "no short window was delivered");
+
+        // And the next real event starts a clean window on the same grid.
+        windower.push(3, 3, 5_100, true);
+        windower.seal_until(7_000);
+        assert_eq!(windower.pending.len(), 1);
+        assert_eq!(windower.pending[0].stream.len(), 1);
+    }
+
+    #[test]
+    fn discarding_a_partial_window_drops_its_aux_too() {
+        // Frames and IMU decoded over the discarded span belong to it. Riding out on the next
+        // window would put them beside events they did not happen with.
+        let mut windower = Windower::new(10, 10, Window::Duration(1.0));
+        windower.push(1, 1, 0, true);
+        windower.push_aux(
+            vec![],
+            vec![ImuSample {
+                t_us: 100,
+                angular_velocity: [0.0; 3],
+                linear_acceleration: [0.0; 3],
+            }],
+        );
+        assert_eq!(windower.imu.len(), 1);
+
+        windower.discard_partial();
+        assert!(windower.imu.is_empty(), "aux went with the span it covered");
     }
 
     #[test]

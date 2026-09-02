@@ -545,10 +545,19 @@ def stream(
     falls behind — the thread buffers a few windows, then applies backpressure, and under *sustained*
     overload the driver's ring is what finally overflows (watch :attr:`EventCamera.n_overflows`).
     Pass ``latest=True`` to trade completeness for freshness instead: reads hand back the **newest**
-    decoded window and drop what it overtook, keeping latency at about one window no matter how slow
-    the loop is. :attr:`EventCamera.n_skipped` counts the windows passed over, and ``record=`` still
-    archives every one of them from the capture thread — so the loop sees live data while the file
-    keeps the full recording.
+    decoded window and drop what it overtook. Buffers queued behind the freshest one are *skimmed* —
+    decoded far enough to keep the sensor's stream state exact, then discarded without being built
+    into windows — which is both cheaper than building results nobody reads and, more importantly,
+    keeps the driver's ring drained. That matters because a full ring backs pressure up into the
+    sensor, where events are lost with nothing able to count them. Two counters say what went:
+    :attr:`EventCamera.n_skipped` counts whole windows passed over and
+    :attr:`EventCamera.n_skimmed_events` counts events discarded before a window was built. Both are
+    exact; :attr:`EventCamera.n_overflows` remains the part the driver dropped, which only it sees.
+
+    Skimming is off while ``record=`` is open, because the file is promised every window and a
+    skimmed buffer's events are gone before the recorder could archive them. With a recording
+    attached the loop still gets the newest window and the file still gets all of them, at the old
+    cost — asking for a complete recording is asking for complete decoding to go with it.
 
     The returned camera is a context manager and an iterator::
 
