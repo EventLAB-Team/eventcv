@@ -25,7 +25,24 @@ const TIMESTAMP_SCALE_MS: f64 = 0.001;
 const TIME_LOOP: i64 = 1 << 24;
 const MAX_TIMESTAMP_BASE: i64 = ((1 << 12) - 1) << 12;
 const LOOP_THRESHOLD: i64 = 10 << 12;
-const CHECKPOINT_BYTES: u64 = 1 << 20;
+/// Bounds on how far apart saved decoder states sit. A slice replays from the nearest one, so the
+/// interval is what a short window costs: at 1 MiB a 33 ms window of a 0.1 Mev/s recording spent
+/// ten times longer replaying words it then threw away than decoding the ones it wanted.
+const CHECKPOINT_MIN_BYTES: u64 = 1 << 16;
+const CHECKPOINT_MAX_BYTES: u64 = 1 << 22;
+/// Roughly how many checkpoints to keep, whatever the file size: enough that a slice replays
+/// little, few enough that a 30 GB recording's index stays in the tens of megabytes.
+const CHECKPOINT_TARGET: u64 = 200_000;
+
+/// The interval for a file of `bytes`, clamped to the bounds above.
+fn checkpoint_interval(bytes: u64) -> u64 {
+    (bytes / CHECKPOINT_TARGET).clamp(CHECKPOINT_MIN_BYTES, CHECKPOINT_MAX_BYTES)
+}
+/// Read granularity for the eager reader, which never looks back.
+const EAGER_CHUNK_BYTES: u64 = 1 << 20;
+/// Read granularity for the slice methods. Large enough that the per-read cost disappears against
+/// the decode, small enough that a one-window slice does not pull in a megabyte to throw away.
+const SLICE_CHUNK_BYTES: u64 = 1 << 16;
 
 /// EVT2 splits a timestamp into a 28-bit high half (its own word) and a 6-bit low half carried by
 /// each CD event, so the high half is stored pre-shifted and the wrap period is `1 << 34` µs — about
@@ -362,13 +379,13 @@ impl RawSliceSource {
         // which matters because `EventStreamBuilder::push` drops silently.
         let mut extent = (0usize, 0usize);
         let mut byte_offset = header.data_offset;
-        let mut chunk = Vec::with_capacity(CHECKPOINT_BYTES as usize);
+        let interval =
+            checkpoint_interval(reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0));
+        let mut chunk = Vec::with_capacity(interval as usize);
 
         loop {
             chunk.clear();
-            (&mut reader)
-                .take(CHECKPOINT_BYTES)
-                .read_to_end(&mut chunk)?;
+            (&mut reader).take(interval).read_to_end(&mut chunk)?;
             if chunk.is_empty() {
                 break;
             }
@@ -475,23 +492,36 @@ impl SliceSource for RawSliceSource {
         let mut reader = self.reader_at(checkpoint)?;
         let mut codec = checkpoint.codec;
         let mut index = checkpoint.event_index;
-        let mut builder = EventStreamBuilder::new(self.width, self.height, TIMESTAMP_SCALE_MS);
-        let mut bytes = [0u8; 4];
+        let (width, height) = (self.width, self.height);
+        // The event count is known exactly, so the four column vectors are sized once instead of
+        // doubling their way to a million events.
+        let mut builder =
+            EventStreamBuilder::with_capacity(width, height, TIMESTAMP_SCALE_MS, i1 - i0);
         let word_size = codec.word_size();
-        while index < i1 {
-            match reader.read_exact(&mut bytes[..word_size]) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(IoError::Io(error)),
+        // Decode out of a chunk buffer, the way the index pass does. Reading one two-byte word at
+        // a time through `read_exact` costs a call, a bounds test and a buffer-position update per
+        // word, which dominates the decode itself.
+        let mut chunk = Vec::with_capacity(SLICE_CHUNK_BYTES as usize);
+        'chunks: while index < i1 {
+            chunk.clear();
+            (&mut reader).take(SLICE_CHUNK_BYTES).read_to_end(&mut chunk)?;
+            if chunk.len() < word_size {
+                break;
             }
-            codec.decode(&bytes[..word_size], |event| {
-                if usize::from(event.x) < self.width && usize::from(event.y) < self.height {
-                    if index >= i0 && index < i1 {
-                        builder.push(event.x, event.y, event.t, event.p);
+            for bytes in chunk.chunks_exact(word_size) {
+                codec.decode(bytes, |event| {
+                    if usize::from(event.x) < width && usize::from(event.y) < height {
+                        if index >= i0 && index < i1 {
+                            // Bounds were just tested; `push` would test them again.
+                            builder.push_in_bounds(event.x, event.y, event.t, event.p);
+                        }
+                        index += 1;
                     }
-                    index += 1;
+                });
+                if index >= i1 {
+                    break 'chunks;
                 }
-            });
+            }
         }
         Ok(builder.build())
     }
@@ -500,26 +530,29 @@ impl SliceSource for RawSliceSource {
         let checkpoint = self.checkpoint_for_time(t0);
         let mut reader = self.reader_at(checkpoint)?;
         let mut codec = checkpoint.codec;
-        let mut builder = EventStreamBuilder::new(self.width, self.height, TIMESTAMP_SCALE_MS);
-        let mut bytes = [0u8; 4];
+        let (width, height) = (self.width, self.height);
+        let mut builder = EventStreamBuilder::new(width, height, TIMESTAMP_SCALE_MS);
         let word_size = codec.word_size();
-        loop {
-            match reader.read_exact(&mut bytes[..word_size]) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(IoError::Io(error)),
-            }
-            codec.decode(&bytes[..word_size], |event| {
-                if event.t >= t0
-                    && event.t < t1
-                    && usize::from(event.x) < self.width
-                    && usize::from(event.y) < self.height
-                {
-                    builder.push(event.x, event.y, event.t, event.p);
-                }
-            });
-            if codec.initialised() && codec.time() >= t1 {
+        let mut chunk = Vec::with_capacity(SLICE_CHUNK_BYTES as usize);
+        'chunks: loop {
+            chunk.clear();
+            (&mut reader).take(SLICE_CHUNK_BYTES).read_to_end(&mut chunk)?;
+            if chunk.len() < word_size {
                 break;
+            }
+            for bytes in chunk.chunks_exact(word_size) {
+                codec.decode(bytes, |event| {
+                    if event.t >= t0
+                        && event.t < t1
+                        && usize::from(event.x) < width
+                        && usize::from(event.y) < height
+                    {
+                        builder.push_in_bounds(event.x, event.y, event.t, event.p);
+                    }
+                });
+                if codec.initialised() && codec.time() >= t1 {
+                    break 'chunks;
+                }
             }
         }
         Ok(builder.build())
@@ -535,10 +568,63 @@ pub fn open_raw_slice(
 }
 
 /// Eagerly reads a Prophesee EVT3 RAW file. Prefer [`open_raw_slice`] for large recordings.
+///
+/// With a declared geometry --- which every recorder that writes a `% geometry` line gives us ---
+/// nothing in the result depends on the checkpoint index, so the file is decoded once, straight
+/// into the stream. Only a header without a geometry needs the index pass first: the sensor size
+/// is then derived from the events, and that cannot be known until they have all been seen.
 pub fn read_raw(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
-    let source = open_raw_slice(path, options)?;
-    let limit = options.max_events.unwrap_or(source.n_events());
-    source.slice_index(0, limit)
+    let path = path.as_ref();
+    let mut reader = BufReader::new(File::open(path)?);
+    let header = parse_header(&mut reader, options.sensor_size)?;
+    let Some((width, height)) = header.sensor_size else {
+        let source = open_raw_slice(path, options)?;
+        let limit = options.max_events.unwrap_or(source.n_events());
+        return source.slice_index(0, limit);
+    };
+
+    let limit = options.max_events.unwrap_or(usize::MAX);
+    let mut codec = Codec::new(header.encoding);
+    let word_size = codec.word_size();
+    let mut builder = EventStreamBuilder::new(width, height, TIMESTAMP_SCALE_MS);
+    let mut count = 0usize;
+    let total_bytes = reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
+    let mut bytes_read = 0u64;
+    let mut reserved = false;
+    let mut chunk = Vec::with_capacity(EAGER_CHUNK_BYTES as usize);
+    'chunks: loop {
+        chunk.clear();
+        (&mut reader).take(EAGER_CHUNK_BYTES).read_to_end(&mut chunk)?;
+        if chunk.len() < word_size {
+            break;
+        }
+        bytes_read += chunk.len() as u64;
+        for bytes in chunk.chunks_exact(word_size) {
+            codec.decode(bytes, |event| {
+                if count < limit
+                    && usize::from(event.x) < width
+                    && usize::from(event.y) < height
+                {
+                    builder.push_in_bounds(event.x, event.y, event.t, event.p);
+                    count += 1;
+                }
+            });
+            if count >= limit {
+                break 'chunks;
+            }
+        }
+        // One reservation, sized from the density the first chunk showed, rather than twenty
+        // doublings of a column that ends up holding millions of events. A vectorised EVT3 stream
+        // emits anywhere from a fraction of an event per word to twelve of them, so the file size
+        // alone gives no useful bound; its own first megabyte does.
+        if !reserved && total_bytes > bytes_read {
+            let projected =
+                (count as u128 * u128::from(total_bytes) / u128::from(bytes_read)) as usize;
+            builder.reserve(projected.saturating_sub(count).min(limit));
+            reserved = true;
+        }
+    }
+    Ok(builder.build())
 }
 
 /// Which of the two `.raw` encodings [`RawEventSink`] writes.
@@ -822,7 +908,7 @@ mod tests {
     #[test]
     fn slices_from_a_sparse_checkpoint() {
         let mut words = vec![word(0x8, 0), word(0x6, 10), word(0x0, 4)];
-        while words.len() < (CHECKPOINT_BYTES as usize / 2) - 1 {
+        while words.len() < (CHECKPOINT_MIN_BYTES as usize / 2) - 1 {
             words.push(word(0x9, 0));
         }
         words.push(word(0x2, 7));
