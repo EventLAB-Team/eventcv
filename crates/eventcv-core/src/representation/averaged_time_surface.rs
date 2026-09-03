@@ -65,13 +65,26 @@ impl Representation for AveragedTimeSurface {
             // Split rather than testing `track_touched` per event: the dense loop is then exactly
             // the accumulation this has always done, with nothing added to a path that runs once
             // per event over a whole recording.
-            let cell = |event: crate::Event| -> Result<(usize, f64), RepresentationError> {
+            // The response depends on the timestamp alone, and a window holds far fewer
+            // distinct timestamps than events: a sensor emits many events at one tick --- an
+            // EVT3 vector word alone carries up to twelve --- so on a real recording this is
+            // tens of events per timestamp. Remembering the last one turns `exp`, the most
+            // expensive thing in the loop, from once per event into once per tick. Exact by
+            // construction: the same input returns the same value, so nothing is approximated.
+            let mut last: Option<(u64, f64)> = None;
+            let mut cell = |event: crate::Event| -> Result<(usize, f64), RepresentationError> {
                 let index =
                     event_index(event, width, height)? + if event.polarity { 0 } else { plane_len };
-                Ok((
-                    index,
-                    (-age_ms(stream, reference, event.timestamp) / self.tau_ms).exp(),
-                ))
+                let response = match last {
+                    Some((timestamp, response)) if timestamp == event.timestamp => response,
+                    _ => {
+                        let response =
+                            (-age_ms(stream, reference, event.timestamp) / self.tau_ms).exp();
+                        last = Some((event.timestamp, response));
+                        response
+                    }
+                };
+                Ok((index, response))
             };
             if track_touched {
                 for event in stream.iter() {
