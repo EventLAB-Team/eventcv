@@ -29,7 +29,7 @@ pub use h5::{
 };
 pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream, NpzEventSink};
 pub use prophesee::{read_dat, DatEventSink};
-pub use prophesee_raw::{open_raw_slice, read_raw, EvtVersion, RawEventSink};
+pub use prophesee_raw::{decode_words, open_raw_slice, read_raw, EvtVersion, RawEventSink};
 pub use text::{
     load_rows, open_text_slice, read_text, write_text_stream, ColumnOrder, RawRow, TextEventSink,
     TextOptions, TextReader, TimeUnit,

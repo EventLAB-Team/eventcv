@@ -48,6 +48,9 @@ pub mod mask;
 #[cfg(feature = "onnx")]
 pub mod model;
 pub mod net;
+#[cfg(feature = "ros2")]
+pub mod ros2;
+
 pub mod representation;
 pub mod simulate;
 pub mod track;

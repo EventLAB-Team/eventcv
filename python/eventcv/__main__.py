@@ -227,6 +227,67 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
     return 0
 
 
+_NO_ROS2 = (
+    "eventcv was built without ROS 2 support. Install a build with the `ros2` feature. It needs "
+    "no ROS installation of its own — the wire is Zenoh — but the ROS 2 side must be running "
+    "rmw_zenoh_cpp, or have a zenoh-bridge-ros2dds in front of a DDS one."
+)
+
+
+def _ros2_context(args: argparse.Namespace):
+    from . import Ros2Context
+
+    if Ros2Context is None:
+        raise OSError(_NO_ROS2)
+    return Ros2Context(router=args.router or None, mode=args.mode or None)
+
+
+def _cmd_ros2_publish(args: argparse.Namespace) -> int:
+    """Replay a recording onto a ROS 2 topic."""
+    import time
+
+    context = _ros2_context(args)
+    publisher = context.publisher(args.topic, encoding=args.encoding, frame_id=args.frame_id)
+    # Discovery is not instantaneous, and packets published before anyone has matched are simply
+    # gone — a silent empty run is a worse default than a short wait.
+    time.sleep(args.settle)
+    packets, events = publisher.replay(
+        args.input, window_ms=args.window_ms, wall_clock=not args.as_fast_as_possible
+    )
+    if not args.quiet:
+        print(f"published {packets} packets, {events} events on {args.topic}")
+    return 0
+
+
+def _cmd_ros2_record(args: argparse.Namespace) -> int:
+    """Record a ROS 2 topic to a file."""
+    context = _ros2_context(args)
+    subscriber = context.subscriber(args.topic)
+    packets, events, dropped = subscriber.record(
+        args.output, idle_ms=args.idle * 1000.0, max_packets=args.max_packets
+    )
+    if not args.quiet:
+        note = f", {dropped} dropped" if dropped else ""
+        print(f"recorded {packets} packets, {events} events{note} -> {args.output}")
+    return 0
+
+
+def _cmd_ros2_represent(args: argparse.Namespace) -> int:
+    """Subscribe to a topic, build a representation, publish it as sensor_msgs/Image."""
+    context = _ros2_context(args)
+    subscriber = context.subscriber(args.topic)
+    images = context.image_publisher(args.image_topic)
+    made = 0
+    while (stream := subscriber.recv(timeout_ms=args.idle * 1000.0)) is not None:
+        images.publish(stream.view(args.repr, bins=args.bins) if args.repr == "voxel"
+                       else stream.view(args.repr))
+        made += 1
+    if not args.quiet:
+        note = f", {subscriber.dropped} dropped" if subscriber.dropped else ""
+        print(f"published {made} images on {args.image_topic}{note}")
+    return 0
+
+
 def _cmd_reconstruct(args: argparse.Namespace) -> int:
     """Run a reconstruction model over a recording to recover an intensity video."""
     from . import Model, open as open_reader, reconstruct
@@ -445,6 +506,63 @@ def build_parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("-q", "--quiet", action="store_true",
                              help="suppress the summary line")
     reconstruct.set_defaults(func=_cmd_reconstruct)
+
+    def _add_ros2_options(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--router", default="", metavar="ENDPOINT",
+                         help="Zenoh router (default: the local rmw_zenohd)")
+        sub.add_argument("--mode", default="", choices=["", "client", "peer", "router"],
+                         help="Zenoh session mode (default: client, as rmw_zenoh_cpp uses)")
+        sub.add_argument("-q", "--quiet", action="store_true",
+                         help="suppress the summary line")
+
+    ros2_publish = subparsers.add_parser(
+        "ros2-publish", help="replay a recording onto a ROS 2 topic"
+    )
+    ros2_publish.add_argument("input", help="source recording")
+    ros2_publish.add_argument("--topic", default="/event_camera/events",
+                              help="topic (default: /event_camera/events)")
+    ros2_publish.add_argument("--window-ms", type=float, default=33.0, metavar="MS",
+                              help="events per packet, in milliseconds (default: 33)")
+    ros2_publish.add_argument("--encoding", default="evt3", choices=["evt3", "evt2"],
+                              help="how the events are packed into the message (default: evt3)")
+    ros2_publish.add_argument("--frame-id", default="event_camera",
+                              help="frame_id on every header (default: event_camera)")
+    ros2_publish.add_argument("--settle", type=float, default=2.0, metavar="S",
+                              help="wait this long for discovery before publishing (default: 2)")
+    ros2_publish.add_argument("--as-fast-as-possible", action="store_true",
+                              help="do not pace to the recording's own clock")
+    _add_ros2_options(ros2_publish)
+    ros2_publish.set_defaults(func=_cmd_ros2_publish)
+
+    ros2_record = subparsers.add_parser(
+        "ros2-record", help="record a ROS 2 topic to a file"
+    )
+    ros2_record.add_argument("output", help="destination; the extension picks the format")
+    ros2_record.add_argument("--topic", default="/event_camera/events",
+                             help="topic (default: /event_camera/events)")
+    ros2_record.add_argument("--idle", type=float, default=5.0, metavar="S",
+                             help="stop after this long with nothing on the topic (default: 5)")
+    ros2_record.add_argument("--max-packets", type=int, default=None, metavar="N",
+                             help="stop after N packets")
+    _add_ros2_options(ros2_record)
+    ros2_record.set_defaults(func=_cmd_ros2_record)
+
+    ros2_represent = subparsers.add_parser(
+        "ros2-represent",
+        help="subscribe to a topic and republish a representation as sensor_msgs/Image",
+    )
+    ros2_represent.add_argument("--topic", default="/event_camera/events",
+                                help="topic to subscribe to (default: /event_camera/events)")
+    ros2_represent.add_argument("--image-topic", default="/event_camera/image",
+                                help="topic to publish on (default: /event_camera/image)")
+    ros2_represent.add_argument("--repr", default="voxel",
+                                help="representation to build (default: voxel)")
+    ros2_represent.add_argument("--bins", type=int, default=3,
+                                help="bins, for the voxel representation (default: 3)")
+    ros2_represent.add_argument("--idle", type=float, default=5.0, metavar="S",
+                                help="stop after this long with nothing on the topic (default: 5)")
+    _add_ros2_options(ros2_represent)
+    ros2_represent.set_defaults(func=_cmd_ros2_represent)
 
     return parser
 

@@ -559,6 +559,40 @@ impl SliceSource for RawSliceSource {
     }
 }
 
+/// Decodes encoded words with no file and no header around them.
+///
+/// The read side of [`RawEventSink::to_writer`] with `header = false`: a transport that states
+/// the geometry itself (ROS 2's `event_camera_msgs/msg/EventPacket` carries `width`, `height`
+/// and `encoding` in its own fields) sends the encoded words alone, so there is no `% geometry`
+/// line to parse and no file to seek in.
+pub fn decode_words(
+    bytes: &[u8],
+    version: EvtVersion,
+    width: usize,
+    height: usize,
+) -> Result<EventStream, IoError> {
+    if width == 0 || height == 0 {
+        return Err(IoError::InvalidSensorSize);
+    }
+    let mut codec = Codec::new(match version {
+        EvtVersion::Evt2 => Encoding::Evt2,
+        EvtVersion::Evt3 => Encoding::Evt3,
+    });
+    let word_size = codec.word_size();
+    // At most one event per word for EVT2, and vectorised EVT3 words emit more, so this is a
+    // starting point rather than a bound.
+    let mut builder =
+        EventStreamBuilder::with_capacity(width, height, TIMESTAMP_SCALE_MS, bytes.len() / word_size);
+    for word in bytes.chunks_exact(word_size) {
+        codec.decode(word, |event| {
+            if usize::from(event.x) < width && usize::from(event.y) < height {
+                builder.push_in_bounds(event.x, event.y, event.t, event.p);
+            }
+        });
+    }
+    Ok(builder.build())
+}
+
 /// Opens a Prophesee EVT3 RAW file for bounded-memory random slicing.
 pub fn open_raw_slice(
     path: impl AsRef<Path>,
@@ -649,8 +683,8 @@ pub enum EvtVersion {
 /// coarse half that is emitted only when it changes, so a backwards step would be encoded as a
 /// counter wrap and silently move the event forwards by hours. Out-of-order input is rejected
 /// rather than mis-encoded.
-pub struct RawEventSink {
-    writer: BufWriter<File>,
+pub struct RawEventSink<W: Write = BufWriter<File>> {
+    writer: W,
     version: EvtVersion,
     header_written: bool,
     n_events: usize,
@@ -668,7 +702,7 @@ struct EncoderState {
     y: Option<u16>,
 }
 
-impl RawEventSink {
+impl RawEventSink<BufWriter<File>> {
     pub fn create(path: impl AsRef<Path>, version: EvtVersion) -> Result<Self, IoError> {
         Ok(Self {
             writer: BufWriter::new(File::create(path).map_err(IoError::Io)?),
@@ -678,6 +712,32 @@ impl RawEventSink {
             last_t: None,
             state: EncoderState::default(),
         })
+    }
+
+}
+
+impl<W: Write> RawEventSink<W> {
+    /// Encodes into any writer rather than a file.
+    ///
+    /// The header carries `% geometry`, which a transport that already states the sensor size
+    /// out of band does not want repeated in the payload: ROS 2's
+    /// `event_camera_msgs/msg/EventPacket` puts width and height in its own fields and expects
+    /// `events` to be the encoded words alone. Pass `header = false` for that case.
+    pub fn to_writer(writer: W, version: EvtVersion, header: bool) -> Self {
+        Self {
+            writer,
+            version,
+            header_written: !header,
+            n_events: 0,
+            last_t: None,
+            state: EncoderState::default(),
+        }
+    }
+
+    /// The writer back, with everything appended so far in it.
+    pub fn into_inner(mut self) -> Result<W, IoError> {
+        self.writer.flush().map_err(IoError::Io)?;
+        Ok(self.writer)
     }
 
     fn word16(&mut self, kind: u16, payload: u16) -> Result<(), IoError> {
@@ -784,7 +844,7 @@ impl RawEventSink {
     }
 }
 
-impl super::EventSink for RawEventSink {
+impl<W: Write + Send> super::EventSink for RawEventSink<W> {
     fn append(&mut self, stream: &EventStream) -> Result<(), IoError> {
         if stream.is_empty() {
             return Ok(());

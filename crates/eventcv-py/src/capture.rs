@@ -64,6 +64,10 @@ struct Shared {
     recorded: AtomicUsize,
     /// Windows that arrived first-after-overflow — i.e. the driver dropped events before them.
     overflows: AtomicUsize,
+    /// Events discarded on purpose in [`Backpressure::Latest`] mode, decoded but never built into a
+    /// window. Counted exactly, because a drop policy nobody can quantify is a bias on everything
+    /// downstream of it.
+    skimmed: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -85,11 +89,7 @@ pub(crate) struct Pump {
 
 impl Pump {
     /// Spawns the pump thread and starts decoding immediately.
-    pub(crate) fn start(
-        capture: Capture,
-        recorder: Option<Recorder>,
-        mode: Backpressure,
-    ) -> Self {
+    pub(crate) fn start(capture: Capture, recorder: Option<Recorder>, mode: Backpressure) -> Self {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),
             signal: Condvar::new(),
@@ -98,6 +98,7 @@ impl Pump {
             bias: Mutex::new(capture.bias_state()),
             recorded: AtomicUsize::new(recorder.as_ref().map_or(0, Recorder::n_events)),
             overflows: AtomicUsize::new(0),
+            skimmed: AtomicUsize::new(0),
         });
         let worker = Arc::clone(&shared);
         // The camera and the open recording are owned *outside* the unwind boundary so a panic in
@@ -162,6 +163,10 @@ impl Pump {
         self.shared.queue.lock().unwrap().skipped
     }
 
+    pub(crate) fn n_skimmed_events(&self) -> usize {
+        self.shared.skimmed.load(Ordering::Relaxed)
+    }
+
     /// Stops the thread and hands back the camera (and the open recording, if any). A panic inside
     /// the decode loop is caught and republished as an error, so both still come back; `None` means
     /// the thread died in a way even that could not recover from.
@@ -205,9 +210,34 @@ fn run(
     mode: Backpressure,
 ) {
     'pump: while !shared.stop.load(Ordering::Acquire) {
+        // In `Latest` mode the consumer has said it only wants the newest window, so anything
+        // queued behind the freshest buffer is going to be discarded by `offer` anyway. Skimming
+        // those buffers — decoding their words for the stream state, discarding their events —
+        // reaches the same answer without building the columns first, and it keeps the driver's
+        // ring drained. That second part is the one that matters: a full ring back-pressures into
+        // the sensor, where events are lost with nothing to count them, so the cheapest drop is
+        // also the only one that stays visible.
+        // Not while a recording is open. `record=` promises the file gets every window even in
+        // `Latest` mode --- that is the whole point of archiving on this thread rather than the
+        // consumer's --- and a skimmed buffer's events are gone before the recorder could see
+        // them. Someone who asked for a complete recording asked for complete decoding with it.
+        if matches!(mode, Backpressure::Latest) && recorder.is_none() {
+            while capture.backlog() > 1 {
+                match capture.skim_next(Duration::ZERO) {
+                    Ok(Some(events)) => {
+                        shared.skimmed.fetch_add(events, Ordering::Relaxed);
+                    }
+                    Ok(None) => break,
+                    Err(message) => {
+                        fail(shared, message);
+                        break 'pump;
+                    }
+                }
+            }
+        }
         // One buffer per pass, its windows handed on before the next: `offer` is what throttles
-        // decoding when the consumer stalls, so the backlog waits in the driver's ring rather than
-        // ballooning into decoded columns here.
+        // decoding when the consumer stalls, so in `Buffer` mode the backlog waits in the driver's
+        // ring rather than ballooning into decoded columns here.
         let decoded = match capture.decode_next(DECODE_TIMEOUT) {
             Ok(decoded) => decoded,
             Err(message) => {
