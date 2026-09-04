@@ -33,7 +33,7 @@ const HISTORY_LIMIT: usize = 2_048;
 const ACTIVE_POLL: Duration = Duration::from_millis(4);
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Options {
     pub(crate) dt_ms: f64,
     pub(crate) refresh_hz: f64,
@@ -339,7 +339,7 @@ impl Pipeline {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ViewConfig {
     repr: Option<ReprSpec>,
     colormap: Colormap,
@@ -449,7 +449,7 @@ impl WorkerSource {
         self.last_start_us = None;
         self.last_end_us = None;
         self.last_dt_us = dt_us;
-        self.view = Some(match self.view_config.repr {
+        self.view = Some(match self.view_config.repr.clone() {
             None => RenderView::Raw(RawSurface::new(
                 self.metadata.width,
                 self.metadata.height,
@@ -862,7 +862,7 @@ impl Model {
         Self {
             commands,
             results,
-            view: options.into(),
+            view: options.clone().into(),
             metadata: None,
             processors: Vec::new(),
             history: VecDeque::new(),
@@ -900,7 +900,7 @@ impl Model {
         let _ = self.commands.send(Command::SetSource {
             generation,
             source,
-            view: self.view,
+            view: self.view.clone(),
         });
     }
 
@@ -922,7 +922,7 @@ impl Model {
             name,
             width,
             height,
-            view: self.view,
+            view: self.view.clone(),
         });
     }
 
@@ -936,7 +936,7 @@ impl Model {
         let _ = self.commands.send(Command::Open {
             generation,
             path,
-            view: self.view,
+            view: self.view.clone(),
         });
     }
 

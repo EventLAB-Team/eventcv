@@ -272,6 +272,29 @@ class LoadTests(unittest.TestCase):
 
         np.testing.assert_array_equal(stream.countmask().numpy(), expected)
 
+    def test_mcts_accepts_explicit_windows(self):
+        stream = eventcv.load(str(EXAMPLE_PATH))
+
+        frame = stream.mcts(windows_ms=[1, 5, 20])
+
+        self.assertEqual((frame.kind, frame.shape), ("mcts", (6, 480, 640)))
+        self.assertEqual(
+            frame.channel_names,
+            (
+                "negative_1.000ms",
+                "negative_5.000ms",
+                "negative_20.000ms",
+                "positive_1.000ms",
+                "positive_5.000ms",
+                "positive_20.000ms",
+            ),
+        )
+        self.assertEqual(frame.numpy().dtype, np.float32)
+        # An int list and a float list are the same request.
+        np.testing.assert_array_equal(
+            stream.mcts(windows_ms=[1.0, 5.0, 20.0]).numpy(), frame.numpy()
+        )
+
     def test_validates_representation_parameters(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
@@ -282,6 +305,10 @@ class LoadTests(unittest.TestCase):
             lambda: stream.atsurf(tau_ms=0),
             lambda: stream.tencode(window_ms=float("inf")),
             lambda: stream.mcts(max_window_ms=0.5),
+            lambda: stream.mcts(windows_ms=[]),
+            lambda: stream.mcts(windows_ms=[0]),
+            lambda: stream.mcts(windows_ms=[-1.0]),
+            lambda: stream.mcts(windows_ms=[5], max_window_ms=30),
             lambda: stream.countmask(pct=100.5),
             lambda: stream.countmask(pct=-1),
         ):

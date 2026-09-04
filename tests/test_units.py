@@ -134,6 +134,13 @@ class StreamOpUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.stream.tsurf(tau_ms=10, tau_us=10_000)
 
+    def test_mcts_windows_take_any_unit(self):
+        by_ms = self.stream.mcts(windows_ms=[1, 5]).numpy()
+        np.testing.assert_array_equal(self.stream.mcts(windows_us=[1_000, 5_000]).numpy(), by_ms)
+        np.testing.assert_array_equal(self.stream.mcts(windows_s=[0.001, 0.005]).numpy(), by_ms)
+        with self.assertRaises(ValueError):
+            self.stream.mcts(windows_ms=[1, 5], windows_us=[1_000, 5_000])
+
 
 class TimeUnitNameTests(unittest.TestCase):
     def test_load_accepts_the_unit_synonyms(self):

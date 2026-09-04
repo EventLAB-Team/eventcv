@@ -170,8 +170,8 @@ fn time_surface_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
 
 fn mcts_cloud(frame: &EventFrame) -> Result<Vec<CloudPoint>, String> {
     let (channels, height, width) = frame.shape();
-    if channels != 10 {
-        return Err("mcts frame must have ten channels".to_owned());
+    if channels < 2 || channels % 2 != 0 {
+        return Err("mcts frame must have an even number of channels".to_owned());
     }
     let values = float_data(frame)?;
     let plane_len = checked_plane_len(width, height)?;

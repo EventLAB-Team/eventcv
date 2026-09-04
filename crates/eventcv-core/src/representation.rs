@@ -345,6 +345,8 @@ impl fmt::Display for RepresentationError {
                 "max_window_ms" => {
                     formatter.write_str("max_window_ms must be finite and at least 1")
                 }
+                "windows" => formatter
+                    .write_str("windows must be a non-empty list of finite, positive spans (ms)"),
                 "pct" => formatter.write_str("pct must be between 0 and 100"),
                 _ => write!(formatter, "{name} must be finite and positive"),
             },

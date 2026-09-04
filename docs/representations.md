@@ -29,7 +29,7 @@ all three forms; each is flagged in its section below.
 | `atsurf`   | {func}`~eventcv.atsurf`  | 2  | `float32`          | Averaged time surface: mean of `exp(-age/tau_ms)` over *all* events per pixel/polarity. |
 | `tencode`  | {func}`~eventcv.tencode` | 3  | `uint8`            | Latest polarity + normalized age within `window_ms`, as an RGB-like image. |
 | `countmask`| {func}`~eventcv.countmask` | 3 | `uint8`           | Positive/negative event counts in red/blue, jointly normalized by a percentile of the non-zero counts, plus a binary activity mask in green. Timestamps unused. |
-| `mcts`     | {func}`~eventcv.mcts`    | 10 | `float32`          | Multi-channel time surface: 5 log-spaced windows up to `max_window_ms`, per polarity. |
+| `mcts`     | {func}`~eventcv.mcts`    | `2·N` (10) | `float32`  | Multi-channel time surface: 5 log-spaced windows up to `max_window_ms` (or the `N` windows in `windows_ms`), per polarity. |
 | `flow`     | {func}`~eventcv.optical_flow` | 2 | `float32`     | Dense Lucas-Kanade optical flow `(flow_x, flow_y)` on the time surface, pixels/ms. |
 | `pset`     | {func}`~eventcv.pset`    | — (`[N, 4]`) | `float32`    | Sparse, normalized `(x, y, t, p)` point array — not a dense frame. |
 | `labels`   | {meth}`~eventcv.EventFrame.connected_components` | 1 | `uint64`   | Connected-component labels of an existing frame (post-processing, not stream-level). |
@@ -37,6 +37,13 @@ all three forms; each is flagged in its section below.
 Two rows are special cases rather than string-selectable representations: `pset` returns a
 sparse point array (not a dense frame), and `labels` is computed from an existing frame — so
 neither is a valid `repr=` / `flatten` / `view` name. See their sections below.
+
+The time-span parameters (`window_ms`, `tau_ms`, `max_window_ms`) default to `30.0` on a plain
+stream, but **an unset span follows the window the events came from**: on a live capture it
+defaults to `stream(dt_ms=…)`, and on a file it defaults to the slice duration — `open(path,
+dt_ms=50).slice(0).mcts()` covers the full 50 ms rather than clipping to 30. An explicit span
+always wins. Count-based windows (`max_events`) have no fixed duration, so the 30 ms default
+stands there.
 
 The dtype column lists `uint64`/`uint8` for the two representations with a `normalize` option
 (`count` and `polarity`): raw `uint64` counts, or `uint8` rescaled so the busiest pixel maps to
@@ -176,14 +183,22 @@ frames expect the black-background default.
 ```python
 stream.mcts(max_window_ms=30.0)
 ecv.mcts(stream, max_window_ms=16.0)
+stream.mcts(windows_ms=[1, 5, 20])   # explicit windows: 6 channels
 ```
 
-- `max_window_ms` (`float`, default `30.0`) — largest window; must be at least `1.0`.
+- `max_window_ms` (`float`, default: the slice/capture window, else `30.0`) — largest of the
+  5 log-spaced windows; must be at least `1.0`.
+- `windows_ms` (`list[float]`) — explicit windows instead of the log-spaced ladder: `N`
+  finite, positive spans, used in the order given, producing `2·N` channels. Mutually
+  exclusive with `max_window_ms` (passing both is a `ValueError`); duplicates are allowed
+  (and yield duplicate channel names). Takes the usual unit siblings
+  (`windows_s`/`windows_us`/`windows_ns`).
 
-Ten channels, `float32`: 5 log-spaced windows (from `1 ms` up to `max_window_ms`) for each of
-`negative`/`positive` (channel names like `negative_1.000ms` … `positive_30.000ms`). Each
-channel holds `max(1 - age/window)` over events within that window — a multi-timescale
-generalization of `tsurf`.
+`2·N` channels, `float32` (ten by default): one channel per window for each of
+`negative`/`positive` (channel names carry the window, like `negative_1.000ms` …
+`positive_30.000ms`). By default the windows are 5 log-spaced spans from `1 ms` up to
+`max_window_ms`. Each channel holds `max(1 - age/window)` over events within that window — a
+multi-timescale generalization of `tsurf`.
 
 ## Optical flow
 
@@ -239,7 +254,7 @@ and `reader.with_repr(...)`. The name is one of `"polarity"`, `"binary"`, `"coun
 
 `flatten`, `view`, and `open(repr=...)` render the representation with its **default**
 parameters — they don't accept a representation's own parameters (`bins`, `tau_ms`, `window_ms`,
-`max_window_ms`, `window`, `pct`, `white_frame`), so `stream.flatten("voxel", bins=5)` is a
+`max_window_ms`, `windows_ms`, `window`, `pct`, `white_frame`), so `stream.flatten("voxel", bins=5)` is a
 `TypeError`. The one
 exception is `normalize`, which is an argument of `flatten`/`view` themselves, so
 `stream.flatten("count", normalize=True)` does work (and each representation keeps its own
@@ -250,13 +265,14 @@ new dataset reader:
 ```python
 # defaults, by name:
 stream.flatten("voxel")                                  # == stream.voxel()  (bins=9)
-reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")    # mcts, default max_window_ms=30
+reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")    # mcts, max_window_ms follows dt (30)
 
 # parameters by name — only with_repr forwards them:
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("voxel", bins=5)
 array = reader[0]                                        # [5, H, W] voxel for frame 0
 frame = reader.slice(7)                                  # EventFrame — voxel(bins=5) applied
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("countmask", pct=95.0)
+reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("mcts", windows_ms=[1, 5, 20])
 
 # a repr-less reader yields a stream; name the representation on the slice:
 frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")   # → EventFrame

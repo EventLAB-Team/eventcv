@@ -266,6 +266,15 @@ def open(
     ``slice(i)`` returns the raw :class:`EventStream`, so name the representation on the stream:
     ``data.slice(1000).view("flow")`` (or ``.slice(1000).optical_flow().view()``).
 
+    **Time spans follow the slice window.** An unset ``window_ms`` / ``tau_ms`` /
+    ``max_window_ms`` — on ``repr=``, on ``with_repr``, or on a representation built from a
+    slice (``reader.slice(0).mcts()``) — defaults to the duration of the window the events came
+    from, so the representation covers exactly the events it was handed:
+    ``open(path, dt_ms=50, repr="mcts")`` encodes the full 50 ms instead of the 30 ms default
+    (which would silently discard the oldest 20 ms of every slice). ``slice(t0, t1)`` and
+    ``windows(span_ms=…)`` follow their own durations the same way. Set a span explicitly to
+    override; in ``max_events`` mode there is no fixed duration, so the 30 ms defaults stand.
+
     Example::
 
         r = eventcv.open("rec.hdf5", dt_ms=30)   # resolution + time unit auto-detected

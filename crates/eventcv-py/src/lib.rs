@@ -39,7 +39,8 @@ use pyo3::types::{PyAny, PyBool, PyDict, PyTuple};
 use pyo3::types::PyList;
 
 /// Default time span for the representations that have one (`window_ms`, `tau_ms`,
-/// `max_window_ms`) when none of its unit forms is given.
+/// `max_window_ms`) when none of its unit forms is given and no slice/capture window applies
+/// (an unset span on a windowed stream follows the window — see `PyEventStream::span_ms`).
 const DEFAULT_SPAN_MS: f64 = 30.0;
 
 /// The optional features compiled into this extension, in a fixed order so the string is stable.
@@ -168,6 +169,11 @@ struct PyEventStream {
     /// `flatten()` render when no explicit representation is passed. `None` for raw streams
     /// (e.g. from `load`), which fall back to the polarity image.
     repr: Option<ReprSpec>,
+    /// The duration (ms) of the time window this stream was fetched as (`open(dt_ms=…)` slices,
+    /// `slice(t0, t1)`, `windows(span_ms=…)`), or `None` for whole loads and count-based slices.
+    /// Unset representation spans (`window_ms`/`tau_ms`/`max_window_ms`) default to it, mirroring
+    /// the live-camera rule; an explicit argument always wins.
+    span_ms: Option<f64>,
 }
 
 #[pymethods]
@@ -200,7 +206,7 @@ impl PyEventStream {
     /// `view()`/`flatten()` render), or `None` for a raw stream.
     #[getter]
     fn repr(&self) -> Option<&'static str> {
-        self.repr.map(ReprSpec::name)
+        self.repr.as_ref().map(ReprSpec::name)
     }
 
     fn numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u64>> {
@@ -666,6 +672,7 @@ impl PyEventStream {
         let bins =
             usize::try_from(bins).map_err(|_| PyValueError::new_err("bins must be at least 1"))?;
         let window_ms = resolve_ms("window", window_s, window_ms, window_us, window_ns)?
+            .or(self.span_ms)
             .unwrap_or(DEFAULT_SPAN_MS);
         let device = resolve_device(device)?;
         py.detach(|| VoxelGrid::new(bins, window_ms).generate_on(&self.inner, device))
@@ -683,7 +690,9 @@ impl PyEventStream {
         tau_ns: Option<f64>,
         device: Option<&str>,
     ) -> PyResult<PyEventFrame> {
-        let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS);
+        let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?
+            .or(self.span_ms)
+            .unwrap_or(DEFAULT_SPAN_MS);
         let device = resolve_device(device)?;
         py.detach(|| TimeSurface::new(tau_ms).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
@@ -702,7 +711,9 @@ impl PyEventStream {
         tau_ns: Option<f64>,
         device: Option<&str>,
     ) -> PyResult<PyEventFrame> {
-        let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.unwrap_or(DEFAULT_SPAN_MS);
+        let tau_ms = resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?
+            .or(self.span_ms)
+            .unwrap_or(DEFAULT_SPAN_MS);
         let device = resolve_device(device)?;
         py.detach(|| AveragedTimeSurface::new(tau_ms).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
@@ -740,6 +751,7 @@ impl PyEventStream {
         window_ns: Option<f64>,
     ) -> PyResult<PyEventFrame> {
         let window_ms = resolve_ms("window", window_s, window_ms, window_us, window_ns)?
+            .or(self.span_ms)
             .unwrap_or(DEFAULT_SPAN_MS);
         py.detach(|| Tencode::new(window_ms).generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
@@ -766,7 +778,12 @@ impl PyEventStream {
             .map_err(map_representation_error)
     }
 
-    #[pyo3(signature = (*, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None))]
+    /// Multi-channel time surface (SuperEvent) — per polarity, one linear-decay channel per time
+    /// window, float32. The windows are 5 log-spaced spans from 1 ms up to `max_window_ms`
+    /// (default: the slice window, else 30 ms), or exactly the spans in `windows_ms=[…]`
+    /// (2N channels, used in the order given); pass one form, not both.
+    #[pyo3(signature = (*, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None, windows_ms=None, windows_s=None, windows_us=None, windows_ns=None))]
+    #[allow(clippy::too_many_arguments)]
     fn mcts(
         &self,
         py: Python<'_>,
@@ -774,6 +791,10 @@ impl PyEventStream {
         max_window_s: Option<f64>,
         max_window_us: Option<f64>,
         max_window_ns: Option<f64>,
+        windows_ms: Option<Vec<f64>>,
+        windows_s: Option<Vec<f64>>,
+        windows_us: Option<Vec<f64>>,
+        windows_ns: Option<Vec<f64>>,
     ) -> PyResult<PyEventFrame> {
         let max_window_ms = resolve_ms(
             "max_window",
@@ -781,9 +802,19 @@ impl PyEventStream {
             max_window_ms,
             max_window_us,
             max_window_ns,
-        )?
-        .unwrap_or(DEFAULT_SPAN_MS);
-        py.detach(|| Mcts::new(max_window_ms).generate(&self.inner))
+        )?;
+        let windows_ms = resolve_ms_list("windows", windows_s, windows_ms, windows_us, windows_ns)?;
+        if windows_ms.is_some() && max_window_ms.is_some() {
+            return Err(PyValueError::new_err(
+                "pass windows_* (explicit MCTS windows) or max_window_* (the log-spaced ladder), \
+                 not both",
+            ));
+        }
+        let mcts = match windows_ms {
+            Some(list) => Mcts::with_windows(list),
+            None => Mcts::new(max_window_ms.or(self.span_ms).unwrap_or(DEFAULT_SPAN_MS)),
+        };
+        py.detach(|| mcts.generate(&self.inner))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
@@ -906,7 +937,7 @@ impl PyEventStream {
         let spec = match repr {
             Some("raw") => None,
             Some(name) => Some(ReprSpec::named(name, None)?),
-            None => self.repr,
+            None => self.repr.clone(),
         };
         let mut view = match spec {
             None => RenderView::Raw(eventcv_core::viz::RawSurface::new(
@@ -914,12 +945,11 @@ impl PyEventStream {
                 height,
                 decay_ms.unwrap_or(dt_ms),
             )),
-            Some(spec) => RenderView::Repr {
-                spec,
-                colormap: parse_colormap(colormap)?,
+            Some(spec) => {
+                let colormap = parse_colormap(colormap)?;
                 // The whole stream is in hand, so the display scale is calibrated from the frames
                 // themselves rather than sampled — no second read to avoid.
-                scale: match clim {
+                let scale = match clim {
                     Some(value) if value > 0.0 => Scale::Fixed(value),
                     Some(_) => Scale::Auto,
                     None => {
@@ -938,8 +968,13 @@ impl PyEventStream {
                             Scale::Auto
                         }
                     }
-                },
-            },
+                };
+                RenderView::Repr {
+                    spec,
+                    colormap,
+                    scale,
+                }
+            }
         };
 
         let mut encoder: Option<Box<dyn eventcv_core::video::AnimationEncoder + Send>> = None;
@@ -994,12 +1029,14 @@ impl PyEventStream {
 
 impl PyEventStream {
     /// Wraps a core stream as a Python `EventStream`, carrying this stream's stored
-    /// representation forward (used by the chainable transforms, so `open(repr=…)` survives
-    /// `stream.flip_x().view()` etc.).
+    /// representation and window span forward (used by the chainable transforms, so
+    /// `open(repr=…)` survives `stream.flip_x().view()` etc.). Temporal ops (`time_scale`,
+    /// `time_window`) do not adjust the span stamp — it is only a default; explicit spans win.
     fn wrap(&self, inner: EventStream) -> PyEventStream {
         PyEventStream {
             inner,
-            repr: self.repr,
+            repr: self.repr.clone(),
+            span_ms: self.span_ms,
         }
     }
 
@@ -1025,7 +1062,7 @@ impl PyEventStream {
     /// The frame rendered when no explicit representation is passed: the stream's stored
     /// representation (from `open(repr=…)`) if set, else the default polarity image.
     fn default_frame(&self, py: Python<'_>, normalize: Option<bool>) -> PyResult<PyEventFrame> {
-        match self.repr {
+        match &self.repr {
             Some(spec) => py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
@@ -1046,7 +1083,7 @@ impl PyEventStream {
         // A representation *name* ("count", "flow", "voxel", …) renders that repr with its
         // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
         if let Ok(name) = representation.extract::<String>() {
-            let spec = ReprSpec::named(&name, normalize)?;
+            let spec = ReprSpec::named_with_span(&name, normalize, self.span_ms)?;
             return py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
@@ -1445,6 +1482,41 @@ fn resolve_ms(
     Ok(resolve_us(name, seconds, milliseconds, microseconds, nanoseconds)?.map(|us| us / 1000.0))
 }
 
+/// [`resolve_ms`] for a *list* of time spans (`windows_*` on `mcts`): one list, one unit,
+/// every element converted to milliseconds. Element validation (non-empty, finite, positive)
+/// stays with the core, like the scalar spans.
+fn resolve_ms_list(
+    name: &str,
+    seconds: Option<Vec<f64>>,
+    milliseconds: Option<Vec<f64>>,
+    microseconds: Option<Vec<f64>>,
+    nanoseconds: Option<Vec<f64>>,
+) -> PyResult<Option<Vec<f64>>> {
+    let given: Vec<(TimeUnit, Vec<f64>)> = [
+        (TimeUnit::Seconds, seconds),
+        (TimeUnit::Milliseconds, milliseconds),
+        (TimeUnit::Microseconds, microseconds),
+        (TimeUnit::Nanoseconds, nanoseconds),
+    ]
+    .into_iter()
+    .filter_map(|(unit, value)| value.map(|value| (unit, value)))
+    .collect();
+    if given.len() > 1 {
+        let names: Vec<String> = given
+            .iter()
+            .map(|(unit, _)| format!("{name}_{unit}"))
+            .collect();
+        return Err(PyValueError::new_err(format!(
+            "pass one of {name}_s / {name}_ms / {name}_us / {name}_ns, not {}",
+            names.join(" and "),
+        )));
+    }
+    Ok(given.into_iter().next().map(|(unit, values)| {
+        let scale = unit.scale_us() / 1000.0;
+        values.into_iter().map(|value| value * scale).collect()
+    }))
+}
+
 /// [`resolve_us`] for a *duration* — something that has to be positive and land on the microsecond
 /// grid, like `dt` or a window `step`. A value below half a microsecond is rejected rather than
 /// rounded up to 1 µs, so `dt_ns=100` says so instead of silently becoming ten times itself.
@@ -1618,7 +1690,11 @@ fn load(
         keys: parse_keys(keys)?,
     };
     py.detach(|| eventcv_core::io::load(path, options))
-        .map(|inner| PyEventStream { inner, repr: None })
+        .map(|inner| PyEventStream {
+            inner,
+            repr: None,
+            span_ms: None,
+        })
         .map_err(map_io_error)
 }
 
@@ -1646,7 +1722,11 @@ fn from_numpy(
     };
     let rows = numpy_rows(events, options.order)?;
     py.detach(|| load_rows(&rows, &options))
-        .map(|inner| PyEventStream { inner, repr: None })
+        .map(|inner| PyEventStream {
+            inner,
+            repr: None,
+            span_ms: None,
+        })
         .map_err(map_io_error)
 }
 
@@ -1746,7 +1826,15 @@ fn open(
         (None, None) => None,
     };
     let origin_us = parse_offset(offset, offset_s, offset_ms, offset_us, offset_ns)?;
-    let repr = repr.map(|name| ReprSpec::named(name, None)).transpose()?;
+    // Unset time spans follow the slice window (see `ReprSpec::named_with_span`); count-based
+    // slicing has no fixed duration, so those keep the 30 ms default.
+    let span_ms = match mode {
+        Some(SliceMode::Duration(dt_us)) => Some(dt_us as f64 / 1000.0),
+        _ => None,
+    };
+    let repr = repr
+        .map(|name| ReprSpec::named_with_span(name, None, span_ms))
+        .transpose()?;
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
         time_unit: parse_time_unit(time_unit)?,
@@ -1951,6 +2039,14 @@ impl RenderView {
     }
 }
 
+/// The duration (ms) a fetched slice covers. Count windows have no fixed duration.
+fn window_span_ms(window: &SliceWindow) -> Option<f64> {
+    match window {
+        SliceWindow::Time(t0, t1) => Some(t1.saturating_sub(*t0) as f64 / 1000.0),
+        SliceWindow::Index(..) => None,
+    }
+}
+
 /// Reads `window` from the shared reader off-GIL, dropping the whole-recording hot pixels (if
 /// any) before the deferred per-slice ops, so corner detectors never fire on stuck pixels.
 ///
@@ -1989,6 +2085,7 @@ fn render_slice(
     py: Python<'_>,
     repr: Option<ReprSpec>,
     stream: EventStream,
+    span_ms: Option<f64>,
 ) -> PyResult<Py<PyAny>> {
     match repr {
         Some(spec) => {
@@ -2004,6 +2101,7 @@ fn render_slice(
             PyEventStream {
                 inner: stream,
                 repr: None,
+                span_ms,
             },
         )?
         .into_any()
@@ -2030,7 +2128,7 @@ impl PyEventReader {
     /// The per-slice representation name set at `open`/`with_repr`, or `None` (raw streams).
     #[getter]
     fn repr(&self) -> Option<&'static str> {
-        self.repr.map(ReprSpec::name)
+        self.repr.as_ref().map(ReprSpec::name)
     }
 
     #[getter]
@@ -2210,7 +2308,7 @@ impl PyEventReader {
     fn __getitem__(&self, py: Python<'_>, index: i64) -> PyResult<Py<PyAny>> {
         let window = self.window_for_index(index)?;
         let stream = self.fetch(py, window, self.slice_seed(index))?;
-        match self.repr {
+        match &self.repr {
             Some(spec) => {
                 let frame = py
                     .detach(|| spec.generate(&stream.inner))
@@ -2222,9 +2320,10 @@ impl PyEventReader {
     }
 
     /// Returns a new reader over the same file that renders each slice with `repr` (unset
-    /// params take their method defaults). The dataset-mode counterpart of `open(repr=…)`,
-    /// but with per-representation options: e.g. `reader.with_repr("voxel", bins=5)`.
-    #[pyo3(signature = (repr, *, bins=None, window_ms=None, window_s=None, window_us=None, window_ns=None, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None, window=None, normalize=None, pct=None, white_frame=None))]
+    /// params take their method defaults; unset time spans follow the reader's `dt`). The
+    /// dataset-mode counterpart of `open(repr=…)`, but with per-representation options:
+    /// e.g. `reader.with_repr("voxel", bins=5)`.
+    #[pyo3(signature = (repr, *, bins=None, window_ms=None, window_s=None, window_us=None, window_ns=None, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None, windows_ms=None, windows_s=None, windows_us=None, windows_ns=None, window=None, normalize=None, pct=None, white_frame=None))]
     #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
@@ -2242,23 +2341,44 @@ impl PyEventReader {
         max_window_s: Option<f64>,
         max_window_us: Option<f64>,
         max_window_ns: Option<f64>,
+        windows_ms: Option<Vec<f64>>,
+        windows_s: Option<Vec<f64>>,
+        windows_us: Option<Vec<f64>>,
+        windows_ns: Option<Vec<f64>>,
         window: Option<i64>,
         normalize: Option<bool>,
         pct: Option<f64>,
         white_frame: Option<bool>,
     ) -> PyResult<PyEventReader> {
+        let max_window_ms = resolve_ms(
+            "max_window",
+            max_window_s,
+            max_window_ms,
+            max_window_us,
+            max_window_ns,
+        )?;
+        let windows = resolve_ms_list("windows", windows_s, windows_ms, windows_us, windows_ns)?;
+        // Checked against the *explicit* max_window, before the slice-duration default below —
+        // a dt-reader with windows_ms alone is fine.
+        if windows.is_some() && max_window_ms.is_some() {
+            return Err(PyValueError::new_err(
+                "pass windows_* (explicit MCTS windows) or max_window_* (the log-spaced ladder), \
+                 not both",
+            ));
+        }
+        // Unset time spans follow the reader's slice duration, like `open(repr=…)`;
+        // an explicit `window_ms=`/`tau_ms=`/`max_window_ms=` always wins.
+        let span = match self.mode {
+            Some(SliceMode::Duration(dt_us)) => Some(dt_us as f64 / 1000.0),
+            _ => None,
+        };
         let spec = ReprSpec::new(
             repr,
             bins,
-            resolve_ms("window", window_s, window_ms, window_us, window_ns)?,
-            resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?,
-            resolve_ms(
-                "max_window",
-                max_window_s,
-                max_window_ms,
-                max_window_us,
-                max_window_ns,
-            )?,
+            resolve_ms("window", window_s, window_ms, window_us, window_ns)?.or(span),
+            resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.or(span),
+            max_window_ms.or(span),
+            windows,
             window,
             normalize,
             pct,
@@ -2526,7 +2646,7 @@ impl PyEventReader {
         let repr = match repr {
             Some("raw") => None,
             Some(name) => Some(ReprSpec::named(name, None)?),
-            None => self.repr,
+            None => self.repr.clone(),
         };
         let options = viewer::gui::Options {
             dt_ms,
@@ -2699,7 +2819,7 @@ impl PyEventReader {
     /// for training. Requires a representation (`open(repr=…)` / `with_repr`). `indices` is any
     /// int sequence (list / range / …); each is a `dt_ms` frame index.
     fn batch<'py>(&self, py: Python<'py>, indices: Vec<i64>) -> PyResult<Bound<'py, PyAny>> {
-        let spec = self.repr.ok_or_else(|| {
+        let spec = self.repr.clone().ok_or_else(|| {
             PyValueError::new_err(
                 "batch needs a representation; open(repr=…) or reader.with_repr(…)",
             )
@@ -2851,6 +2971,7 @@ impl PyEventReader {
     /// Reads `window` off-GIL into an `EventStream` carrying the reader's stored repr,
     /// applying the per-slice op (e.g. `efast`) if one is set.
     fn fetch(&self, py: Python<'_>, window: SliceWindow, index: usize) -> PyResult<PyEventStream> {
+        let span_ms = window_span_ms(&window);
         fetch_window(
             py,
             &self.inner,
@@ -2861,7 +2982,8 @@ impl PyEventReader {
         )
         .map(|inner| PyEventStream {
             inner,
-            repr: self.repr,
+            repr: self.repr.clone(),
+            span_ms,
         })
     }
 
@@ -2873,6 +2995,7 @@ impl PyEventReader {
         window: SliceWindow,
         index: usize,
     ) -> PyResult<Py<PyAny>> {
+        let span_ms = window_span_ms(&window);
         let stream = fetch_window(
             py,
             &self.inner,
@@ -2881,7 +3004,7 @@ impl PyEventReader {
             self.slice_ops.clone(),
             self.hot_pixel_mask.clone(),
         )?;
-        render_slice(py, self.repr, stream)
+        render_slice(py, self.repr.clone(), stream, span_ms)
     }
 
     /// A new reader over the same file (and mode/`repr`) that applies `op` to every slice after
@@ -2892,7 +3015,7 @@ impl PyEventReader {
         PyEventReader {
             inner: Arc::clone(&self.inner),
             mode: self.mode,
-            repr: self.repr,
+            repr: self.repr.clone(),
             slice_ops: Arc::from(ops),
             offset_us: self.offset_us,
             base_index: self.base_index,
@@ -2907,7 +3030,7 @@ impl PyEventReader {
             cursor,
             emitted: 0,
             slice_ops: self.slice_ops.clone(),
-            repr: self.repr,
+            repr: self.repr.clone(),
             hot_pixel_mask: self.hot_pixel_mask.clone(),
         }
     }
@@ -2976,7 +3099,7 @@ impl PyEventReader {
             // No explicit choice: the reader's own representation if it has one, else raw. A
             // reader opened without `repr=` used to be an error here; showing the events
             // themselves is a better answer than refusing to show anything.
-            None => self.repr,
+            None => self.repr.clone(),
         };
         let Some(spec) = spec else {
             let (width, height) = {
@@ -3163,6 +3286,7 @@ impl PyWindowIterator {
         };
         let index = self.emitted;
         self.emitted += 1;
+        let span_ms = window_span_ms(&window);
         let stream = fetch_window(
             py,
             &self.reader,
@@ -3171,7 +3295,7 @@ impl PyWindowIterator {
             self.slice_ops.clone(),
             self.hot_pixel_mask.clone(),
         )?;
-        render_slice(py, self.repr, stream).map(Some)
+        render_slice(py, self.repr.clone(), stream, span_ms).map(Some)
     }
 }
 
@@ -3489,7 +3613,15 @@ fn simulate(
         }
         None => {
             let inner = py.detach(|| sink.into_stream());
-            Py::new(py, PyEventStream { inner, repr: None }).map(|stream| stream.into_any())
+            Py::new(
+                py,
+                PyEventStream {
+                    inner,
+                    repr: None,
+                    span_ms: None,
+                },
+            )
+            .map(|stream| stream.into_any())
         }
     }
 }
@@ -3712,7 +3844,7 @@ fn reconstruct(
     use eventcv_core::video::{encoder_for, Fps};
     use eventcv_core::viz::{render_frame_scaled, Scale};
 
-    let spec = reader.repr.ok_or_else(|| {
+    let spec = reader.repr.clone().ok_or_else(|| {
         PyValueError::new_err(
             "reconstruct needs the representation the model expects; open(repr=…) or with_repr(…)",
         )
@@ -4437,7 +4569,11 @@ impl PyUdpReceiver {
         }
         let window = std::time::Duration::from_micros((dt_ms * 1000.0) as u64);
         py.detach(|| self.inner.recv_window(window))
-            .map(|inner| PyEventStream { inner, repr: None })
+            .map(|inner| PyEventStream {
+                inner,
+                repr: None,
+                span_ms: None,
+            })
             .map_err(map_std_io_error)
     }
 
@@ -4546,7 +4682,7 @@ fn stack_frames<'py>(
 /// A representation choice + its parameters, attached to an [`PyEventReader`] so each slice
 /// renders to a dense frame (the `DataLoader`-friendly mode). One place that maps a repr name
 /// to the core generator, shared by `open(repr=…)`, `with_repr`, `__getitem__`, and `batch`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ReprSpec {
     Binary,
     Count { normalize: bool },
@@ -4556,7 +4692,7 @@ enum ReprSpec {
     AveragedTimeSurface { tau_ms: f64 },
     Tencode { window_ms: f64 },
     CountMask { pct: f64, white_frame: bool },
-    Mcts { max_window_ms: f64 },
+    Mcts { max_window_ms: f64, windows: Option<Vec<f64>> },
     Flow { window: usize },
 }
 
@@ -4570,6 +4706,7 @@ impl ReprSpec {
         window_ms: Option<f64>,
         tau_ms: Option<f64>,
         max_window_ms: Option<f64>,
+        windows: Option<Vec<f64>>,
         window: Option<i64>,
         normalize: Option<bool>,
         pct: Option<f64>,
@@ -4608,6 +4745,7 @@ impl ReprSpec {
             },
             "mcts" => Self::Mcts {
                 max_window_ms: max_window_ms.unwrap_or(DEFAULT_SPAN_MS),
+                windows,
             },
             "flow" => Self::Flow {
                 window: window
@@ -4631,10 +4769,23 @@ impl ReprSpec {
     /// A spec from a name alone, for the callers that don't accept per-representation options —
     /// `open(repr=…)`, `flatten`/`view`, `camera.show` — which take at most `normalize`.
     fn named(name: &str, normalize: Option<bool>) -> PyResult<Self> {
-        Self::new(name, None, None, None, None, None, normalize, None, None)
+        Self::named_with_span(name, normalize, None)
     }
 
-    fn name(self) -> &'static str {
+    /// [`ReprSpec::named`], with unset time spans defaulting to `span_ms` — the slice window a
+    /// reader or stream was fetched as — instead of the fixed 30 ms, mirroring `stream()`'s
+    /// live-camera rule so the representation covers exactly the events it is handed.
+    fn named_with_span(
+        name: &str,
+        normalize: Option<bool>,
+        span_ms: Option<f64>,
+    ) -> PyResult<Self> {
+        Self::new(
+            name, None, span_ms, span_ms, span_ms, None, None, normalize, None, None,
+        )
+    }
+
+    fn name(&self) -> &'static str {
         match self {
             Self::Binary => "binary",
             Self::Count { .. } => "count",
@@ -4655,32 +4806,38 @@ impl ReprSpec {
     /// implementation: a Rust caller asking for `generate` should get exactly that, while a
     /// `reader = ecv.open(..., repr="voxel")` that never names a device should follow whatever the
     /// session was set to. Representations with no kernel fall back to the CPU on their own.
-    fn generate(self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
+    fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
         self.generate_on(stream, eventcv_core::accel::default_device())
     }
 
     fn generate_on(
-        self,
+        &self,
         stream: &EventStream,
         device: eventcv_core::accel::Device,
     ) -> Result<EventFrame, RepresentationError> {
         match self {
             Self::Binary => Binary.generate_on(stream, device),
-            Self::Count { normalize } => EventCount::new(normalize).generate_on(stream, device),
-            Self::Polarity { normalize } => Polarity::new(normalize).generate_on(stream, device),
+            Self::Count { normalize } => EventCount::new(*normalize).generate_on(stream, device),
+            Self::Polarity { normalize } => Polarity::new(*normalize).generate_on(stream, device),
             Self::Voxel { bins, window_ms } => {
-                VoxelGrid::new(bins, window_ms).generate_on(stream, device)
+                VoxelGrid::new(*bins, *window_ms).generate_on(stream, device)
             }
-            Self::TimeSurface { tau_ms } => TimeSurface::new(tau_ms).generate_on(stream, device),
+            Self::TimeSurface { tau_ms } => TimeSurface::new(*tau_ms).generate_on(stream, device),
             Self::AveragedTimeSurface { tau_ms } => {
-                AveragedTimeSurface::new(tau_ms).generate_on(stream, device)
+                AveragedTimeSurface::new(*tau_ms).generate_on(stream, device)
             }
-            Self::Tencode { window_ms } => Tencode::new(window_ms).generate_on(stream, device),
+            Self::Tencode { window_ms } => Tencode::new(*window_ms).generate_on(stream, device),
             Self::CountMask { pct, white_frame } => {
-                CountMask::new(pct, white_frame).generate_on(stream, device)
+                CountMask::new(*pct, *white_frame).generate_on(stream, device)
             }
-            Self::Mcts { max_window_ms } => Mcts::new(max_window_ms).generate_on(stream, device),
-            Self::Flow { window } => stream.optical_flow(window).map_err(|error| match error {
+            Self::Mcts {
+                max_window_ms,
+                windows,
+            } => match windows {
+                Some(list) => Mcts::with_windows(list.clone()).generate_on(stream, device),
+                None => Mcts::new(*max_window_ms).generate_on(stream, device),
+            },
+            Self::Flow { window } => stream.optical_flow(*window).map_err(|error| match error {
                 FlowError::SizeOverflow => RepresentationError::SizeOverflow,
                 FlowError::InvalidParameter(name) => RepresentationError::InvalidParameter(name),
             }),
@@ -5785,7 +5942,7 @@ impl PyEventCamera {
         let refresh_hz = gui_refresh_hz(refresh_hz)?;
         let decay_ms = Some(gui_decay_ms(decay_ms)?.unwrap_or(self.decay_ms));
         let repr = match representation.as_deref() {
-            None => self.repr,
+            None => self.repr.clone(),
             Some("raw") => None,
             Some(name) => Some(ReprSpec::named(name, Some(normalize))?),
         };
@@ -6148,7 +6305,7 @@ impl PyEventCamera {
         mode: LiveMode,
     ) -> PyResult<Option<Vec<bool>>> {
         let default_decay = self.decay_ms;
-        let stored_repr = self.repr;
+        let stored_repr = self.repr.clone();
         let colormap_value = parse_colormap(colormap)?;
         // The viewer decodes on a wall-clock budget and drops the surplus to hold ~60 FPS, so
         // feeding the recording from it would write a file full of holes. The recording pauses
@@ -6272,7 +6429,7 @@ impl PyEventCamera {
         py: Python<'_>,
         timeout: Option<std::time::Duration>,
     ) -> PyResult<Option<Py<PyAny>>> {
-        let repr = self.repr;
+        let repr = self.repr.clone();
         // Decoding, archiving, and the `latest=` skip policy all run on the pump thread; this loop
         // only collects finished windows and renders them.
         self.pumping()?;
@@ -6286,7 +6443,7 @@ impl PyEventCamera {
                         note_overflow();
                     }
                     self.stage_aux(window.frames, window.imu);
-                    return render_slice(py, repr, window.stream).map(Some);
+                    return render_slice(py, repr, window.stream, None).map(Some);
                 }
                 Ok(None) => {} // nothing decoded yet — keep waiting
                 Err(message) => return Err(PyRuntimeError::new_err(message)),
@@ -6625,6 +6782,7 @@ fn stream(
                     max_window_ns,
                 )?
                 .or(span),
+                None,
                 window,
                 normalize,
                 pct,
@@ -7054,7 +7212,13 @@ impl PyRos2Subscriber {
     fn recv(&self, py: Python<'_>, timeout_ms: f64) -> PyResult<Option<PyEventStream>> {
         let timeout = Ros2Duration::from_secs_f64((timeout_ms / 1000.0).max(0.0));
         py.detach(|| self.inner.lock().expect("subscriber mutex").recv(timeout))
-            .map(|stream| stream.map(|inner| PyEventStream { inner, repr: None }))
+            .map(|stream| {
+                stream.map(|inner| PyEventStream {
+                    inner,
+                    repr: None,
+                    span_ms: None,
+                })
+            })
             .map_err(map_ros2_error)
     }
 
