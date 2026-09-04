@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-core"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-py"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "bytemuck",
  "egui",

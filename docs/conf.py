@@ -18,7 +18,7 @@ copyright = "2026, EventLAB"
 try:
     release = _pkg_version("eventcv")
 except PackageNotFoundError:  # docs building against an uninstalled tree
-    release = "1.0.6"
+    release = "1.0.7"
 version = release
 
 extensions = [
