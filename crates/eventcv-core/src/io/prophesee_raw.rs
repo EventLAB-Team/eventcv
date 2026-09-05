@@ -373,19 +373,16 @@ fn decode_bytes<F: FnMut(RawEvent), S: FnMut(bool, i64) -> bool>(
 ) {
     match codec {
         Codec::Evt3(decoder) => {
-            for word in bytes.chunks_exact(2) {
-                decoder.decode(u16::from_le_bytes([word[0], word[1]]), &mut emit);
+            for word in bytes.as_chunks::<2>().0 {
+                decoder.decode(u16::from_le_bytes(*word), &mut emit);
                 if stop(decoder.initialised, decoder.time) {
                     break;
                 }
             }
         }
         Codec::Evt2(decoder) => {
-            for word in bytes.chunks_exact(4) {
-                decoder.decode(
-                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-                    &mut emit,
-                );
+            for word in bytes.as_chunks::<4>().0 {
+                decoder.decode(u32::from_le_bytes(*word), &mut emit);
                 if stop(decoder.initialised, decoder.time) {
                     break;
                 }
@@ -1041,7 +1038,7 @@ mod tests {
         let time_high = (0x8000u16 | base).to_le_bytes();
         let time_low = (0x6000u16 | 3000).to_le_bytes();
         let mut words: Vec<[u8; 2]> = vec![time_high, 0x0005u16.to_le_bytes()]; // TIME_HIGH, Y = 5
-        words.extend(std::iter::repeat(time_low).take(62)); // 64-word prefix
+        words.extend(std::iter::repeat_n(time_low, 62)); // 64-word prefix
         let periods = 3 * (CHECKPOINT_MIN_BYTES as usize / 2) / 64;
         let mut expected = 0usize;
         for _ in 0..periods {

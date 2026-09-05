@@ -12,7 +12,7 @@ fn rebin_axis(coords: &mut [u16], from: usize, to: usize) {
     if from == 0 || to == 0 || from == to {
         return;
     }
-    if from % to == 0 {
+    if from.is_multiple_of(to) {
         let factor = (from / to) as u16;
         if factor.is_power_of_two() {
             let shift = factor.trailing_zeros();
