@@ -4,6 +4,34 @@
 use crate::camera::Camera;
 use crate::EventStream;
 
+/// Maps every coordinate of one axis from a `from`-wide grid onto a `to`-wide one: `floor(c * to / from)`.
+///
+/// `c < 2^16` and `to` is a sensor dimension, so `c * to` fits comfortably in `u64`; the result is
+/// below `to` whenever `c < from`, which `EventStream` guarantees for its own coordinates.
+fn rebin_axis(coords: &mut [u16], from: usize, to: usize) {
+    if from == 0 || to == 0 || from == to {
+        return;
+    }
+    if from % to == 0 {
+        let factor = (from / to) as u16;
+        if factor.is_power_of_two() {
+            let shift = factor.trailing_zeros();
+            for c in coords {
+                *c >>= shift;
+            }
+        } else {
+            for c in coords {
+                *c /= factor;
+            }
+        }
+    } else {
+        let (to, from) = (to as u64, from as u64);
+        for c in coords {
+            *c = (u64::from(*c) * to / from) as u16;
+        }
+    }
+}
+
 impl EventStream {
     /// Keeps events inside the `w`×`h` window at `(x0, y0)` and shifts them to a new origin.
     /// The result is a `w`×`h` stream.
@@ -85,25 +113,16 @@ impl EventStream {
     /// Resizes the sensor grid to `w`×`h`, rebinning each coordinate proportionally (floored —
     /// the destination bin, no interpolation). Every event maps into `[0, w)×[0, h)`, so the
     /// count is conserved; on downscale several events may share a pixel (lossless).
+    ///
+    /// The bin is `floor(x * w / width)` computed in integers: exact, and no `floor` call per
+    /// coordinate (on a baseline x86-64 build `f64::floor` is a libm call, which made this the
+    /// most expensive step of a decode → downsample → histogram pipeline). An integer factor —
+    /// the common `1280x720 → 640x360` — collapses to a shift or a division.
     pub fn resize(&self, w: usize, h: usize) -> EventStream {
         let (width, height) = self.sensor_size();
-        let sx = if width > 0 {
-            w as f64 / width as f64
-        } else {
-            0.0
-        };
-        let sy = if height > 0 {
-            h as f64 / height as f64
-        } else {
-            0.0
-        };
         self.map_columns(w, h, |out| {
-            for x in &mut out.xs {
-                *x = (f64::from(*x) * sx).floor() as u16;
-            }
-            for y in &mut out.ys {
-                *y = (f64::from(*y) * sy).floor() as u16;
-            }
+            rebin_axis(&mut out.xs, width, w);
+            rebin_axis(&mut out.ys, height, h);
         })
     }
 

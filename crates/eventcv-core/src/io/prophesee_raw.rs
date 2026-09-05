@@ -15,11 +15,16 @@
 //! event payload is never materialised as a whole.  That machinery is shared: only the word size and
 //! the decoder state differ, which is what [`Codec`] abstracts.
 
+use std::cell::Cell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::path::Path;
 
-use super::{EventStream, EventStreamBuilder, IoError, LoadOptions, RawEvent, SliceSource};
+use memmap2::{Mmap, MmapMut};
+
+use super::{
+    EventConsumer, EventStream, EventStreamBuilder, IoError, LoadOptions, RawEvent, SliceSource,
+};
 
 const TIMESTAMP_SCALE_MS: f64 = 0.001;
 const TIME_LOOP: i64 = 1 << 24;
@@ -40,9 +45,6 @@ fn checkpoint_interval(bytes: u64) -> u64 {
 }
 /// Read granularity for the eager reader, which never looks back.
 const EAGER_CHUNK_BYTES: u64 = 1 << 20;
-/// Read granularity for the slice methods. Large enough that the per-read cost disappears against
-/// the decode, small enough that a one-window slice does not pull in a megabyte to throw away.
-const SLICE_CHUNK_BYTES: u64 = 1 << 16;
 
 /// EVT2 splits a timestamp into a 28-bit high half (its own word) and a 6-bit low half carried by
 /// each CD event, so the high half is stored pre-shifted and the wrap period is `1 << 34` µs — about
@@ -98,21 +100,6 @@ impl Codec {
         }
     }
 
-    /// The decoder's current timestamp, for checkpointing and for the early exit in `slice_time`.
-    fn time(self) -> i64 {
-        match self {
-            Self::Evt2(decoder) => decoder.time,
-            Self::Evt3(decoder) => decoder.time,
-        }
-    }
-
-    /// Whether a timestamp has been established yet — before the first TIME_HIGH there is none.
-    fn initialised(self) -> bool {
-        match self {
-            Self::Evt2(decoder) => decoder.initialised,
-            Self::Evt3(decoder) => decoder.initialised,
-        }
-    }
 }
 
 /// EVT2: one 32-bit word per event, with a shared timestamp high half.
@@ -264,6 +251,12 @@ impl Decoder {
 struct Checkpoint {
     byte_offset: u64,
     event_index: usize,
+    /// The latest event timestamp emitted *before* this checkpoint — not the decoder's own clock.
+    /// After a repeated EVT3 `TIME_HIGH` word the decoder's `time` falls back to the 4096 µs base
+    /// until the next `TIME_LOW`, so at such a boundary the clock understates the events just
+    /// decoded by up to 4 ms; a checkpoint tagged with that clock could be chosen for a window
+    /// whose first events sit *before* it, and they would be replayed past. The running maximum is
+    /// monotone across checkpoints, which is what makes the search in `checkpoint_for_time` exact.
     time: i64,
     codec: Codec,
 }
@@ -350,8 +343,14 @@ fn parse_header(
 }
 
 /// Lazy, indexed source for a Prophesee EVT3 RAW recording.
+///
+/// The file is memory-mapped once at open: a slice is then a decode over a byte range, with no
+/// `open`/`seek`/buffered-read per window and no copy of the words before they are decoded.
 pub struct RawSliceSource {
-    path: PathBuf,
+    data: Mmap,
+    /// Bytes of the file that are data (`data_offset..len` of the map is the word stream).
+    len: usize,
+    data_offset: usize,
     width: usize,
     height: usize,
     checkpoints: Vec<Checkpoint>,
@@ -359,14 +358,62 @@ pub struct RawSliceSource {
     time_span: (i64, i64),
 }
 
+/// Decodes every whole word of `bytes` through `codec`, handing each event to `emit`.
+///
+/// The codec is matched once, outside the word loop, so each encoding gets its own tight loop
+/// rather than an enum dispatch per 16-bit word. `stop` is consulted after every word with the
+/// decoder's clock (`initialised`, `time`) and ends the loop early — a time slice stops once the
+/// clock reaches its end time; an index slice when it has its events.
+#[inline]
+fn decode_bytes<F: FnMut(RawEvent), S: FnMut(bool, i64) -> bool>(
+    codec: &mut Codec,
+    bytes: &[u8],
+    mut emit: F,
+    mut stop: S,
+) {
+    match codec {
+        Codec::Evt3(decoder) => {
+            for word in bytes.chunks_exact(2) {
+                decoder.decode(u16::from_le_bytes([word[0], word[1]]), &mut emit);
+                if stop(decoder.initialised, decoder.time) {
+                    break;
+                }
+            }
+        }
+        Codec::Evt2(decoder) => {
+            for word in bytes.chunks_exact(4) {
+                decoder.decode(
+                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                    &mut emit,
+                );
+                if stop(decoder.initialised, decoder.time) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl RawSliceSource {
     fn open(path: &Path, options: &LoadOptions) -> Result<Self, IoError> {
         let mut reader = BufReader::new(File::open(path)?);
         let header = parse_header(&mut reader, options.sensor_size)?;
+        let file = reader.into_inner();
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+        // An empty file cannot be mapped; an anonymous page stands in so the slice methods can
+        // treat every source the same way.
+        let data = if len == 0 {
+            MmapMut::map_anon(1)?.make_read_only()?
+        } else {
+            // SAFETY: the map is read-only and the file is a recording that nothing here writes to;
+            // a concurrent truncation would at worst fault a read, which is the documented risk of
+            // mapping any file.
+            unsafe { Mmap::map(&file)? }
+        };
+        let data_offset = (header.data_offset as usize).min(len);
         let mut codec = Codec::new(header.encoding);
-        let word_size = codec.word_size();
         let mut checkpoints = vec![Checkpoint {
-            byte_offset: header.data_offset,
+            byte_offset: data_offset as u64,
             event_index: 0,
             time: 0,
             codec,
@@ -378,27 +425,24 @@ impl RawSliceSource {
         // bound from the events themselves means nothing is ever dropped for being out of bounds —
         // which matters because `EventStreamBuilder::push` drops silently.
         let mut extent = (0usize, 0usize);
-        let mut byte_offset = header.data_offset;
-        let interval =
-            checkpoint_interval(reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0));
-        let mut chunk = Vec::with_capacity(interval as usize);
+        let interval = checkpoint_interval(len as u64) as usize;
+        let body = &data[data_offset..len];
 
-        loop {
-            chunk.clear();
-            (&mut reader).take(interval).read_to_end(&mut chunk)?;
-            if chunk.is_empty() {
-                break;
-            }
-            if byte_offset != header.data_offset {
+        for (chunk_index, chunk) in body.chunks(interval).enumerate() {
+            if chunk_index > 0 {
                 checkpoints.push(Checkpoint {
-                    byte_offset,
+                    byte_offset: (data_offset + chunk_index * interval) as u64,
                     event_index,
-                    time: codec.time(),
+                    // Every event so far has `t <= maximum` (see `Checkpoint::time`); before the
+                    // first event the tag is `0`, which no window can start below.
+                    time: if event_index == 0 { 0 } else { maximum },
                     codec,
                 });
             }
-            for bytes in chunk.chunks_exact(word_size) {
-                codec.decode(bytes, |event| {
+            decode_bytes(
+                &mut codec,
+                chunk,
+                |event| {
                     // With a declared size, out-of-bounds events are not counted, so the index
                     // matches what the slice methods will actually emit. Without one, everything
                     // counts and the size is derived below.
@@ -415,9 +459,9 @@ impl RawSliceSource {
                         minimum = minimum.min(event.t);
                         maximum = maximum.max(event.t);
                     }
-                });
-            }
-            byte_offset += chunk.len() as u64;
+                },
+                |_, _| false,
+            );
         }
 
         // A derived size is a tight bound on the events present, not the physical sensor: a 640x480
@@ -430,7 +474,9 @@ impl RawSliceSource {
         };
 
         Ok(Self {
-            path: path.to_owned(),
+            data,
+            len,
+            data_offset,
             width,
             height,
             checkpoints,
@@ -451,20 +497,62 @@ impl RawSliceSource {
         self.checkpoints[position]
     }
 
+    /// The last checkpoint that every event with `t >= time` lies at or after.
+    ///
+    /// A checkpoint's `time` is the largest timestamp before it, so every event before a
+    /// checkpoint tagged below `time` is itself below `time`: the last such checkpoint is the
+    /// right one, and none of the events in `[time, …)` can precede it — even in a stream whose
+    /// `TIME_LOW` values briefly move backwards, because the tag is a maximum, not the clock.
+    /// The tags are monotone, so the binary search is exact.
     fn checkpoint_for_time(&self, time: i64) -> Checkpoint {
         let position = self
             .checkpoints
-            .partition_point(|checkpoint| checkpoint.time <= time)
+            .partition_point(|checkpoint| checkpoint.time < time)
             .saturating_sub(1);
-        // A checkpoint timestamp is the state before its next word. Replaying one checkpoint
-        // earlier also covers streams whose repeated TIME_LOW values briefly move backwards.
-        self.checkpoints[position.saturating_sub(1)]
+        self.checkpoints[position]
     }
 
-    fn reader_at(&self, checkpoint: Checkpoint) -> Result<BufReader<File>, IoError> {
-        let mut reader = BufReader::new(File::open(&self.path)?);
-        reader.seek(SeekFrom::Start(checkpoint.byte_offset))?;
-        Ok(reader)
+    /// The words from `checkpoint` to the end of the file.
+    fn bytes_from(&self, checkpoint: Checkpoint) -> &[u8] {
+        let start = (checkpoint.byte_offset as usize).clamp(self.data_offset, self.len);
+        &self.data[start..self.len]
+    }
+
+    /// An upper bound on the events in `[t0, t1)`: the index distance between the checkpoints
+    /// bracketing the window. Sizes the columns once instead of growing them per push.
+    fn capacity_hint(&self, t0: i64, t1: i64) -> usize {
+        let first = self.checkpoint_for_time(t0).event_index;
+        let after = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.time <= t1)
+            .min(self.checkpoints.len().saturating_sub(1));
+        let last = self
+            .checkpoints
+            .get(after + 1)
+            .map_or(self.n_events, |checkpoint| checkpoint.event_index);
+        last.saturating_sub(first)
+    }
+
+    /// Feeds every event of `[t0, t1)` to `sink`, straight off the decoder (the monomorphised
+    /// core of both [`SliceSource::slice_time`] and [`SliceSource::slice_time_into`]).
+    fn stream_time<S: EventConsumer + ?Sized>(&self, t0: i64, t1: i64, sink: &mut S) {
+        let checkpoint = self.checkpoint_for_time(t0);
+        let mut codec = checkpoint.codec;
+        let (width, height) = (self.width, self.height);
+        decode_bytes(
+            &mut codec,
+            self.bytes_from(checkpoint),
+            |event| {
+                if event.t >= t0
+                    && event.t < t1
+                    && usize::from(event.x) < width
+                    && usize::from(event.y) < height
+                {
+                    sink.push(event.x, event.y, event.t, event.p);
+                }
+            },
+            |initialised, time| initialised && time >= t1,
+        );
     }
 }
 
@@ -489,73 +577,45 @@ impl SliceSource for RawSliceSource {
         let i0 = i0.min(self.n_events);
         let i1 = i1.clamp(i0, self.n_events);
         let checkpoint = self.checkpoint_for_index(i0);
-        let mut reader = self.reader_at(checkpoint)?;
         let mut codec = checkpoint.codec;
-        let mut index = checkpoint.event_index;
         let (width, height) = (self.width, self.height);
         // The event count is known exactly, so the four column vectors are sized once instead of
         // doubling their way to a million events.
         let mut builder =
             EventStreamBuilder::with_capacity(width, height, TIMESTAMP_SCALE_MS, i1 - i0);
-        let word_size = codec.word_size();
-        // Decode out of a chunk buffer, the way the index pass does. Reading one two-byte word at
-        // a time through `read_exact` costs a call, a bounds test and a buffer-position update per
-        // word, which dominates the decode itself.
-        let mut chunk = Vec::with_capacity(SLICE_CHUNK_BYTES as usize);
-        'chunks: while index < i1 {
-            chunk.clear();
-            (&mut reader).take(SLICE_CHUNK_BYTES).read_to_end(&mut chunk)?;
-            if chunk.len() < word_size {
-                break;
-            }
-            for bytes in chunk.chunks_exact(word_size) {
-                codec.decode(bytes, |event| {
-                    if usize::from(event.x) < width && usize::from(event.y) < height {
-                        if index >= i0 && index < i1 {
-                            // Bounds were just tested; `push` would test them again.
-                            builder.push_in_bounds(event.x, event.y, event.t, event.p);
-                        }
-                        index += 1;
+        let index = Cell::new(checkpoint.event_index);
+        decode_bytes(
+            &mut codec,
+            self.bytes_from(checkpoint),
+            |event| {
+                if usize::from(event.x) < width && usize::from(event.y) < height {
+                    let at = index.get();
+                    if at >= i0 && at < i1 {
+                        // Bounds were just tested; `push` would test them again.
+                        builder.push_in_bounds(event.x, event.y, event.t, event.p);
                     }
-                });
-                if index >= i1 {
-                    break 'chunks;
+                    index.set(at + 1);
                 }
-            }
-        }
+            },
+            |_, _| index.get() >= i1,
+        );
         Ok(builder.build())
     }
 
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {
-        let checkpoint = self.checkpoint_for_time(t0);
-        let mut reader = self.reader_at(checkpoint)?;
-        let mut codec = checkpoint.codec;
-        let (width, height) = (self.width, self.height);
-        let mut builder = EventStreamBuilder::new(width, height, TIMESTAMP_SCALE_MS);
-        let word_size = codec.word_size();
-        let mut chunk = Vec::with_capacity(SLICE_CHUNK_BYTES as usize);
-        'chunks: loop {
-            chunk.clear();
-            (&mut reader).take(SLICE_CHUNK_BYTES).read_to_end(&mut chunk)?;
-            if chunk.len() < word_size {
-                break;
-            }
-            for bytes in chunk.chunks_exact(word_size) {
-                codec.decode(bytes, |event| {
-                    if event.t >= t0
-                        && event.t < t1
-                        && usize::from(event.x) < width
-                        && usize::from(event.y) < height
-                    {
-                        builder.push_in_bounds(event.x, event.y, event.t, event.p);
-                    }
-                });
-                if codec.initialised() && codec.time() >= t1 {
-                    break 'chunks;
-                }
-            }
-        }
+        let mut builder = EventStreamBuilder::with_capacity(
+            self.width,
+            self.height,
+            TIMESTAMP_SCALE_MS,
+            self.capacity_hint(t0, t1),
+        );
+        self.stream_time(t0, t1, &mut builder);
         Ok(builder.build())
+    }
+
+    fn slice_time_into(&self, t0: i64, t1: i64, sink: &mut dyn EventConsumer) -> Result<(), IoError> {
+        self.stream_time(t0, t1, sink);
+        Ok(())
     }
 }
 
@@ -899,6 +959,7 @@ impl<W: Write + Send> super::EventSink for RawEventSink<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use super::*;
     use std::io::Write;
 
@@ -963,6 +1024,51 @@ mod tests {
         let events = source.slice_index(0, 2).unwrap();
         assert_eq!(events.ts(), &[TIME_LOOP - 1, TIME_LOOP + 2]);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_repeated_time_high_at_a_checkpoint_boundary_loses_no_events() {
+        // Under one TIME_HIGH base, every 64-word period is TIME_LOW 3000, 62 positive events, then
+        // a *repeated* TIME_HIGH (same base), after which the decoder's clock reads the bare base
+        // until the next TIME_LOW. Checkpoints sit every CHECKPOINT_MIN_BYTES = 32768 words from
+        // the data start; with a 64-word prefix, every boundary falls right after such a repeated
+        // TIME_HIGH, so a checkpoint tagged with the decoder's clock would claim `base` while the
+        // events just before it are at `base + 3000`. A window starting at `base + 500` must still
+        // return every event (the events between the last two checkpoints were replayed past when
+        // the tag was the clock).
+        let base: u16 = 0x0100;
+        let time_base = i64::from(base) << 12;
+        let time_high = (0x8000u16 | base).to_le_bytes();
+        let time_low = (0x6000u16 | 3000).to_le_bytes();
+        let mut words: Vec<[u8; 2]> = vec![time_high, 0x0005u16.to_le_bytes()]; // TIME_HIGH, Y = 5
+        words.extend(std::iter::repeat(time_low).take(62)); // 64-word prefix
+        let periods = 3 * (CHECKPOINT_MIN_BYTES as usize / 2) / 64;
+        let mut expected = 0usize;
+        for _ in 0..periods {
+            words.push(time_low);
+            for x in 0..62u16 {
+                words.push((0x2000u16 | 0x0800 | x).to_le_bytes());
+                expected += 1;
+            }
+            words.push(time_high);
+        }
+        let path = raw(&words);
+        let source = open_raw_slice(
+            &path,
+            &LoadOptions {
+                sensor_size: Some((64, 8)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(source.checkpoints.len() > 2, "the stream must span several checkpoints");
+        let window = source.slice_time(time_base + 500, time_base + 4000).unwrap();
+        assert_eq!(window.len(), expected, "events before a checkpoint boundary were replayed past");
+        let mut sink = EventStreamBuilder::new(64, 8, TIMESTAMP_SCALE_MS);
+        source
+            .slice_time_into(time_base + 500, time_base + 4000, &mut sink)
+            .unwrap();
+        assert_eq!(sink.build().len(), expected);
     }
 
     #[test]

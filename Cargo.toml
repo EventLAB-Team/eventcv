@@ -4,3 +4,10 @@ members = [
     "crates/eventcv-py"
 ]
 resolver = "2"
+
+# One codegen unit and fat LTO for the release artefacts (the wheel included): the decode and
+# accumulation loops are small and hot, and cross-crate inlining is what lets the sink-based
+# slicing (`SliceSource::slice_time_into`) compile down to a single loop.
+[profile.release]
+lto = "fat"
+codegen-units = 1

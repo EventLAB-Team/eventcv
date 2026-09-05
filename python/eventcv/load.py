@@ -184,6 +184,7 @@ def open(
     hot_pixel_filter: bool = False,
     hot_pixel_std: float = 3.0,
     keys: dict[str, str] | None = None,
+    downsample: int | None = None,
 ) -> EventReader:
     """Open a file for lazy slicing without loading it whole.
 
@@ -292,6 +293,9 @@ def open(
         eventcv.export_png((w.count() for w in corners.windows()), "corners/", colormap="turbo")
         # Optical-flow video:
         eventcv.export_png((w.optical_flow() for w in r.windows()), "flow/")
+    
+    ``downsample=k`` (polarity only) bins ``k``×``k`` sensor pixels into one cell while counting; with
+    ``repr="polarity"`` the RAW decoder feeds the histogram directly, without building the window's events.
     """
     return _rust.open(
         path,
@@ -313,6 +317,7 @@ def open(
         hot_pixel_filter=hot_pixel_filter,
         hot_pixel_std=hot_pixel_std,
         keys=keys,
+        downsample=downsample,
     )
 
 

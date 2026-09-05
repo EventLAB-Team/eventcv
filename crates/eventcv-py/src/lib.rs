@@ -24,6 +24,7 @@ use eventcv_core::{
     viz::Colormap,
     EventStream, EventStreamBuilder,
 };
+use eventcv_core::representation::PolarityAccumulator;
 use numpy::ndarray::Array2;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
@@ -630,13 +631,14 @@ impl PyEventStream {
             .map_err(map_flow_error)
     }
 
-    #[pyo3(signature = (representation=None, *, normalize=None, binary=false))]
+    #[pyo3(signature = (representation=None, *, normalize=None, binary=false, downsample=None))]
     fn flatten(
         &self,
         py: Python<'_>,
         representation: Option<&Bound<'_, PyAny>>,
         normalize: Option<bool>,
         binary: bool,
+        downsample: Option<i64>,
     ) -> PyResult<PyEventFrame> {
         if binary {
             if representation.is_some() {
@@ -650,8 +652,8 @@ impl PyEventStream {
                 .map_err(map_representation_error);
         }
         match representation {
-            Some(representation) => self.generate(py, representation, normalize),
-            None => self.default_frame(py, normalize),
+            Some(representation) => self.generate(py, representation, normalize, downsample),
+            None => self.default_frame(py, normalize, downsample),
         }
     }
 
@@ -845,8 +847,8 @@ impl PyEventStream {
                 .map_err(PyRuntimeError::new_err);
         }
         let frame = match representation {
-            Some(representation) => self.generate(py, representation, normalize)?,
-            None => self.default_frame(py, normalize)?,
+            Some(representation) => self.generate(py, representation, normalize, None)?,
+            None => self.default_frame(py, normalize, None)?,
         };
         // Rendering always auto-contrasts unless the caller opts out explicitly.
         frame.view(py, colormap, normalize.unwrap_or(true))
@@ -1020,8 +1022,8 @@ impl PyEventStream {
         normalize: Option<bool>,
     ) -> PyResult<Option<Bound<'py, PyArray2<bool>>>> {
         let frame = match representation {
-            Some(representation) => self.generate(py, representation, normalize)?,
-            None => self.default_frame(py, normalize)?,
+            Some(representation) => self.generate(py, representation, normalize, None)?,
+            None => self.default_frame(py, normalize, None)?,
         };
         frame.draw_mask(py, colormap, normalize.unwrap_or(true))
     }
@@ -1061,13 +1063,21 @@ impl PyEventStream {
 
     /// The frame rendered when no explicit representation is passed: the stream's stored
     /// representation (from `open(repr=…)`) if set, else the default polarity image.
-    fn default_frame(&self, py: Python<'_>, normalize: Option<bool>) -> PyResult<PyEventFrame> {
+    fn default_frame(
+        &self,
+        py: Python<'_>,
+        normalize: Option<bool>,
+        downsample: Option<i64>,
+    ) -> PyResult<PyEventFrame> {
         match &self.repr {
             Some(spec) => py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
                 .map_err(map_representation_error),
-            None => self.generate_polarity(py, Polarity::new(normalize.unwrap_or(true))),
+            None => self.generate_polarity(
+                py,
+                Polarity::new(normalize.unwrap_or(true)).with_downsample(downsample_factor(downsample)?),
+            ),
         }
     }
 
@@ -1076,14 +1086,18 @@ impl PyEventStream {
         py: Python<'_>,
         representation: &Bound<'_, PyAny>,
         normalize: Option<bool>,
+        downsample: Option<i64>,
     ) -> PyResult<PyEventFrame> {
         if representation.extract::<PyRef<'_, PyPolarity>>().is_ok() {
-            return self.generate_polarity(py, Polarity::new(normalize.unwrap_or(true)));
+            return self.generate_polarity(
+                py,
+                Polarity::new(normalize.unwrap_or(true)).with_downsample(downsample_factor(downsample)?),
+            );
         }
         // A representation *name* ("count", "flow", "voxel", …) renders that repr with its
         // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
         if let Ok(name) = representation.extract::<String>() {
-            let spec = ReprSpec::named_with_span(&name, normalize, self.span_ms)?;
+            let spec = ReprSpec::named_with_span_downsample(&name, normalize, self.span_ms, downsample)?;
             return py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
@@ -1788,7 +1802,7 @@ fn parse_dt(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None))]
+#[pyo3(signature = (path, *, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None, downsample=None))]
 #[allow(clippy::too_many_arguments)]
 fn open(
     py: Python<'_>,
@@ -1811,6 +1825,7 @@ fn open(
     hot_pixel_filter: bool,
     hot_pixel_std: f64,
     keys: Option<HashMap<String, String>>,
+    downsample: Option<i64>,
 ) -> PyResult<PyEventReader> {
     let mode = match (parse_dt(dt_s, dt_ms, dt_us, dt_ns)?, max_events) {
         (Some(_), Some(_)) => return Err(PyValueError::new_err(
@@ -1833,7 +1848,7 @@ fn open(
         _ => None,
     };
     let repr = repr
-        .map(|name| ReprSpec::named_with_span(name, None, span_ms))
+        .map(|name| ReprSpec::named_with_span_downsample(name, None, span_ms, downsample))
         .transpose()?;
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
@@ -2077,6 +2092,54 @@ fn fetch_window(
     .map_err(map_io_error)
 }
 
+/// A `downsample=` argument as a bin factor: unset is the sensor grid, anything below 1 is an error.
+fn downsample_factor(downsample: Option<i64>) -> PyResult<usize> {
+    match downsample {
+        None => Ok(1),
+        Some(factor) if factor >= 1 => Ok(factor as usize),
+        Some(_) => Err(PyValueError::new_err("downsample must be at least 1")),
+    }
+}
+
+/// The fused path for a reader that renders polarity frames: the window's events go straight from
+/// the decoder into a [`PolarityAccumulator`] (`SliceSource::slice_time_into`), so no `EventStream`
+/// is built, written and re-read per window. Applies only when nothing else has to see the events —
+/// no deferred slice ops, no hot-pixel mask — and to time windows; otherwise `None`, and the caller
+/// takes the general path. The result is bit-identical to `Polarity` on the fetched stream.
+fn fused_polarity_frame(
+    py: Python<'_>,
+    reader: &Arc<Mutex<Reader>>,
+    repr: &Option<ReprSpec>,
+    slice_ops: &SliceOps,
+    hot_pixel_mask: &Option<Arc<[bool]>>,
+    window: &SliceWindow,
+) -> Option<PyResult<EventFrame>> {
+    let (normalize, downsample) = match repr {
+        Some(ReprSpec::Polarity {
+            normalize,
+            downsample,
+        }) => (*normalize, *downsample),
+        _ => return None,
+    };
+    if !slice_ops.is_empty() || hot_pixel_mask.is_some() {
+        return None;
+    }
+    let SliceWindow::Time(t0, t1) = *window else {
+        return None;
+    };
+    let reader = Arc::clone(reader);
+    Some(py.detach(move || {
+        let guard = reader.lock().unwrap();
+        let (width, height) = guard.sensor_size();
+        let mut accumulator = PolarityAccumulator::new(width, height, downsample)
+            .map_err(map_representation_error)?;
+        guard
+            .slice_time_into(t0, t1, &mut accumulator)
+            .map_err(map_io_error)?;
+        Ok(accumulator.into_frame(normalize))
+    }))
+}
+
 /// Wraps a freshly fetched slice for a public slice API. When the reader carries a
 /// representation (`open(repr=…)` / `with_repr`) the slice is rendered eagerly and returned as
 /// an `EventFrame` (so `open(repr="mcts").slice(0)` == the frame `open().slice(0).mcts()`
@@ -2307,6 +2370,9 @@ impl PyEventReader {
     /// `[C, H, W]` array, so a `torch.utils.data.DataLoader` can collate the reader directly.
     fn __getitem__(&self, py: Python<'_>, index: i64) -> PyResult<Py<PyAny>> {
         let window = self.window_for_index(index)?;
+        if let Some(frame) = fused_polarity_frame(py, &self.inner, &self.repr, &self.slice_ops, &self.hot_pixel_mask, &window) {
+            return Ok(frame_into_numpy(py, frame?).unbind());
+        }
         let stream = self.fetch(py, window, self.slice_seed(index))?;
         match &self.repr {
             Some(spec) => {
@@ -2323,7 +2389,7 @@ impl PyEventReader {
     /// params take their method defaults; unset time spans follow the reader's `dt`). The
     /// dataset-mode counterpart of `open(repr=…)`, but with per-representation options:
     /// e.g. `reader.with_repr("voxel", bins=5)`.
-    #[pyo3(signature = (repr, *, bins=None, window_ms=None, window_s=None, window_us=None, window_ns=None, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None, windows_ms=None, windows_s=None, windows_us=None, windows_ns=None, window=None, normalize=None, pct=None, white_frame=None))]
+    #[pyo3(signature = (repr, *, bins=None, window_ms=None, window_s=None, window_us=None, window_ns=None, tau_ms=None, tau_s=None, tau_us=None, tau_ns=None, max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None, windows_ms=None, windows_s=None, windows_us=None, windows_ns=None, window=None, normalize=None, pct=None, white_frame=None, downsample=None))]
     #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
@@ -2349,6 +2415,7 @@ impl PyEventReader {
         normalize: Option<bool>,
         pct: Option<f64>,
         white_frame: Option<bool>,
+        downsample: Option<i64>,
     ) -> PyResult<PyEventReader> {
         let max_window_ms = resolve_ms(
             "max_window",
@@ -2383,6 +2450,7 @@ impl PyEventReader {
             normalize,
             pct,
             white_frame,
+            downsample,
         )?;
         Ok(PyEventReader {
             inner: Arc::clone(&self.inner),
@@ -2996,6 +3064,9 @@ impl PyEventReader {
         index: usize,
     ) -> PyResult<Py<PyAny>> {
         let span_ms = window_span_ms(&window);
+        if let Some(frame) = fused_polarity_frame(py, &self.inner, &self.repr, &self.slice_ops, &self.hot_pixel_mask, &window) {
+            return Ok(Bound::new(py, PyEventFrame { inner: frame? })?.into_any().unbind());
+        }
         let stream = fetch_window(
             py,
             &self.inner,
@@ -3287,6 +3358,9 @@ impl PyWindowIterator {
         let index = self.emitted;
         self.emitted += 1;
         let span_ms = window_span_ms(&window);
+        if let Some(frame) = fused_polarity_frame(py, &self.reader, &self.repr, &self.slice_ops, &self.hot_pixel_mask, &window) {
+            return Ok(Some(Bound::new(py, PyEventFrame { inner: frame? })?.into_any().unbind()));
+        }
         let stream = fetch_window(
             py,
             &self.reader,
@@ -4686,7 +4760,7 @@ fn stack_frames<'py>(
 enum ReprSpec {
     Binary,
     Count { normalize: bool },
-    Polarity { normalize: bool },
+    Polarity { normalize: bool, downsample: usize },
     Voxel { bins: usize, window_ms: f64 },
     TimeSurface { tau_ms: f64 },
     AveragedTimeSurface { tau_ms: f64 },
@@ -4711,7 +4785,13 @@ impl ReprSpec {
         normalize: Option<bool>,
         pct: Option<f64>,
         white_frame: Option<bool>,
+        downsample: Option<i64>,
     ) -> PyResult<Self> {
+        let downsample = match downsample {
+            Some(factor) if factor >= 1 => factor as usize,
+            Some(_) => return Err(PyValueError::new_err("downsample must be at least 1")),
+            None => 1,
+        };
         Ok(match name {
             "binary" => Self::Binary,
             "count" => Self::Count {
@@ -4719,6 +4799,7 @@ impl ReprSpec {
             },
             "polarity" => Self::Polarity {
                 normalize: normalize.unwrap_or(true),
+                downsample,
             },
             "voxel" => Self::Voxel {
                 bins: bins
@@ -4772,6 +4853,18 @@ impl ReprSpec {
         Self::named_with_span(name, normalize, None)
     }
 
+    /// [`ReprSpec::named_with_span`] plus the polarity `downsample` factor (ignored by the others).
+    fn named_with_span_downsample(
+        name: &str,
+        normalize: Option<bool>,
+        span_ms: Option<f64>,
+        downsample: Option<i64>,
+    ) -> PyResult<Self> {
+        Self::new(
+            name, None, span_ms, span_ms, span_ms, None, None, normalize, None, None, downsample,
+        )
+    }
+
     /// [`ReprSpec::named`], with unset time spans defaulting to `span_ms` — the slice window a
     /// reader or stream was fetched as — instead of the fixed 30 ms, mirroring `stream()`'s
     /// live-camera rule so the representation covers exactly the events it is handed.
@@ -4781,7 +4874,7 @@ impl ReprSpec {
         span_ms: Option<f64>,
     ) -> PyResult<Self> {
         Self::new(
-            name, None, span_ms, span_ms, span_ms, None, None, normalize, None, None,
+            name, None, span_ms, span_ms, span_ms, None, None, normalize, None, None, None,
         )
     }
 
@@ -4818,7 +4911,12 @@ impl ReprSpec {
         match self {
             Self::Binary => Binary.generate_on(stream, device),
             Self::Count { normalize } => EventCount::new(*normalize).generate_on(stream, device),
-            Self::Polarity { normalize } => Polarity::new(*normalize).generate_on(stream, device),
+            Self::Polarity {
+                normalize,
+                downsample,
+            } => Polarity::new(*normalize)
+                .with_downsample(*downsample)
+                .generate_on(stream, device),
             Self::Voxel { bins, window_ms } => {
                 VoxelGrid::new(*bins, *window_ms).generate_on(stream, device)
             }
@@ -6787,6 +6885,7 @@ fn stream(
                 normalize,
                 pct,
                 white_frame,
+                None,
             )?)
         }
     };

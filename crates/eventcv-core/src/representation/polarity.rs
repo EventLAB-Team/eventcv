@@ -2,20 +2,121 @@ use super::{
     event_index, frame_len, EventFrame, EventFrameData, Representation, RepresentationError,
     RepresentationKind,
 };
+use crate::io::EventConsumer;
 use crate::EventStream;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Polarity {
     normalize: bool,
+    downsample: usize,
+}
+
+impl Default for Polarity {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl Polarity {
     pub fn new(normalize: bool) -> Self {
-        Self { normalize }
+        Self {
+            normalize,
+            downsample: 1,
+        }
+    }
+
+    /// Bins `factor`×`factor` sensor pixels into one cell (`x / factor`, `y / factor`), so the
+    /// frame is `ceil(width / factor)` × `ceil(height / factor)`. The same integers as
+    /// `stream.resize(width / factor, height / factor)` followed by the full-resolution
+    /// histogram, without building the resized stream. `1` (the default) is the sensor grid.
+    pub fn with_downsample(mut self, factor: usize) -> Self {
+        self.downsample = factor.max(1);
+        self
     }
 
     pub fn is_normalized(&self) -> bool {
         self.normalize
+    }
+
+    pub fn downsample(&self) -> usize {
+        self.downsample
+    }
+}
+
+/// Per-pixel, per-polarity counts accumulated one event at a time — the [`EventConsumer`] behind
+/// [`Polarity`], so a lazy reader can feed it straight from its decoder
+/// (`SliceSource::slice_time_into`) instead of building an `EventStream` first.
+///
+/// Cells are `(x / factor, y / factor)` on a `ceil(width / factor)` × `ceil(height / factor)`
+/// grid; the positive plane comes first, matching [`Polarity`]'s frame layout exactly.
+#[derive(Clone, Debug)]
+pub struct PolarityAccumulator {
+    counts: Vec<u64>,
+    width: usize,
+    height: usize,
+    plane: usize,
+    factor: usize,
+    /// `Some(bits)` when `factor` is a power of two, so the division is a shift.
+    shift: Option<u32>,
+}
+
+impl PolarityAccumulator {
+    /// An empty accumulator for a `sensor_width` × `sensor_height` sensor binned by `factor`.
+    pub fn new(
+        sensor_width: usize,
+        sensor_height: usize,
+        factor: usize,
+    ) -> Result<Self, RepresentationError> {
+        let factor = factor.max(1);
+        let width = sensor_width.div_ceil(factor);
+        let height = sensor_height.div_ceil(factor);
+        let plane = width
+            .checked_mul(height)
+            .ok_or(RepresentationError::SizeOverflow)?;
+        let length = plane
+            .checked_mul(2)
+            .ok_or(RepresentationError::SizeOverflow)?;
+        Ok(Self {
+            counts: vec![0; length],
+            width,
+            height,
+            plane,
+            factor,
+            shift: factor.is_power_of_two().then(|| factor.trailing_zeros()),
+        })
+    }
+
+    /// Zeroes the counts so the buffer can take the next window.
+    pub fn reset(&mut self) {
+        self.counts.iter_mut().for_each(|count| *count = 0);
+    }
+
+    /// The accumulated frame, raw `u64` counts or `u8` rescaled to the busiest cell.
+    pub fn into_frame(self, normalize: bool) -> EventFrame {
+        EventFrame {
+            data: if normalize {
+                EventFrameData::U8(normalize_u8(self.counts))
+            } else {
+                EventFrameData::U64(self.counts)
+            },
+            channels: 2,
+            width: self.width,
+            height: self.height,
+            kind: RepresentationKind::Polarity,
+            channel_names: vec!["positive".to_owned(), "negative".to_owned()],
+        }
+    }
+}
+
+impl EventConsumer for PolarityAccumulator {
+    #[inline]
+    fn push(&mut self, x: u16, y: u16, _t: i64, p: bool) {
+        let (cx, cy) = match self.shift {
+            Some(shift) => (usize::from(x) >> shift, usize::from(y) >> shift),
+            None => (usize::from(x) / self.factor, usize::from(y) / self.factor),
+        };
+        let offset = if p { 0 } else { self.plane };
+        self.counts[offset + cy * self.width + cx] += 1;
     }
 }
 
@@ -31,6 +132,17 @@ impl Representation for Polarity {
         stream: &EventStream,
         device: crate::accel::Device,
     ) -> Result<EventFrame, RepresentationError> {
+        if self.downsample > 1 {
+            // Binned frames go through the accumulator (CPU): the same integers a resized
+            // stream would give, in one pass and without the resized stream.
+            let (width, height) = stream.sensor_size();
+            let mut accumulator = PolarityAccumulator::new(width, height, self.downsample)?;
+            for event in stream.iter() {
+                event_index(event, width, height)?;
+                accumulator.push(event.x as u16, event.y as u16, event.timestamp as i64, event.polarity);
+            }
+            return Ok(accumulator.into_frame(self.normalize));
+        }
         let (width, height, counts) = polarity_counts_on(stream, device)?;
         Ok(EventFrame {
             data: if self.normalize {
@@ -115,10 +227,44 @@ fn normalize_u8(counts: Vec<u64>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::PolarityAccumulator;
+    use crate::io::EventConsumer;
     use ndarray::array;
 
     use super::{Polarity, Representation};
     use crate::{representation::EventFrameData, EventStream};
+
+    #[test]
+    fn downsample_matches_resize_then_histogram() {
+        // 8x6 sensor, factor 2 -> 4x3; events on every pixel plus a pile-up, both polarities
+        let mut rows = Vec::new();
+        for y in 0..6u64 {
+            for x in 0..8u64 {
+                rows.push([x, y, x + 8 * y, (x + y) % 2]);
+            }
+        }
+        rows.extend([[7, 5, 100, 1], [7, 5, 101, 1], [6, 4, 102, 0]]);
+        let stream = EventStream::from_array2(
+            ndarray::Array2::from_shape_vec((rows.len(), 4), rows.concat()).unwrap(), 8, 6, 0.001,
+        );
+        let fused = Polarity::new(false).with_downsample(2).generate(&stream).unwrap();
+        let two_pass = Polarity::new(false).generate(&stream.resize(4, 3)).unwrap();
+        assert_eq!(fused.shape(), (2, 3, 4));
+        assert_eq!(fused.data(), two_pass.data());
+        // and the sink path gives the same frame as the stream path
+        let mut acc = PolarityAccumulator::new(8, 6, 2).unwrap();
+        for event in stream.iter() {
+            acc.push(event.x as u16, event.y as u16, event.timestamp as i64, event.polarity);
+        }
+        assert_eq!(acc.into_frame(false).data(), fused.data());
+        // non-integer ratio: 8x6 by 3 -> 3x2 (ceil), every event still lands in the frame
+        let odd = Polarity::new(false).with_downsample(3).generate(&stream).unwrap();
+        assert_eq!(odd.shape(), (2, 2, 3));
+        assert_eq!(
+            match odd.data() { EventFrameData::U64(v) => v.iter().sum::<u64>(), _ => 0 },
+            rows.len() as u64
+        );
+    }
 
     #[test]
     fn accumulates_and_normalizes_polarities() {

@@ -10,6 +10,7 @@ categories = ["computer-vision"]
 
 [dependencies]
 ndarray = "0.17"
+memmap2 = "0.9"
 npyz = { version = "0.9", features = ["derive", "npz"] }
 # Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
 # `small_rng` is the simulator's per-block noise generator: its parallel pixel loop needs one cheap,

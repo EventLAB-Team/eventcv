@@ -46,7 +46,7 @@ always wins. Count-based windows (`max_events`) have no fixed duration, so the 3
 stands there.
 
 The dtype column lists `uint64`/`uint8` for the two representations with a `normalize` option
-(`count` and `polarity`): raw `uint64` counts, or `uint8` rescaled so the busiest pixel maps to
+(`count` and `polarity`): raw `uint64` counts, or `uint8` rescaled so the busiest pixel maps to `downsample=k` bins `k`×`k` sensor pixels into one cell (`x // k`, `y // k`) as it counts — the same integers as `stream.resize(width // k, height // k)` followed by the histogram, in one pass; on a reader (`open(..., repr="polarity", downsample=k)` or `with_repr("polarity", downsample=k)`) the RAW decoder feeds the accumulator directly, so no event stream is built per window.
 255 when `normalize=True`. The default differs by representation: `polarity` normalizes by
 default (`True`), while `count` returns raw counts by default (`False`) so the frame preserves
 exact event totals. The rest have no normalization option. `view` always auto-contrasts for

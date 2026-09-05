@@ -1701,6 +1701,7 @@ dependencies = [
  "hiroz-msgs",
  "libloading 0.9.0",
  "lz4",
+ "memmap2",
  "ndarray",
  "neuromorphic-drivers",
  "npyz",

@@ -19,7 +19,7 @@ pub use count::EventCount;
 pub use countmask::CountMask;
 pub use mcts::Mcts;
 pub use point_set::{EventPointSet, PointSet};
-pub use polarity::Polarity;
+pub use polarity::{Polarity, PolarityAccumulator};
 pub use tencode::Tencode;
 pub use time_surface::TimeSurface;
 pub use voxel::VoxelGrid;

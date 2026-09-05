@@ -380,6 +380,26 @@ fn load_format(path: &Path, options: &LoadOptions) -> Result<EventStream, IoErro
 /// Random-access view over a file's events: fetch an arbitrary time or count range
 /// without materialising the whole stream. This backs the lazy [`open`] handle — the
 /// OpenCV `VideoCapture` to [`load`]'s `imread`. Each call returns a new [`EventStream`].
+/// Receives decoded events one at a time — the alternative to materialising an [`EventStream`]
+/// when the caller only wants an accumulation of the events (a histogram, a count image, …).
+///
+/// A representation that implements this can be fed straight from a lazy source's decoder
+/// (see [`SliceSource::slice_time_into`]): no four-column stream is built, written and re-read
+/// per window, which for the file readers was the larger half of the cost of a dense frame.
+pub trait EventConsumer {
+    /// One event: the sensor coordinates, the timestamp in the source's own unit (µs for the
+    /// readers here) and the polarity (`true` = positive/ON). Coordinates are inside the
+    /// source's sensor; a sink need not test them again.
+    fn push(&mut self, x: u16, y: u16, t: i64, p: bool);
+}
+
+impl EventConsumer for EventStreamBuilder {
+    #[inline]
+    fn push(&mut self, x: u16, y: u16, t: i64, p: bool) {
+        self.push_in_bounds(x, y, t, p);
+    }
+}
+
 pub trait SliceSource: Send {
     fn sensor_size(&self) -> (usize, usize);
     fn timestamp_scale_ms(&self) -> f64;
@@ -391,6 +411,20 @@ pub trait SliceSource: Send {
     fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError>;
     /// Events whose timestamp (µs) lies in the half-open window `[t0, t1)`.
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError>;
+
+    /// Streams the events of `[t0, t1)` into `sink`, in decode order, without keeping them.
+    ///
+    /// The default fetches the slice and replays it, so every source supports it; a source that
+    /// decodes lazily overrides it to hand each event to the sink as it comes off the decoder
+    /// (the RAW reader does), which is what makes `open(raw, repr="polarity")` a single pass.
+    fn slice_time_into(&self, t0: i64, t1: i64, sink: &mut dyn EventConsumer) -> Result<(), IoError> {
+        let stream = self.slice_time(t0, t1)?;
+        let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
+        for index in 0..stream.len() {
+            sink.push(xs[index], ys[index], ts[index], ps[index]);
+        }
+        Ok(())
+    }
 
     /// The intensity (APS) frames a DAVIS recorded alongside its events, those whose timestamp
     /// lies in the half-open window `[t0, t1)` (µs), paired with that timestamp.
