@@ -1917,7 +1917,7 @@ fn build_pdf(content: Vec<u8>, image: &Rgb8Image) -> Vec<u8> {
     .into_bytes();
     image_object.extend_from_slice(&image.pixels);
     image_object.extend_from_slice(b"\nendstream");
-    let objects = vec![
+    let objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         format!(
