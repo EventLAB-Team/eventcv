@@ -17,7 +17,7 @@
 
 use std::cell::Cell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::path::Path;
 
 use memmap2::{Mmap, MmapMut};
@@ -43,9 +43,6 @@ const CHECKPOINT_TARGET: u64 = 200_000;
 fn checkpoint_interval(bytes: u64) -> u64 {
     (bytes / CHECKPOINT_TARGET).clamp(CHECKPOINT_MIN_BYTES, CHECKPOINT_MAX_BYTES)
 }
-/// Read granularity for the eager reader, which never looks back.
-const EAGER_CHUNK_BYTES: u64 = 1 << 20;
-
 /// EVT2 splits a timestamp into a 28-bit high half (its own word) and a 6-bit low half carried by
 /// each CD event, so the high half is stored pre-shifted and the wrap period is `1 << 34` µs — about
 /// 4.9 hours. Long enough that no realistic recording reaches it, handled anyway because a silently
@@ -90,6 +87,18 @@ impl Codec {
         }
     }
 
+    /// How many events a word is likely to carry, as a fraction, for sizing columns before a
+    /// decode. EVT2 is at most one event per 32-bit word. EVT3 vectorises, so a word can emit
+    /// twelve, but a real recording spends enough words on `TIME_LOW` and `EVT_ADDR_Y` to run
+    /// under one event per 16-bit word — three quarters is a close over-estimate where assuming
+    /// one would over-allocate by half. An under-estimate only costs the doublings it saved.
+    fn events_per_word(self) -> (usize, usize) {
+        match self {
+            Self::Evt2(_) => (1, 1),
+            Self::Evt3(_) => (3, 4),
+        }
+    }
+
     fn decode(&mut self, bytes: &[u8], emit: impl FnMut(RawEvent)) {
         match self {
             Self::Evt2(decoder) => decoder.decode(
@@ -99,7 +108,6 @@ impl Codec {
             Self::Evt3(decoder) => decoder.decode(u16::from_le_bytes([bytes[0], bytes[1]]), emit),
         }
     }
-
 }
 
 /// EVT2: one 32-bit word per event, with a shared timestamp high half.
@@ -202,30 +210,12 @@ impl Decoder {
             }
             0x4 => {
                 // VECT_12
-                for bit in 0..12 {
-                    if payload & (1 << bit) != 0 {
-                        emit(RawEvent {
-                            x: self.base_x.saturating_add(bit),
-                            y: self.y,
-                            t: self.time,
-                            p: self.polarity,
-                        });
-                    }
-                }
+                self.emit_vector(payload, emit);
                 self.base_x = self.base_x.saturating_add(12);
             }
             0x5 => {
                 // VECT_8
-                for bit in 0..8 {
-                    if payload & (1 << bit) != 0 {
-                        emit(RawEvent {
-                            x: self.base_x.saturating_add(bit),
-                            y: self.y,
-                            t: self.time,
-                            p: self.polarity,
-                        });
-                    }
-                }
+                self.emit_vector(payload & 0x00ff, emit);
                 self.base_x = self.base_x.saturating_add(8);
             }
             0x6 => self.time = self.time_base + i64::from(payload), // EVT_TIME_LOW
@@ -243,6 +233,26 @@ impl Decoder {
             }
             // EXT_TRIGGER, OTHERS, CONTINUED and reserved packet types do not emit CD events.
             _ => {}
+        }
+    }
+
+    /// Expands a vector word's bitmask from `base_x`, one event per set bit, low bit first.
+    ///
+    /// Walking the set bits with `trailing_zeros` costs one iteration per event rather than one
+    /// per bit position: a word carrying two events takes two turns instead of twelve. A real
+    /// recording runs well under one event per word, so most masks are sparse and the fixed loop
+    /// spent most of itself confirming zeros. `mask & (mask - 1)` clears the bit just handled.
+    #[inline]
+    fn emit_vector(&self, mut mask: u16, mut emit: impl FnMut(RawEvent)) {
+        while mask != 0 {
+            let bit = mask.trailing_zeros() as u16;
+            emit(RawEvent {
+                x: self.base_x.saturating_add(bit),
+                y: self.y,
+                t: self.time,
+                p: self.polarity,
+            });
+            mask &= mask - 1;
         }
     }
 }
@@ -356,6 +366,79 @@ pub struct RawSliceSource {
     checkpoints: Vec<Checkpoint>,
     n_events: usize,
     time_span: (i64, i64),
+}
+
+/// Four output columns written through a cursor instead of four `Vec::push` calls.
+///
+/// `Vec::push` checks capacity, may branch to a reallocation that cannot be inlined away, and
+/// updates a length — four of each per event, on four independent allocations. Sizing the columns
+/// up front and indexing into them leaves one capacity test and four stores. `vec![0; n]` comes
+/// from the allocator as untouched zero pages, so the allocation itself costs nothing until an
+/// event is written to it.
+///
+/// This is worth a struct because it is where the time went: on a 116 Mev EVT3 recording the
+/// column writes were 1.07 s of a 2.12 s read, against 1.04 s to decode every word of the file.
+struct RawColumns {
+    xs: Vec<u16>,
+    ys: Vec<u16>,
+    ts: Vec<i64>,
+    ps: Vec<bool>,
+    len: usize,
+    cap: usize,
+}
+
+impl RawColumns {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            xs: vec![0; capacity],
+            ys: vec![0; capacity],
+            ts: vec![0; capacity],
+            ps: vec![false; capacity],
+            len: 0,
+            cap: capacity,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, x: u16, y: u16, timestamp: i64, polarity: bool) {
+        if self.len == self.cap {
+            self.grow();
+        }
+        let index = self.len;
+        self.xs[index] = x;
+        self.ys[index] = y;
+        self.ts[index] = timestamp;
+        self.ps[index] = polarity;
+        self.len = index + 1;
+    }
+
+    /// Only reached when the word-count estimate was low — a densely vectorised recording. Marked
+    /// cold so the growth branch stays out of the hot loop's way.
+    #[cold]
+    fn grow(&mut self) {
+        let next = self.cap.saturating_mul(2).max(1 << 16);
+        self.xs.resize(next, 0);
+        self.ys.resize(next, 0);
+        self.ts.resize(next, 0);
+        self.ps.resize(next, false);
+        self.cap = next;
+    }
+
+    fn into_builder(mut self, width: usize, height: usize) -> EventStreamBuilder {
+        self.xs.truncate(self.len);
+        self.ys.truncate(self.len);
+        self.ts.truncate(self.len);
+        self.ps.truncate(self.len);
+        EventStreamBuilder::from_columns(
+            width,
+            height,
+            TIMESTAMP_SCALE_MS,
+            self.xs,
+            self.ys,
+            self.ts,
+            self.ps,
+        )
+    }
 }
 
 /// Decodes every whole word of `bytes` through `codec`, handing each event to `emit`.
@@ -658,64 +741,91 @@ pub fn open_raw_slice(
     RawSliceSource::open(path.as_ref(), options)
 }
 
-/// Eagerly reads a Prophesee EVT3 RAW file. Prefer [`open_raw_slice`] for large recordings.
+/// Eagerly reads a Prophesee EVT2 or EVT3 RAW file. Prefer [`open_raw_slice`] for large recordings.
 ///
-/// With a declared geometry --- which every recorder that writes a `% geometry` line gives us ---
-/// nothing in the result depends on the checkpoint index, so the file is decoded once, straight
-/// into the stream. Only a header without a geometry needs the index pass first: the sensor size
-/// is then derived from the events, and that cannot be known until they have all been seen.
+/// One pass over the mapped file, whatever the header says. A declared `% geometry` bounds the
+/// events as they arrive; without one the size is derived from the largest coordinate seen and
+/// applied at the end, which needs no second pass because nothing before `build` consults it.
+/// (It used to: a header with no geometry fell through to the checkpoint index and then decoded
+/// the file a second time to materialise it, which on a 116 Mev recording was the single largest
+/// cost in the reader.)
+///
+/// The word loop is [`decode_bytes`], the same one the slice methods use, so the codec is matched
+/// once rather than per word and the body is read straight out of the map instead of through a
+/// `BufReader` into a staging chunk.
 pub fn read_raw(path: impl AsRef<Path>, options: &LoadOptions) -> Result<EventStream, IoError> {
     let path = path.as_ref();
     let mut reader = BufReader::new(File::open(path)?);
     let header = parse_header(&mut reader, options.sensor_size)?;
-    let Some((width, height)) = header.sensor_size else {
-        let source = open_raw_slice(path, options)?;
-        let limit = options.max_events.unwrap_or(source.n_events());
-        return source.slice_index(0, limit);
+    let file = reader.into_inner();
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+    // An empty file cannot be mapped; an anonymous page stands in, as in `RawSliceSource::open`.
+    let data = if len == 0 {
+        MmapMut::map_anon(1)?.make_read_only()?
+    } else {
+        // SAFETY: the map is read-only and the file is a recording that nothing here writes to;
+        // a concurrent truncation would at worst fault a read, which is the documented risk of
+        // mapping any file.
+        unsafe { Mmap::map(&file)? }
     };
+    let data_offset = (header.data_offset as usize).min(len);
+    let body = &data[data_offset..len];
 
     let limit = options.max_events.unwrap_or(usize::MAX);
     let mut codec = Codec::new(header.encoding);
-    let word_size = codec.word_size();
-    let mut builder = EventStreamBuilder::new(width, height, TIMESTAMP_SCALE_MS);
-    let mut count = 0usize;
-    let total_bytes = reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
-    let mut bytes_read = 0u64;
-    let mut reserved = false;
-    let mut chunk = Vec::with_capacity(EAGER_CHUNK_BYTES as usize);
-    'chunks: loop {
-        chunk.clear();
-        (&mut reader).take(EAGER_CHUNK_BYTES).read_to_end(&mut chunk)?;
-        if chunk.len() < word_size {
-            break;
+    // Size the columns once from the word count rather than doubling four of them up to a hundred
+    // million entries.
+    let (per_word, over) = codec.events_per_word();
+    let capacity = (body.len() / codec.word_size()).saturating_mul(per_word) / over;
+    let mut columns = RawColumns::with_capacity(capacity.min(limit));
+    // `emit` counts and `stop` reads the count, and a plain counter cannot be borrowed by both
+    // closures at once — the same reason `slice_index` threads its index through a `Cell`.
+    let count = Cell::new(0usize);
+
+    let (width, height) = match header.sensor_size {
+        // A declared sensor: events outside it are dropped, exactly as the indexed path drops them.
+        Some((width, height)) => {
+            decode_bytes(
+                &mut codec,
+                body,
+                |event| {
+                    if count.get() < limit
+                        && usize::from(event.x) < width
+                        && usize::from(event.y) < height
+                    {
+                        columns.push(event.x, event.y, event.t, event.p);
+                        count.set(count.get() + 1);
+                    }
+                },
+                |_, _| count.get() >= limit,
+            );
+            (width, height)
         }
-        bytes_read += chunk.len() as u64;
-        for bytes in chunk.chunks_exact(word_size) {
-            codec.decode(bytes, |event| {
-                if count < limit
-                    && usize::from(event.x) < width
-                    && usize::from(event.y) < height
-                {
-                    builder.push_in_bounds(event.x, event.y, event.t, event.p);
-                    count += 1;
-                }
-            });
-            if count >= limit {
-                break 'chunks;
+        // No declared sensor: keep everything and take the bound from the events, which is a tight
+        // bound on what actually fired rather than a guess at the physical sensor.
+        None => {
+            let extent = Cell::new((0u16, 0u16));
+            decode_bytes(
+                &mut codec,
+                body,
+                |event| {
+                    if count.get() < limit {
+                        let (x, y) = extent.get();
+                        extent.set((x.max(event.x), y.max(event.y)));
+                        columns.push(event.x, event.y, event.t, event.p);
+                        count.set(count.get() + 1);
+                    }
+                },
+                |_, _| count.get() >= limit,
+            );
+            if count.get() == 0 {
+                return Err(IoError::InvalidSensorSize);
             }
+            let (x, y) = extent.get();
+            (usize::from(x) + 1, usize::from(y) + 1)
         }
-        // One reservation, sized from the density the first chunk showed, rather than twenty
-        // doublings of a column that ends up holding millions of events. A vectorised EVT3 stream
-        // emits anywhere from a fraction of an event per word to twelve of them, so the file size
-        // alone gives no useful bound; its own first megabyte does.
-        if !reserved && total_bytes > bytes_read {
-            let projected =
-                (count as u128 * u128::from(total_bytes) / u128::from(bytes_read)) as usize;
-            builder.reserve(projected.saturating_sub(count).min(limit));
-            reserved = true;
-        }
-    }
-    Ok(builder.build())
+    };
+    Ok(columns.into_builder(width, height).build())
 }
 
 /// Which of the two `.raw` encodings [`RawEventSink`] writes.
@@ -965,14 +1075,18 @@ mod tests {
     }
 
     fn raw(words: &[[u8; 2]]) -> PathBuf {
+        raw_with_header("% format EVT3\n% geometry 1280x720\n", words)
+    }
+
+    fn raw_with_header(header: &str, words: &[[u8; 2]]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "eventcv_evt3_{}_{}.raw",
+            "eventcv_evt3_{}_{}_{}.raw",
             std::process::id(),
+            header.len(),
             words.len()
         ));
         let mut file = File::create(&path).unwrap();
-        file.write_all(b"% format EVT3\n% geometry 1280x720\n")
-            .unwrap();
+        file.write_all(header.as_bytes()).unwrap();
         for bytes in words {
             file.write_all(bytes).unwrap();
         }
@@ -1003,6 +1117,84 @@ mod tests {
         assert_eq!(all.ts(), &[4106, 4106, 4106, 4106, 4116]);
         assert_eq!(source.slice_index(1, 3).unwrap().xs(), &[40, 42]);
         assert_eq!(source.slice_time(4110, 4120).unwrap().xs(), &[31]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn vect_8_expands_its_bitmask_and_advances_the_base() {
+        // VECT_8 (kind 0x5) is the only CD word type the suite never covered. It expands the low
+        // eight bits of its payload from `base_x` and then advances the base by eight, so two in a
+        // row must not overlap.
+        let path = raw(&[
+            word(0x8, 1),
+            word(0x6, 10),
+            word(0x0, 20),
+            word(0x3, 100),
+            word(0x5, 0b1010_0001),
+            word(0x5, 0b0000_0001),
+        ]);
+        let source = open_raw_slice(&path, &LoadOptions::default()).unwrap();
+        let all = source.slice_index(0, source.n_events()).unwrap();
+        assert_eq!(all.xs(), &[100, 105, 107, 108], "bits 0,5,7 then base + 8");
+        assert_eq!(all.ys(), &[20, 20, 20, 20]);
+        assert_eq!(all.ps(), &[false, false, false, false]);
+        assert_eq!(all.ts(), &[4106, 4106, 4106, 4106]);
+
+        // The eager reader has to agree with the indexed one, word type by word type.
+        let eager = read_raw(&path, &LoadOptions::default()).unwrap();
+        assert_eq!(eager.xs(), all.xs());
+        assert_eq!(eager.ts(), all.ts());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn eager_and_indexed_agree_without_a_geometry_header() {
+        // A header with no `% geometry` makes the sensor size come from the events. Both readers
+        // have to derive the same bound and keep every event, whichever way they get there.
+        let path = raw_with_header(
+            "% format EVT3\n",
+            &[
+                word(0x8, 1),
+                word(0x6, 10),
+                word(0x0, 20),
+                word(0x2, 30 | 0x0800),
+                word(0x3, 40),
+                word(0x4, 0b1000_0000_0101),
+                word(0x6, 20),
+                word(0x2, 31),
+            ],
+        );
+        let options = LoadOptions::default();
+        let source = open_raw_slice(&path, &options).unwrap();
+        let indexed = source.slice_index(0, source.n_events()).unwrap();
+        let eager = read_raw(&path, &options).unwrap();
+
+        assert_eq!(
+            eager.sensor_size(),
+            (52, 21),
+            "one past the largest coordinate seen"
+        );
+        assert_eq!(eager.sensor_size(), indexed.sensor_size());
+        assert_eq!(eager.len(), indexed.len(), "no event may be dropped");
+        assert_eq!(eager.xs(), indexed.xs());
+        assert_eq!(eager.ys(), indexed.ys());
+        assert_eq!(eager.ts(), indexed.ts());
+        assert_eq!(eager.ps(), indexed.ps());
+
+        // `max_events` still truncates, and an explicit size still wins over the derivation.
+        let capped = LoadOptions {
+            max_events: Some(2),
+            ..LoadOptions::default()
+        };
+        assert_eq!(read_raw(&path, &capped).unwrap().len(), 2);
+        let declared = LoadOptions {
+            sensor_size: Some((640, 480)),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            read_raw(&path, &declared).unwrap().sensor_size(),
+            (640, 480)
+        );
         std::fs::remove_file(path).ok();
     }
 

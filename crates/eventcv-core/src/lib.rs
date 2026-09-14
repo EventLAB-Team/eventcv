@@ -272,6 +272,38 @@ impl EventStreamBuilder {
         self.ps.extend_from_slice(ps);
     }
 
+    /// Takes ownership of columns a reader has already filled, rather than copying them in.
+    ///
+    /// The counterpart to [`extend_from_columns`](Self::extend_from_columns) for a reader that
+    /// decodes straight into its final buffers: AEDAT 4 knows every packet's output range before
+    /// it decompresses anything, so its workers fill disjoint slices of these vectors and there is
+    /// nothing left to append. The four must share a length and every coordinate must already lie
+    /// on the sensor — the caller has made both guarantees, and re-checking here would mean
+    /// walking every event again to learn nothing.
+    pub(crate) fn from_columns(
+        width: usize,
+        height: usize,
+        timestamp_scale_ms: f64,
+        xs: Vec<u16>,
+        ys: Vec<u16>,
+        ts: Vec<i64>,
+        ps: Vec<bool>,
+    ) -> Self {
+        debug_assert!(
+            xs.len() == ys.len() && xs.len() == ts.len() && xs.len() == ps.len(),
+            "columns must share a length"
+        );
+        Self {
+            xs,
+            ys,
+            ts,
+            ps,
+            width,
+            height,
+            timestamp_scale_ms,
+        }
+    }
+
     /// Reserves room for `additional` more events across every column.
     pub fn reserve(&mut self, additional: usize) {
         self.xs.reserve(additional);

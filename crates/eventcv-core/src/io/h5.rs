@@ -174,7 +174,17 @@ fn read_range(
     height: usize,
     time_unit: TimeUnit,
 ) -> Result<EventStream, IoError> {
-    let mut builder = EventStreamBuilder::with_capacity(width, height, 0.001, range.len());
+    // The range length is known, so the columns are sized once and written through a cursor.
+    // `EventStreamBuilder::push` would re-test the sensor bounds this loop already tests and pay
+    // four capacity checks and four length updates an event; on a 184 Mev recording that is most
+    // of the read. `vec![0; n]` arrives as untouched zero pages, so it costs nothing until written.
+    let total = range.len();
+    let mut out_xs = vec![0u16; total];
+    let mut out_ys = vec![0u16; total];
+    let mut out_ts = vec![0i64; total];
+    let mut out_ps = vec![false; total];
+    let mut kept = 0usize;
+
     let mut start = range.start;
     while start < range.end {
         let end = (start + BLOCK).min(range.end);
@@ -183,16 +193,27 @@ fn read_range(
         let ts = columns.read_ints(T, start..end)?;
         let ps = columns.read_polarity(start..end)?;
         for index in 0..(end - start) {
-            builder.push(
-                xs[index] as u16,
-                ys[index] as u16,
-                time_unit.microseconds_from_int(ts[index]),
-                ps[index],
-            );
+            let (x, y) = (xs[index] as u16, ys[index] as u16);
+            // The same test `push` makes, kept here so an off-sensor event is still dropped.
+            if usize::from(x) < width && usize::from(y) < height {
+                out_xs[kept] = x;
+                out_ys[kept] = y;
+                out_ts[kept] = time_unit.microseconds_from_int(ts[index]);
+                out_ps[kept] = ps[index];
+                kept += 1;
+            }
         }
         start = end;
     }
-    Ok(builder.build())
+
+    out_xs.truncate(kept);
+    out_ys.truncate(kept);
+    out_ts.truncate(kept);
+    out_ps.truncate(kept);
+    Ok(
+        EventStreamBuilder::from_columns(width, height, 0.001, out_xs, out_ys, out_ts, out_ps)
+            .build(),
+    )
 }
 
 /// A [`SliceSource`] that reads time/count ranges straight from the original HDF5

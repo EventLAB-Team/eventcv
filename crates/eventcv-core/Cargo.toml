@@ -36,6 +36,11 @@ png = "0.17"
 # `.aedat4` whose compression this build could not decode would be a file eventcv claims to read
 # and then does not.
 lz4 = "1.28"
+# The frame API directly, for reading. `lz4::Decoder` is a `Read` adapter that allocates its own
+# decompression context and a 32 KiB staging buffer per instance, and copies the compressed bytes
+# through that buffer — a per-packet cost, and a recording is thousands of packets. `lz4-sys` is the
+# binding `lz4` itself is built on, so this links no second copy of anything.
+lz4-sys = "1.11"
 zstd = { version = "0.13", default-features = false }
 # Pure-Rust GIF encoder for animated export. Same no-system-deps story as `png`; `color_quant`
 # (pulled in by default) builds the 256-colour palette each frame needs. MP4 deliberately has no
