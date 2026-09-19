@@ -3,6 +3,7 @@
 //! owns widgets and the GPU surface.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -853,6 +854,7 @@ struct Model {
     processed_stats: WindowStats,
     error: Option<String>,
     image: Option<Rgb8Image>,
+    snapshot: Option<Rgb8Image>,
     texture: Option<TextureHandle>,
     image_size: [usize; 2],
 }
@@ -882,6 +884,7 @@ impl Model {
             processed_stats: WindowStats::default(),
             error: None,
             image: None,
+            snapshot: None,
             texture: None,
             image_size: [0, 0],
         }
@@ -954,6 +957,26 @@ impl Model {
         }
     }
 
+    fn save_pdf(&mut self) {
+        let name = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| Path::new(&metadata.name).file_stem())
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("eventcv-snapshot");
+        let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(format!("{name}.pdf"))
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("pdf");
+        }
+        self.error = write_pdf_snapshot(&path, self).err();
+    }
+
     fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.results.try_recv() {
@@ -966,6 +989,7 @@ impl Model {
                     self.cursor_us = 0;
                     self.history.clear();
                     self.image = None;
+                    self.snapshot = None;
                     self.texture = None;
                     self.loading = false;
                     self.pending = false;
@@ -987,6 +1011,7 @@ impl Model {
                         self.raw_stats = frame.raw;
                         self.processed_stats = frame.processed;
                         self.image_size = [image.width, image.height];
+                        self.snapshot = Some(image.clone());
                         self.image = Some(image);
                         self.push_history(frame.raw.rate, frame.processed.rate);
                         changed = true;
@@ -1130,6 +1155,13 @@ impl Model {
                     .clicked()
                 {
                     self.choose_file();
+                }
+                if ui
+                    .add_enabled(self.snapshot.is_some(), egui::Button::new("Save PDF…"))
+                    .on_hover_text("Save a vector GUI snapshot with an embedded event image")
+                    .clicked()
+                {
+                    self.save_pdf();
                 }
                 if let Some(metadata) = &self.metadata {
                     ui.label(&metadata.name);
@@ -1582,6 +1614,345 @@ fn rate_plot(ui: &mut egui::Ui, history: &VecDeque<RateSample>) {
         egui::FontId::proportional(11.0),
         Color32::LIGHT_GRAY,
     );
+}
+
+const PDF_WIDTH: f32 = 1_100.0;
+const PDF_HEIGHT: f32 = 720.0;
+const PDF_TEXT: [u8; 3] = [226, 228, 233];
+const PDF_MUTED: [u8; 3] = [180, 184, 194];
+
+fn write_pdf_snapshot(path: &Path, model: &Model) -> Result<(), String> {
+    let image = model
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| "wait for a frame before saving a PDF".to_owned())?;
+    std::fs::write(path, pdf_snapshot(model, image)).map_err(|error| error.to_string())
+}
+
+fn pdf_snapshot(model: &Model, image: &Rgb8Image) -> Vec<u8> {
+    let mut page = PdfPage::new();
+    page.rect([0.0, 0.0, PDF_WIDTH, PDF_HEIGHT], [6, 8, 13]);
+    page.rect([0.0, 0.0, PDF_WIDTH, 38.0], [35, 38, 46]);
+    page.rect([800.0, 38.0, 300.0, 594.0], [27, 29, 36]);
+    page.rect([0.0, 632.0, PDF_WIDTH, 88.0], [35, 38, 46]);
+    page.line([800.0, 38.0], [800.0, 632.0], [65, 68, 78], 1.0);
+    page.line([0.0, 632.0], [PDF_WIDTH, 632.0], [65, 68, 78], 1.0);
+    page.button([8.0, 7.0, 62.0, 24.0], "Open...");
+    page.button([78.0, 7.0, 82.0, 24.0], "Save PDF...");
+    let source_name = model
+        .metadata
+        .as_ref()
+        .map_or("No recording open", |metadata| metadata.name.as_str());
+    page.text([170.0, 11.0], 11.0, false, source_name, PDF_TEXT);
+
+    let scale = (752.0 / image.width.max(1) as f32).min(546.0 / image.height.max(1) as f32);
+    let image_width = image.width as f32 * scale;
+    let image_height = image.height as f32 * scale;
+    let image_x = (800.0 - image_width) / 2.0;
+    let image_top = 38.0 + (594.0 - image_height) / 2.0;
+    writeln!(
+        page.0,
+        "q {image_width:.3} 0 0 {image_height:.3} {image_x:.3} {:.3} cm /Im0 Do Q",
+        PDF_HEIGHT - image_top - image_height
+    )
+    .unwrap();
+
+    page.section(52.0, "Source");
+    if let Some(metadata) = &model.metadata {
+        page.rows(
+            78.0,
+            &[
+                (
+                    "Sensor",
+                    format!("{} x {}", metadata.width, metadata.height),
+                ),
+                ("Events", format_count(metadata.n_events as u64)),
+                ("Duration", format_time(metadata.duration_us())),
+                ("Mean rate", format_rate(metadata.mean_rate())),
+            ],
+        );
+    }
+
+    page.rule(158.0);
+    page.section(169.0, "Display");
+    page.rows(
+        195.0,
+        &[
+            (
+                "Accumulation",
+                format!("{} ms", format_number(model.dt_us as f64 / 1_000.0)),
+            ),
+            ("Refresh", format!("{} Hz", format_number(model.refresh_hz))),
+        ],
+    );
+    page.rule(244.0);
+    page.section(255.0, "Current window");
+    let retained = if model.raw_stats.total == 0 {
+        100.0
+    } else {
+        model.processed_stats.total as f64 / model.raw_stats.total as f64 * 100.0
+    };
+    page.rows(
+        281.0,
+        &[
+            ("Raw events", format_count(model.raw_stats.total)),
+            ("Raw rate", format_rate(model.raw_stats.rate)),
+            ("Output events", format_count(model.processed_stats.total)),
+            ("Processed", format_rate(model.processed_stats.rate)),
+            (
+                "Raw ON / OFF",
+                format!(
+                    "{} / {}",
+                    format_count(model.raw_stats.positive),
+                    format_count(model.raw_stats.negative)
+                ),
+            ),
+            (
+                "Output ON / OFF",
+                format!(
+                    "{} / {}",
+                    format_count(model.processed_stats.positive),
+                    format_count(model.processed_stats.negative)
+                ),
+            ),
+            ("Retained", format!("{retained:.1}%")),
+        ],
+    );
+    page.rate_plot(&model.history, [814.0, 407.0, 272.0, 82.0]);
+
+    page.rule(500.0);
+    page.section(511.0, "Processing");
+    if model.processors.is_empty() {
+        page.text([814.0, 537.0], 10.0, false, "No processors", PDF_MUTED);
+    } else {
+        for (index, processor) in model.processors.iter().take(3).enumerate() {
+            let mark = if processor.enabled { "[x]" } else { "[ ]" };
+            page.text(
+                [814.0, 537.0 + index as f32 * 18.0],
+                10.0,
+                false,
+                &format!("{mark} {}  {} us", processor.name(), processor.dt_us),
+                PDF_TEXT,
+            );
+        }
+    }
+    page.button([814.0, 598.0, 96.0, 23.0], "Add processor");
+
+    let live = model
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.live);
+    page.button([12.0, 644.0, 68.0, 24.0], "Previous");
+    page.button(
+        [88.0, 644.0, 52.0, 24.0],
+        if model.playing { "Pause" } else { "Play" },
+    );
+    page.button([148.0, 644.0, 52.0, 24.0], "Next");
+    if live {
+        page.text([214.0, 650.0], 11.0, true, "LIVE", [255, 110, 110]);
+    } else {
+        page.text(
+            [216.0, 650.0],
+            10.0,
+            false,
+            if model.loop_ { "[x] Loop" } else { "[ ] Loop" },
+            PDF_TEXT,
+        );
+        page.button(
+            [280.0, 644.0, 62.0, 24.0],
+            &format!("{}x", format_number(model.speed)),
+        );
+        let maximum = model.max_cursor_us();
+        let position = model.cursor_us as f32 / maximum.max(1) as f32;
+        page.slider([12.0, 687.0], 860.0, position);
+        page.text(
+            [885.0, 681.0],
+            10.0,
+            false,
+            &format!(
+                "{} / {}",
+                format_time(model.cursor_us),
+                format_time(model.metadata.as_ref().map_or(0, Metadata::duration_us))
+            ),
+            PDF_TEXT,
+        );
+    }
+
+    build_pdf(page.0.into_bytes(), image)
+}
+
+struct PdfPage(String);
+
+impl PdfPage {
+    fn new() -> Self {
+        Self(String::new())
+    }
+
+    fn rect(&mut self, [x, top, width, height]: [f32; 4], rgb: [u8; 3]) {
+        let [r, g, b] = rgb.map(|value| value as f32 / 255.0);
+        writeln!(
+            self.0,
+            "{r:.3} {g:.3} {b:.3} rg {x:.3} {:.3} {width:.3} {height:.3} re f",
+            PDF_HEIGHT - top - height
+        )
+        .unwrap();
+    }
+
+    fn line(&mut self, [x1, y1]: [f32; 2], [x2, y2]: [f32; 2], rgb: [u8; 3], width: f32) {
+        let [r, g, b] = rgb.map(|value| value as f32 / 255.0);
+        writeln!(
+            self.0,
+            "{r:.3} {g:.3} {b:.3} RG {width:.3} w {x1:.3} {:.3} m {x2:.3} {:.3} l S",
+            PDF_HEIGHT - y1,
+            PDF_HEIGHT - y2
+        )
+        .unwrap();
+    }
+
+    fn text(&mut self, [x, top]: [f32; 2], size: f32, bold: bool, text: &str, rgb: [u8; 3]) {
+        let [r, g, b] = rgb.map(|value| value as f32 / 255.0);
+        let font = if bold { "F2" } else { "F1" };
+        writeln!(
+            self.0,
+            "{r:.3} {g:.3} {b:.3} rg BT /{font} {size:.3} Tf 1 0 0 1 {x:.3} {:.3} Tm ({}) Tj ET",
+            PDF_HEIGHT - top - size,
+            pdf_string(text)
+        )
+        .unwrap();
+    }
+
+    fn button(&mut self, rect: [f32; 4], label: &str) {
+        self.rect(rect, [58, 61, 70]);
+        self.text([rect[0] + 7.0, rect[1] + 6.0], 9.0, false, label, PDF_TEXT);
+    }
+
+    fn rule(&mut self, top: f32) {
+        self.line([814.0, top], [1086.0, top], [65, 68, 78], 0.8);
+    }
+
+    fn section(&mut self, top: f32, label: &str) {
+        self.text([814.0, top], 15.0, true, label, [238, 239, 242]);
+    }
+
+    fn rows(&mut self, top: f32, rows: &[(&str, String)]) {
+        for (index, (label, value)) in rows.iter().enumerate() {
+            let top = top + index as f32 * 18.0;
+            self.text([814.0, top], 9.5, false, label, PDF_MUTED);
+            self.text([968.0, top], 9.5, false, value, PDF_TEXT);
+        }
+    }
+
+    fn slider(&mut self, [x, top]: [f32; 2], width: f32, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        self.line([x, top], [x + width, top], [80, 84, 94], 3.0);
+        self.line([x, top], [x + width * value, top], [90, 155, 235], 3.0);
+        self.rect([x + width * value - 3.0, top - 3.0, 6.0, 6.0], PDF_TEXT);
+    }
+
+    fn rate_plot(&mut self, history: &VecDeque<RateSample>, [x, top, width, height]: [f32; 4]) {
+        self.rect([x, top, width, height], [20, 22, 28]);
+        self.text(
+            [x + 6.0, top + 5.0],
+            8.5,
+            false,
+            "raw / processed",
+            PDF_MUTED,
+        );
+        let max = history
+            .iter()
+            .fold(1.0_f64, |m, s| m.max(s.raw).max(s.processed));
+        for (processed, color) in [(false, [245, 105, 110]), (true, [105, 225, 135])] {
+            for index in 1..history.len() {
+                let value = |sample: &RateSample| {
+                    if processed {
+                        sample.processed
+                    } else {
+                        sample.raw
+                    }
+                };
+                let point = |i: usize, sample: &RateSample| {
+                    [
+                        x + i as f32 / (history.len() - 1) as f32 * width,
+                        top + height - (value(sample) / max) as f32 * (height - 18.0),
+                    ]
+                };
+                self.line(
+                    point(index - 1, &history[index - 1]),
+                    point(index, &history[index]),
+                    color,
+                    1.2,
+                );
+            }
+        }
+    }
+}
+
+fn pdf_string(value: &str) -> String {
+    value.chars().take(120).fold(String::new(), |mut out, ch| {
+        match ch {
+            '\\' | '(' | ')' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '×' => out.push('x'),
+            'µ' => out.push('u'),
+            '…' => out.push_str("..."),
+            ch if ch.is_ascii_graphic() || ch == ' ' => out.push(ch),
+            _ => out.push('?'),
+        }
+        out
+    })
+}
+
+fn build_pdf(content: Vec<u8>, image: &Rgb8Image) -> Vec<u8> {
+    let mut content_object = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+    content_object.extend_from_slice(&content);
+    content_object.extend_from_slice(b"\nendstream");
+    let mut image_object = format!(
+        "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Interpolate false /Length {} >>\nstream\n",
+        image.width,
+        image.height,
+        image.pixels.len()
+    )
+    .into_bytes();
+    image_object.extend_from_slice(&image.pixels);
+    image_object.extend_from_slice(b"\nendstream");
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_WIDTH} {PDF_HEIGHT}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> /XObject << /Im0 7 0 R >> >> /Contents 4 0 R >>"
+        )
+        .into_bytes(),
+        content_object,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+        image_object,
+    ];
+    let mut pdf = b"%PDF-1.4\n%\xFF\xFF\xFF\xFF\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
 }
 
 struct GuiRender {
@@ -2049,6 +2420,27 @@ mod tests {
         );
         assert_eq!((stats.total, stats.positive, stats.negative), (3, 2, 1));
         assert_eq!(stats.rate, 3_000.0);
+    }
+
+    #[test]
+    fn pdf_snapshot_keeps_text_vector_and_embeds_only_the_event_image() {
+        let mut player = model();
+        player.metadata = Some(metadata(30_000));
+        player.raw_stats.total = 3;
+        player.processed_stats.total = 2;
+        let pdf = pdf_snapshot(
+            &player,
+            &Rgb8Image {
+                width: 2,
+                height: 1,
+                pixels: vec![255, 0, 0, 0, 0, 255],
+            },
+        );
+        let document = String::from_utf8_lossy(&pdf);
+        assert!(document.starts_with("%PDF-1.4"));
+        assert!(document.contains("/Subtype /Type1 /BaseFont /Helvetica"));
+        assert!(document.contains("/Subtype /Image /Width 2 /Height 1"));
+        assert!(document.ends_with("%%EOF\n"));
     }
 
     #[test]
