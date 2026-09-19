@@ -1,8 +1,8 @@
 //! Frame → pixels rendering: the shared 2-D visualisation path used by PNG export and the
 //! interactive viewer's image representations. Most [`EventFrame`]s reduce to a per-pixel
 //! scalar field (signed for polarity/voxel/time-surface reprs, unsigned for count/binary),
-//! which a [`Colormap`] turns into RGB. Some kinds have their own RGB path: Tencode and CountMask
-//! (already RGB encodings) and Flow (Middlebury colour coding — direction → hue, speed →
+//! which a [`Colormap`] turns into RGB. Some kinds have their own RGB path: Tencode, CountMask
+//! and RedBlue (already RGB encodings) and Flow (Middlebury colour coding — direction → hue, speed →
 //! saturation).
 
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
@@ -43,7 +43,7 @@ impl Colormap {
 /// Renders `frame` to an RGB image. `normalize` stretches the field to its own data range
 /// (auto-contrast); when `false`, values are read at their natural scale (`f32` reprs in
 /// `[0, 1]` / `[-1, 1]`, integer counts divided by 255). Diverging kinds ignore `colormap`
-/// and use `RedBlue`; Tencode and CountMask ignore it entirely (already RGB encodings).
+/// and use `RedBlue`; Tencode, CountMask and RedBlue ignore it entirely (already RGB encodings).
 pub fn render_frame(frame: &EventFrame, colormap: Colormap, normalize: bool) -> Rgb8Image {
     render_frame_scaled(frame, colormap, Scale::from_normalize(normalize))
 }
@@ -83,7 +83,7 @@ pub fn render_frame_scaled(frame: &EventFrame, colormap: Colormap, scale: Scale)
 
     if matches!(
         frame.kind(),
-        RepresentationKind::Tencode | RepresentationKind::CountMask
+        RepresentationKind::Tencode | RepresentationKind::CountMask | RepresentationKind::RedBlue
     ) {
         return Rgb8Image {
             width,
@@ -129,12 +129,15 @@ pub fn render_frame_scaled(frame: &EventFrame, colormap: Colormap, scale: Scale)
 ///
 /// Exposed so a sequence can be calibrated before it is rendered: take this over a sample of frames,
 /// keep the largest, and pass it as [`Scale::Fixed`] to every frame. Returns `0.0` for a frame with
-/// no non-zero values, and for the kinds that bypass scalar mapping entirely (Tencode, CountMask,
-/// Flow) — those already carry their own scaling and are unaffected by [`Scale`].
+/// no non-zero values, and for the kinds that bypass scalar mapping entirely
+/// (Tencode, CountMask, RedBlue, Flow) — those already carry their own scaling and are unaffected by [`Scale`].
 pub fn frame_extent(frame: &EventFrame) -> f64 {
     if matches!(
         frame.kind(),
-        RepresentationKind::Tencode | RepresentationKind::CountMask | RepresentationKind::Flow
+        RepresentationKind::Tencode
+            | RepresentationKind::CountMask
+            | RepresentationKind::RedBlue
+            | RepresentationKind::Flow
     ) {
         return 0.0;
     }
@@ -195,8 +198,8 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
                 .collect(),
             true,
         ),
-        // Tencode and CountMask are handled before this call (both are already RGB).
-        RepresentationKind::Tencode | RepresentationKind::CountMask => {
+        // Tencode, CountMask and RedBlue are handled before this call (already RGB).
+        RepresentationKind::Tencode | RepresentationKind::CountMask | RepresentationKind::RedBlue => {
             (vec![0.0; plane_len], false)
         }
     }
@@ -316,8 +319,8 @@ fn flow_color_wheel() -> Vec<[f64; 3]> {
     wheel
 }
 
-/// Interleaves a frame whose three planes *are* the R, G and B channels (Tencode, CountMask) into
-/// packed pixels. `normalize` stretches to the brightest channel value; otherwise the planes pass
+/// Interleaves a frame whose three planes *are* the R, G and B channels (Tencode, CountMask, RedBlue)
+/// into packed pixels. `normalize` stretches to the brightest channel value; otherwise the planes pass
 /// through at their stored 8-bit scale.
 fn render_rgb8_planes(frame: &EventFrame, plane_len: usize, normalize: bool) -> Vec<u8> {
     let data = frame.data();

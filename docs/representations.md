@@ -28,6 +28,7 @@ all three forms; each is flagged in its section below.
 | `tsurf`    | {func}`~eventcv.tsurf`   | 2  | `float32`          | Time surface: `exp(-age/tau_ms)` of the *latest* event per pixel/polarity. |
 | `atsurf`   | {func}`~eventcv.atsurf`  | 2  | `float32`          | Averaged time surface: mean of `exp(-age/tau_ms)` over *all* events per pixel/polarity. |
 | `tencode`  | {func}`~eventcv.tencode` | 3  | `uint8`            | Latest polarity + normalized age within `window_ms`, as an RGB-like image. |
+| `redblue` | {func}`~eventcv.redblue` | 3 | `uint8` | White-background red/blue counts, independently normalized per polarity; the stronger normalized polarity wins. |
 | `countmask`| {func}`~eventcv.countmask` | 3 | `uint8`           | Positive/negative event counts in red/blue, jointly normalized by a percentile of the non-zero counts, plus a binary activity mask in green. Timestamps unused. |
 | `mcts`     | {func}`~eventcv.mcts`    | `2·N` (10) | `float32`  | Multi-channel time surface: 5 log-spaced windows up to `max_window_ms` (or the `N` windows in `windows_ms`), per polarity. |
 | `flow`     | {func}`~eventcv.optical_flow` | 2 | `float32`     | Dense Lucas-Kanade optical flow `(flow_x, flow_y)` on the time surface, pixels/ms. |
@@ -178,6 +179,25 @@ several times brighter than the other two. `white_frame=True` inverts the whole 
 included, and exists for parity with the reference renderer — descriptor models trained on these
 frames expect the black-background default.
 
+## Red/blue counts
+
+```python
+stream.redblue(pct=99.0)
+ecv.redblue(stream, pct=99.0, white_frame=True, device="cpu")
+```
+
+Three RGB channels `[red, green, blue]`, shape `[3, H, W]`, `uint8`. Positive activity
+shades white toward red and negative activity shades it toward blue. Each polarity is clipped
+and normalized independently by the `pct`-th percentile of its nonzero counts, using linear
+interpolation. At each pixel only the stronger normalized polarity contributes; ties favor
+positive. Green is the inverse winning intensity, not a binary activity mask.
+
+`pct` defaults to `99.0` and must be finite and between `0` and `100`, inclusive.
+`white_frame` defaults to `True` and is accepted for compatibility: either value produces the
+same white background. Empty streams produce white frames. Timestamps are unused.
+`device` follows the session default; GPU counting uses the existing polarity kernel and
+normalization stays on the CPU. Colors pass through unchanged when displayed or exported.
+
 ## MCTS (multi-channel time surface)
 
 ```python
@@ -250,7 +270,7 @@ each maximal connected blob gets a distinct label `1..k`, with background `0`.
 A representation can be picked by string anywhere a name is accepted:
 {meth}`~eventcv.EventStream.flatten`, {meth}`~eventcv.EventStream.view`, `open(..., repr=...)`,
 and `reader.with_repr(...)`. The name is one of `"polarity"`, `"binary"`, `"count"`,
-`"countmask"`, `"voxel"`, `"tsurf"`, `"atsurf"`, `"tencode"`, `"mcts"`, or `"flow"`.
+`"countmask"`, `"redblue"`, `"voxel"`, `"tsurf"`, `"atsurf"`, `"tencode"`, `"mcts"`, or `"flow"`.
 
 `flatten`, `view`, and `open(repr=...)` render the representation with its **default**
 parameters — they don't accept a representation's own parameters (`bins`, `tau_ms`, `window_ms`,
@@ -327,7 +347,7 @@ gpu -- representations_gpu` runs the comparison above on your machine.
 
 Nothing you would notice, and the tests pin exactly how much:
 
-- `count`, `polarity`, `countmask` and `tsurf` are **bit-identical** to the CPU. They accumulate
+- `count`, `polarity`, `countmask`, `redblue` and `tsurf` are **bit-identical** to the CPU. They accumulate
   integers, and integer addition commutes exactly where float addition does not.
 - `voxel` and `atsurf` accumulate in Q16.16 fixed point, which is what makes them independent of
   the order the GPU happened to run in. They agree with the CPU to about 1e-4 on a cell — well

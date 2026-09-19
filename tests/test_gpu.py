@@ -19,7 +19,7 @@ import eventcv
 
 #: Kernels whose arithmetic is integer, so the GPU's answer is not close to the CPU's — it is the
 #: same numbers. Order cannot matter to an integer sum or a minimum.
-EXACT = ["count", "polarity", "countmask", "tsurf"]
+EXACT = ["count", "polarity", "countmask", "redblue", "tsurf"]
 
 #: Kernels that accumulate in Q16.16 fixed point. The quantisation is per event and bounded, but it
 #: accumulates over the hundreds of events that share a cell, so this is what the total may differ
@@ -53,6 +53,8 @@ class GpuKernelTests(unittest.TestCase):
             ("count", {}),
             ("count", {"normalize": True}),
             ("countmask", {}),
+            ("redblue", {}),
+            ("redblue", {"pct": 73.5, "white_frame": False}),
             ("tsurf", {"tau_ms": 30}),
         ]:
             with self.subTest(kernel=name, **kwargs):

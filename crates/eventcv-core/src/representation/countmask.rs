@@ -134,7 +134,7 @@ impl Representation for CountMask {
 /// below mirrors; the naive `lower + delta * gamma` form disagrees on roughly 1 input in 50 000.
 ///
 /// Reorders `values` in place (two partial selections rather than a full sort).
-fn percentile_linear(values: &mut [f64], pct: f64) -> f64 {
+pub(super) fn percentile_linear(values: &mut [f64], pct: f64) -> f64 {
     let last = values.len() - 1;
     let virtual_index = (pct / 100.0) * last as f64;
 

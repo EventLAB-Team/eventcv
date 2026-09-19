@@ -18,7 +18,7 @@ use eventcv_core::{
     },
     representation::{
         AveragedTimeSurface, Binary, CountMask, EventCount, EventFrame, EventFrameData,
-        EventPointSet, Mcts, PointSet, Polarity, Representation, RepresentationError, Tencode,
+        EventPointSet, Mcts, PointSet, Polarity, RedBlue, Representation, RepresentationError, Tencode,
         TimeSurface, VoxelGrid,
     },
     viz::Colormap,
@@ -776,6 +776,24 @@ impl PyEventStream {
     ) -> PyResult<PyEventFrame> {
         let device = resolve_device(device)?;
         py.detach(|| CountMask::new(pct, white_frame).generate_on(&self.inner, device))
+            .map(|inner| PyEventFrame { inner })
+            .map_err(map_representation_error)
+    }
+
+    /// White-background red/blue counts, independently percentile-normalized per polarity.
+    /// The stronger normalized polarity wins (positive on ties); timestamps are unused.
+    /// `white_frame` is accepted for compatibility but the background is always white.
+    #[pyo3(signature = (*, pct=99.0, white_frame=true, device=None))]
+    fn redblue(
+        &self,
+        py: Python<'_>,
+        pct: f64,
+        white_frame: bool,
+        device: Option<&str>,
+    ) -> PyResult<PyEventFrame> {
+        let _ = white_frame;
+        let device = resolve_device(device)?;
+        py.detach(|| RedBlue::new(pct).generate_on(&self.inner, device))
             .map(|inner| PyEventFrame { inner })
             .map_err(map_representation_error)
     }
@@ -4766,6 +4784,7 @@ enum ReprSpec {
     AveragedTimeSurface { tau_ms: f64 },
     Tencode { window_ms: f64 },
     CountMask { pct: f64, white_frame: bool },
+    RedBlue { pct: f64 },
     Mcts { max_window_ms: f64, windows: Option<Vec<f64>> },
     Flow { window: usize },
 }
@@ -4819,6 +4838,9 @@ impl ReprSpec {
             },
             "tencode" => Self::Tencode {
                 window_ms: window_ms.unwrap_or(DEFAULT_SPAN_MS),
+            },
+            "redblue" => Self::RedBlue {
+                pct: pct.unwrap_or(99.0),
             },
             "countmask" => Self::CountMask {
                 pct: pct.unwrap_or(99.0),
@@ -4888,6 +4910,7 @@ impl ReprSpec {
             Self::AveragedTimeSurface { .. } => "atsurf",
             Self::Tencode { .. } => "tencode",
             Self::CountMask { .. } => "countmask",
+            Self::RedBlue { .. } => "redblue",
             Self::Mcts { .. } => "mcts",
             Self::Flow { .. } => "flow",
         }
@@ -4925,6 +4948,7 @@ impl ReprSpec {
                 AveragedTimeSurface::new(*tau_ms).generate_on(stream, device)
             }
             Self::Tencode { window_ms } => Tencode::new(*window_ms).generate_on(stream, device),
+            Self::RedBlue { pct } => RedBlue::new(*pct).generate_on(stream, device),
             Self::CountMask { pct, white_frame } => {
                 CountMask::new(*pct, *white_frame).generate_on(stream, device)
             }

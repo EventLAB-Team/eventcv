@@ -81,6 +81,7 @@ pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> R
         | RepresentationKind::Binary
         | RepresentationKind::Count
         | RepresentationKind::CountMask
+        | RepresentationKind::RedBlue
         | RepresentationKind::Flow
         | RepresentationKind::Intensity
         | RepresentationKind::Labels

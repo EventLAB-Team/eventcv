@@ -86,8 +86,8 @@ cameras, before and after a filter. Without it each is scaled to itself and the 
 against each other.
 
 `colormap=` takes the same names as elsewhere: `viridis` (default), `turbo`, `grayscale`,
-`redblue`. Signed representations always use the diverging `redblue` map, and `tencode` and
-`countmask` carry their own colour, so `colormap` does not apply to them.
+`redblue`. Signed representations always use the diverging `redblue` map, and `tencode`,
+`countmask`, and `redblue` carry their own colour, so `colormap` does not apply to them.
 
 ### Augmentations apply
 

@@ -9,6 +9,7 @@ mod countmask;
 mod mcts;
 mod point_set;
 mod polarity;
+mod redblue;
 mod tencode;
 mod time_surface;
 mod voxel;
@@ -20,6 +21,7 @@ pub use countmask::CountMask;
 pub use mcts::Mcts;
 pub use point_set::{EventPointSet, PointSet};
 pub use polarity::{Polarity, PolarityAccumulator};
+pub use redblue::RedBlue;
 pub use tencode::Tencode;
 pub use time_surface::TimeSurface;
 pub use voxel::VoxelGrid;
@@ -97,6 +99,7 @@ pub enum RepresentationKind {
     Labels,
     Mcts,
     Polarity,
+    RedBlue,
     Tencode,
     TimeSurface,
     Voxel,
@@ -114,6 +117,7 @@ impl RepresentationKind {
             Self::Labels => "labels",
             Self::Mcts => "mcts",
             Self::Polarity => "polarity",
+            Self::RedBlue => "redblue",
             Self::Tencode => "tencode",
             Self::TimeSurface => "tsurf",
             Self::Voxel => "voxel",
@@ -132,6 +136,7 @@ impl RepresentationKind {
             "labels" => Self::Labels,
             "mcts" => Self::Mcts,
             "polarity" => Self::Polarity,
+            "redblue" => Self::RedBlue,
             "tencode" => Self::Tencode,
             "tsurf" => Self::TimeSurface,
             "voxel" => Self::Voxel,
