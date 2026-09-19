@@ -262,7 +262,7 @@ fn checked_plane_len(width: usize, height: usize) -> Result<usize, String> {
 mod tests {
     use eventcv_core::representation::{
         AveragedTimeSurface, Binary, CountMask, EventCount, Mcts, PointSet, Polarity,
-        Representation, Tencode, TimeSurface, VoxelGrid,
+        RedBlue, Representation, Tencode, TimeSurface, VoxelGrid,
     };
     use eventcv_core::viz::Colormap;
 
@@ -272,7 +272,7 @@ mod tests {
         // Mirrors `view` without opening a window: image vs cloud dispatch.
         use eventcv_core::representation::RepresentationKind::*;
         match frame.kind() {
-            Polarity | Binary | Count | CountMask | Flow | Intensity | Labels | Tencode => {
+            Polarity | Binary | Count | CountMask | RedBlue | Flow | Intensity | Labels | Tencode => {
                 Scene::Image(eventcv_core::viz::render_frame(
                     frame,
                     Colormap::Viridis,
@@ -307,6 +307,7 @@ mod tests {
             Polarity::default().generate(&stream).unwrap(),
             Tencode::default().generate(&stream).unwrap(),
             CountMask::default().generate(&stream).unwrap(),
+            RedBlue::default().generate(&stream).unwrap(),
         ] {
             assert!(matches!(scene_of(&frame), Scene::Image(_)));
         }
