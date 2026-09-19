@@ -1,6 +1,6 @@
 [package]
 name = "eventcv-core"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 description = "Rust core of EventCV — OpenCV for event-based vision."
 license = "Apache-2.0"
