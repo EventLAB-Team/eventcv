@@ -1,9 +1,15 @@
-@misc{EventCV,
-      title={The EventCV Library for Event-Based Robotic Vision}, 
-      author={Adam D. Hines and Michael Milford and Tobias Fischer},
-      year={2026},
-      eprint={2609.21330},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2609.21330}, 
-}
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "The EventCV Library for Event-Based Robotic Vision"
+authors:
+  - family-names: Hines
+    given-names: Adam D.
+  - family-names: Milford
+    given-names: Michael
+  - family-names: Fischer
+    given-names: Tobias
+date-released: 2026
+identifiers:
+  - type: url
+    value: "https://arxiv.org/abs/2609.21330"
+    description: "arXiv:2609.21330"
