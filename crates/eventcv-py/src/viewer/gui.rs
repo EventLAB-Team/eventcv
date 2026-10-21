@@ -1984,15 +1984,17 @@ impl GuiRender {
         })
     }
 
-    fn resize(&mut self, size: PhysicalSize<u32>) {
+    fn resize(&mut self, size: PhysicalSize<u32>) -> Result<(), String> {
         if size.width == 0 || size.height == 0 {
-            return;
+            return Ok(());
         }
+        gpu::validate_surface_size(size, self.gpu.device.limits().max_texture_dimension_2d)?;
         self.gpu.config.width = size.width;
         self.gpu.config.height = size.height;
         self.gpu
             .surface
             .configure(&self.gpu.device, &self.gpu.config);
+        Ok(())
     }
 
     fn draw(&mut self, window: &Window, model: &mut Model) -> Result<(), String> {
@@ -2197,7 +2199,9 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         match event {
             WindowEvent::Resized(size) => {
                 if let Some(render) = &mut self.render {
-                    render.resize(size);
+                    if let Err(error) = render.resize(size) {
+                        return self.fail(event_loop, error);
+                    }
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();

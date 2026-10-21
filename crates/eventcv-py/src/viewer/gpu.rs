@@ -321,7 +321,9 @@ where
             }
             WindowEvent::Resized(size) => {
                 if let Some(render) = &mut self.render {
-                    render.resize(size);
+                    if let Err(error) = render.resize(size) {
+                        return self.fail(event_loop, error);
+                    }
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -459,7 +461,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Resized(size) => {
                 if let Some(render) = &mut self.render {
-                    render.resize(size);
+                    if let Err(error) = render.resize(size) {
+                        return self.fail(event_loop, error);
+                    }
                 }
                 self.redraw();
             }
@@ -518,6 +522,25 @@ pub(super) struct GpuContext {
     pub(super) config: wgpu::SurfaceConfiguration,
 }
 
+fn viewer_limits(adapter_limits: wgpu::Limits) -> wgpu::Limits {
+    // Surfaces use physical pixels: a 1100-point Retina window already exceeds the
+    // downlevel default of 2048. Allow the adapter's resolutions, including later resizes.
+    wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits)
+}
+
+pub(super) fn validate_surface_size(
+    size: PhysicalSize<u32>,
+    max_dimension: u32,
+) -> Result<(), String> {
+    if size.width > max_dimension || size.height > max_dimension {
+        return Err(format!(
+            "viewer surface size {} x {} physical pixels exceeds the GPU device limit of {} per dimension",
+            size.width, size.height, max_dimension
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
     // `all()` (not just `PRIMARY`) so machines with no native Vulkan/Metal/DX12 GPU — headless
     // boxes, VMs, remote desktops — can still reach an OpenGL or software adapter.
@@ -540,7 +563,7 @@ pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
         &wgpu::DeviceDescriptor {
             label: Some("eventcv-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: viewer_limits(adapter.limits()),
             memory_hints: wgpu::MemoryHints::Performance,
         },
         None,
@@ -565,6 +588,10 @@ pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
     };
+    validate_surface_size(
+        PhysicalSize::new(config.width, config.height),
+        device.limits().max_texture_dimension_2d,
+    )?;
     surface.configure(&device, &config);
     Ok(GpuContext {
         surface,
@@ -661,14 +688,16 @@ impl Render {
         })
     }
 
-    fn resize(&mut self, size: PhysicalSize<u32>) {
+    fn resize(&mut self, size: PhysicalSize<u32>) -> Result<(), String> {
         if size.width == 0 || size.height == 0 {
-            return;
+            return Ok(());
         }
+        validate_surface_size(size, self.device.limits().max_texture_dimension_2d)?;
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
         self.depth = depth_view(&self.device, size.width, size.height);
+        Ok(())
     }
 
     /// Re-uploads a live frame into the image texture in place. Frames whose size differs from the
@@ -1496,8 +1525,51 @@ fn fs_image(in: ImageOut) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cloud_instances, mul, view_proj};
+    use super::{cloud_instances, mul, validate_surface_size, view_proj, viewer_limits};
     use crate::viewer::CloudPoint;
+    use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn viewer_uses_adapter_resolution_without_raising_other_limits() {
+        let adapter = wgpu::Limits {
+            max_texture_dimension_1d: 8192,
+            max_texture_dimension_2d: 16384,
+            max_texture_dimension_3d: 2048,
+            max_bind_groups: 8,
+            ..wgpu::Limits::default()
+        };
+        let limits = viewer_limits(adapter.clone());
+        let expected = wgpu::Limits {
+            max_texture_dimension_1d: adapter.max_texture_dimension_1d,
+            max_texture_dimension_2d: adapter.max_texture_dimension_2d,
+            max_texture_dimension_3d: adapter.max_texture_dimension_3d,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+        assert_eq!(limits, expected);
+        assert!(validate_surface_size(
+            PhysicalSize::new(2200, 1440),
+            limits.max_texture_dimension_2d
+        )
+        .is_ok());
+
+        // Keep adapters with lower resolution limits usable as well.
+        assert_eq!(
+            viewer_limits(wgpu::Limits::downlevel_defaults()),
+            wgpu::Limits::downlevel_defaults()
+        );
+    }
+
+    #[test]
+    fn surface_size_checks_both_axes_and_accepts_the_limit() {
+        for (width, height) in [(1100, 720), (2048, 2048)] {
+            assert!(validate_surface_size(PhysicalSize::new(width, height), 2048).is_ok());
+        }
+        for (width, height) in [(2049, 720), (1100, 2049), (2200, 1440)] {
+            let error = validate_surface_size(PhysicalSize::new(width, height), 2048).unwrap_err();
+            assert!(error.contains(&format!("{width} x {height}")));
+            assert!(error.contains("2048"));
+        }
+    }
 
     #[test]
     fn strength_scales_instance_size_and_brightness() {
