@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -1958,8 +1959,27 @@ fn build_pdf(content: Vec<u8>, image: &Rgb8Image) -> Vec<u8> {
 struct GuiRender {
     gpu: GpuContext,
     context: egui::Context,
-    state: egui_winit::State,
+    /// Never dropped on macOS — see the `Drop` impl below.
+    state: ManuallyDrop<egui_winit::State>,
     renderer: EguiRenderer,
+}
+
+impl Drop for GuiRender {
+    fn drop(&mut self) {
+        // On macOS the AccessKit adapter inside `state` isa-swizzles the window's NSView into a
+        // runtime subclass, and dropping it swaps the original class back in. While the window
+        // is key, AppKit's Touch Bar finder keeps a KVO observer on the view (which swizzles it
+        // again, to an NSKVONotifying_ class); restoring the class strips that out from under
+        // KVO, so when the finder removes its observer on the next display flush AppKit throws
+        // and aborts the process (SIGTRAP on window close, issue #36). Leaking the state keeps
+        // the view's class intact, at the cost of keeping each closed window's NSView and egui
+        // context alive.
+        #[cfg(not(target_os = "macos"))]
+        // SAFETY: `state` is dropped exactly once, here, and `self` is not used afterwards.
+        unsafe {
+            ManuallyDrop::drop(&mut self.state);
+        }
+    }
 }
 
 impl GuiRender {
@@ -1979,7 +1999,7 @@ impl GuiRender {
         Ok(Self {
             gpu,
             context,
-            state,
+            state: ManuallyDrop::new(state),
             renderer,
         })
     }
@@ -1997,9 +2017,15 @@ impl GuiRender {
         Ok(())
     }
 
-    fn draw(&mut self, window: &Window, model: &mut Model) -> Result<(), String> {
+    /// Paints one frame and returns when egui next wants one (animations, tooltips, a spinner),
+    /// or `None` if it is idle until the next input event.
+    fn draw(&mut self, window: &Window, model: &mut Model) -> Result<Option<Instant>, String> {
         let input = self.state.take_egui_input(window);
         let output = self.context.run(input, |context| model.ui(context));
+        let repaint_at = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .and_then(|viewport| Instant::now().checked_add(viewport.repaint_delay));
         self.state
             .handle_platform_output(window, output.platform_output);
         let pixels_per_point = egui_winit::pixels_per_point(&self.context, window);
@@ -2015,9 +2041,9 @@ impl GuiRender {
                 self.gpu
                     .surface
                     .configure(&self.gpu.device, &self.gpu.config);
-                return Ok(());
+                return Ok(Some(Instant::now()));
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => return Ok(Some(Instant::now())),
             Err(error) => return Err(error.to_string()),
         };
         let view = frame
@@ -2069,7 +2095,7 @@ impl GuiRender {
         for id in &output.textures_delta.free {
             self.renderer.free_texture(id);
         }
-        Ok(())
+        Ok(repaint_at)
     }
 }
 
@@ -2092,6 +2118,8 @@ struct GuiApp {
     render: Option<GuiRender>,
     proxy: Option<EventLoopProxy<UserEvent>>,
     error: Option<String>,
+    /// When egui asked to be repainted next, independent of new frames or input.
+    repaint_at: Option<Instant>,
 }
 
 impl GuiApp {
@@ -2107,6 +2135,7 @@ impl GuiApp {
             render: None,
             proxy: None,
             error: None,
+            repaint_at: None,
         }
     }
 
@@ -2182,9 +2211,16 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         if matches!(event, WindowEvent::CloseRequested) {
             return self.shutdown(event_loop);
         }
-        let consumed = match (&mut self.render, &self.window) {
-            (Some(render), Some(window)) => render.state.on_window_event(window, &event).consumed,
-            _ => false,
+        // egui reports a click on any of its panels (which fill the window) as consumed, yet
+        // still needs a frame to act on it — so redraw on `repaint`, not just unconsumed input.
+        // Otherwise a click while nothing else is redrawing (live view paused, no recording
+        // open) sits unprocessed until the pointer next moves.
+        let (consumed, repaint) = match (&mut self.render, &self.window) {
+            (Some(render), Some(window)) => {
+                let response = render.state.on_window_event(window, &event);
+                (response.consumed, response.repaint)
+            }
+            _ => (false, true),
         };
         if !consumed
             && matches!(
@@ -2210,13 +2246,14 @@ impl ApplicationHandler<UserEvent> for GuiApp {
             WindowEvent::RedrawRequested => {
                 let result = match (&mut self.render, &self.window) {
                     (Some(render), Some(window)) => render.draw(window, &mut self.model),
-                    _ => Ok(()),
+                    _ => Ok(None),
                 };
-                if let Err(error) = result {
-                    self.fail(event_loop, error);
+                match result {
+                    Ok(repaint_at) => self.repaint_at = repaint_at,
+                    Err(error) => self.fail(event_loop, error),
                 }
             }
-            _ if !consumed => {
+            _ if repaint => {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -2246,7 +2283,11 @@ impl ApplicationHandler<UserEvent> for GuiApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        let changed = self.model.poll() | self.model.tick(now);
+        let egui_due = self.repaint_at.is_some_and(|at| at <= now);
+        if egui_due {
+            self.repaint_at = None;
+        }
+        let changed = self.model.poll() | self.model.tick(now) | egui_due;
         if changed {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -2259,6 +2300,7 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         } else {
             now + IDLE_POLL
         };
+        let deadline = self.repaint_at.map_or(deadline, |at| deadline.min(at));
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
