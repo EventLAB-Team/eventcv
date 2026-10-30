@@ -41,7 +41,7 @@ fn a_stream_survives_a_round_trip_through_ros2() {
     eventcv_core::io::save_stream(&source, &synthetic(), &Default::default())
         .expect("write source");
 
-    let topic = format!("/eventcv_test/{}", std::process::id());
+    let topic = format!("/eventcv_test/pid_{}", std::process::id());
     let recorder_topic = topic.clone();
     let recorded_path = recorded.clone();
 

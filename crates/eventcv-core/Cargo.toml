@@ -77,7 +77,7 @@ serde_json = { version = "1", optional = true }
 # Pinned exactly because ort has no stable release yet (2.0 is still RC) and a point release can
 # move the API under us — the feature gate means a bad RC is a build-flag change, not an API
 # break. Enable with `--features onnx`.
-ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
     "std",
     "ndarray",          # take/return ndarray tensors, which representations already are
     "load-dynamic",     # dlopen libonnxruntime on first use; nothing linked, nothing downloaded
@@ -102,8 +102,8 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 # rather than `rclrs` or `r2r`, either of which would put the integration in a separate,
 # colcon-built package that could not ship in the wheel. Pinned exactly: hiroz is young.
 # The distro feature decides the key-expression and type-hash convention on the wire.
-hiroz = { version = "=0.2.0", optional = true, default-features = false, features = ["rolling", "rmw-zenoh", "config-builders"] }
-hiroz-msgs = { version = "=0.2.0", optional = true }
+hiroz = { version = "=0.2.1", optional = true, default-features = false, features = ["rolling", "rmw-zenoh", "config-builders"] }
+hiroz-msgs = { version = "=0.2.1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
