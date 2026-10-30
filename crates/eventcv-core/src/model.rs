@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use ndarray::{ArrayD, IxDyn};
+use ort::environment::Environment;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::sys;
 use ort::value::{Tensor, Value};
@@ -87,9 +88,11 @@ impl Model {
         // Before the first ort call, because that is where a missing runtime would otherwise
         // abort the process rather than return.
         ensure_runtime()?;
+        let environment = environment()?;
         // Stepwise rather than a combinator chain: ort's error type is generic over the stage, so
         // the intermediate results don't share one `Result` type to chain through.
-        let builder = Session::builder().map_err(|error| ModelError::Load(error.to_string()))?;
+        let builder =
+            Session::builder(environment).map_err(|error| ModelError::Load(error.to_string()))?;
         let mut builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|error| ModelError::Load(error.to_string()))?;
@@ -297,6 +300,23 @@ fn ensure_runtime() -> Result<(), ModelError> {
              point ORT_DYLIB_PATH at a libonnxruntime you already have"
         ))),
     }
+}
+
+/// The process-wide ONNX Runtime environment, built on first use and shared by every model. Only
+/// called after [`ensure_runtime`], so ort's lazy loader finds a library it can open.
+fn environment() -> Result<&'static Environment, ModelError> {
+    static ENVIRONMENT: OnceLock<Result<Environment, String>> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| {
+            ort::init()
+                .with_name("eventcv")
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|message| {
+            ModelError::Load(format!("could not initialise ONNX Runtime: {message}"))
+        })
 }
 
 /// The declared shape of a tensor port, with `-1` for free dimensions. Non-tensor ports (sequences,
