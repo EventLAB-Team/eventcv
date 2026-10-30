@@ -21,7 +21,7 @@ jobs:
           - { runner: ubuntu-latest, target: x86_64 }
           - { runner: ubuntu-24.04-arm, target: aarch64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
@@ -87,7 +87,7 @@ jobs:
             python: /opt/python/cp311-cp311/bin/python
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: wheels-linux-x86_64
@@ -111,7 +111,7 @@ jobs:
         include:
           - { runner: macos-15, target: aarch64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
@@ -131,7 +131,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
@@ -151,7 +151,7 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
