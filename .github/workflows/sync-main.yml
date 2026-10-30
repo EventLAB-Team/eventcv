@@ -1,0 +1,34 @@
+name: Sync Main to Development
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-main-to-development
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout features/1.1.x branch
+        uses: actions/checkout@v7
+        with:
+          ref: features/1.1.x
+          fetch-depth: 0
+
+      - name: Merge main into features/1.1.x
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+          git merge origin/main --no-edit
+          git push origin HEAD:features/1.1.x
