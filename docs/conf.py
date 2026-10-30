@@ -17,8 +17,11 @@ copyright = "2026, EventLAB"
 
 try:
     release = _pkg_version("eventcv")
-except PackageNotFoundError:  # docs building against an uninstalled tree
-    release = "1.0.9"
+except PackageNotFoundError:  # docs building against an uninstalled tree: read the workspace
+    import re
+
+    _cargo = open(os.path.join(os.path.dirname(__file__), "..", "Cargo.toml")).read()
+    release = re.search(r'\[workspace\.package\]\s*version = "([^"]+)"', _cargo).group(1)
 version = release
 
 extensions = [
