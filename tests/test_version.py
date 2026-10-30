@@ -1,9 +1,10 @@
 """Version reporting, and the guard that keeps the declarations from drifting apart.
 
-``eventcv.__version__`` comes from the **compiled extension** (baked in from
-``crates/eventcv-py/Cargo.toml``), because that names the binary actually loaded. Nothing in the
-build makes that agree with ``pyproject.toml``'s version, which is what a wheel is published under
-— so these tests are what keeps a release from shipping two different numbers.
+``eventcv.__version__`` comes from the **compiled extension** (baked in from the crate version),
+because that names the binary actually loaded. The version is declared once, in the root
+``Cargo.toml`` ``[workspace.package]``: both crates inherit it and ``pyproject.toml`` is
+``dynamic`` so maturin publishes the wheel under the same number. These tests keep it that way —
+a hardcoded version creeping back into any of them would let a release ship two numbers.
 """
 
 import re
@@ -31,12 +32,16 @@ class VersionTests(unittest.TestCase):
         self.assertRegex(eventcv.__version__, r"^\d+\.\d+\.\d+")
 
     def test_every_declaration_agrees(self):
-        # The four places a release has to be bumped. They are separate files with no build-time
-        # link, so drift is silent until a wheel is published under the wrong number.
-        expected = _declared(ROOT / "pyproject.toml")
-        self.assertEqual(eventcv.__version__, expected, "compiled extension vs pyproject.toml")
-        self.assertEqual(_declared(ROOT / "crates" / "eventcv-py" / "Cargo.toml"), expected)
-        self.assertEqual(_declared(ROOT / "crates" / "eventcv-core" / "Cargo.toml"), expected)
+        # One declaration (bumped by `scripts/bump_version.py`); everything else must inherit it.
+        expected = _declared(ROOT / "Cargo.toml")
+        self.assertEqual(eventcv.__version__, expected, "compiled extension vs root Cargo.toml")
+        for crate in ("eventcv-py", "eventcv-core"):
+            manifest = (ROOT / "crates" / crate / "Cargo.toml").read_text()
+            self.assertRegex(manifest, r"(?m)^version\.workspace\s*=\s*true", crate)
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        self.assertRegex(pyproject, r'(?m)^dynamic\s*=\s*\[[^\]]*"version"')
+        self.assertNotRegex(pyproject, r"(?m)^version\s*=")
+        self.assertIn(f"eventcv {expected} (", (ROOT / "docs" / "cli.md").read_text())
 
     def test_features_list_what_was_built_in(self):
         # Published wheels carry all four; a plain `cargo build` of the bindings carries none.
