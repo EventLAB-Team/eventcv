@@ -1,0 +1,39 @@
+version: 2
+
+updates:
+  # Rust workspace and its member crates
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    versioning-strategy: "increase-if-necessary"
+    groups:
+      rust-patches:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  # Python package and documentation dependencies
+  - package-ecosystem: "pip"
+    directories:
+      - "/"
+      - "/docs"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    versioning-strategy: "increase-if-necessary"
+    groups:
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions used by CI and release workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
