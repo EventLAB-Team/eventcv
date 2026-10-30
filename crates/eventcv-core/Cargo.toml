@@ -41,7 +41,7 @@ lz4 = "1.28"
 # through that buffer — a per-packet cost, and a recording is thousands of packets. `lz4-sys` is the
 # binding `lz4` itself is built on, so this links no second copy of anything.
 lz4-sys = "1.11"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 # Pure-Rust GIF encoder for animated export. Same no-system-deps story as `png`; `color_quant`
 # (pulled in by default) builds the 256-colour palette each frame needs. MP4 deliberately has no
 # crate here — it is piped to a system ffmpeg, see `video.rs` for why.
