@@ -22,7 +22,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, target: aarch64 }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # On the runner rather than inside the manylinux container: the workspace is mounted into
@@ -112,7 +112,7 @@ jobs:
           - { runner: macos-15, target: aarch64 }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: python -m pip install cmake
@@ -132,7 +132,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: python -m pip install cmake
