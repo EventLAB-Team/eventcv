@@ -188,7 +188,7 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
             )
         }
         // Voxel bins are signed contributions — sum them.
-        RepresentationKind::Voxel => (
+        RepresentationKind::Voxel | RepresentationKind::Custom => (
             (0..plane_len)
                 .map(|i| {
                     (0..channels)

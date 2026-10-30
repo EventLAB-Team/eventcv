@@ -9,3 +9,6 @@ __version__ = _rust.__version__
 
 # `__all__` is defined by `load` (curated names + the auto-generated functional API, §D1).
 __all__ = list(_load.__all__)
+
+from .representation import representation, CustomRepresentation
+__all__ += ["representation", "CustomRepresentation"]

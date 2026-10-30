@@ -13,7 +13,7 @@ requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [{ name = "Adam Hines"}]
 maintainers = [{ name = "EventLAB Team", email="eventlab.localization@gmail.com"}]
-dependencies = ["numpy"]
+dependencies = ["numpy>=1.20"]
 classifiers = [
         # Development status
         'Development Status :: 5 - Production/Stable',

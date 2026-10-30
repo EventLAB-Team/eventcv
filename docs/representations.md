@@ -355,3 +355,70 @@ Nothing you would notice, and the tests pin exactly how much:
 - A representation with no kernel (`tencode`, `mcts`, `binary`, `flow`) simply runs on the CPU when
   you ask for the GPU. A pipeline that sets `device="gpu"` once should not have to know which steps
   were ported.
+
+## Experimental custom representations
+
+Define a stateless dense representation with a NumPy-style function. EventCV traces
+it once, generates Rust source, and compiles a CPU kernel on its first call:
+
+```python
+import numpy as np
+import eventcv as ecv
+
+@ecv.representation(channels=2, channel_names=["negative", "positive"])
+def weighted_counts(events):
+    out = np.zeros((2, events.height, events.width), dtype=np.float32, like=events)
+    weights = np.exp(-events.age_ms / 30)
+    np.add.at(out, (events.p.astype(np.int64), events.y, events.x), weights)
+    return out
+
+frame = weighted_counts(stream)             # EventFrame, shape [2, H, W]
+reader = ecv.open("recording.npz", dt_ms=30).with_repr(weighted_counts)
+array = reader[0]                            # NumPy array
+weighted_counts.compile()                   # optional explicit preparation
+print(weighted_counts.rust_source)
+```
+
+`like=events` is required to dispatch allocation to the tracer. Output must be
+`float32`, with the declared channel count and original sensor dimensions. Names
+must contain one string per channel; defaults are `channel_0`, `channel_1`, etc.
+Use a function factory to choose parameters or channel counts. Configuration is
+captured at decoration time; recreate the representation to change it.
+
+The event input exposes integer `x`, `y`, and raw `t`, boolean `p`,
+`timestamp_scale_ms`, and `age_ms` relative to the final event. Relative ages
+subtract integers before conversion to floating point, preserving small differences
+between large timestamps. Sensor dimensions are allocation placeholders, not
+values for Python arithmetic or branching.
+
+Supported operations include scalar and elementwise arithmetic, comparisons,
+boolean conjunction/disjunction, boolean event masks, `np.where`, `np.exp`,
+`np.floor`, `np.minimum`, `np.maximum`, `np.clip`, and explicit casts to `float32`,
+`float64`, `int64`, and `uint64`. Use `np.add.at` or `np.maximum.at` to accumulate
+into `(channel, y, x)`. Two-dimensional allocations also support `(y, x)` indices;
+`np.stack([plane_a, plane_b])` combines them into channels. Integer indices must
+be in bounds; negative indices raise rather than wrapping. Empty inputs produce
+zero frames. Maximum accumulation starts at zero.
+
+Arithmetic preserves matching operand types and otherwise uses float64; division
+uses float64. Contributions are cast to float32 before accumulation. This is an
+explicit numerical subset, not NumPy's complete promotion and broadcasting rules.
+Accumulation follows event order with no parallel scatter or fast-math flags.
+Python loops over fixed configuration are allowed; loops over events,
+data-dependent Python branches, general array mutation, and other NumPy
+operations raise during tracing. No Python execution fallback is provided.
+
+Compilation requires `rustc` and the platform linker. The generated library uses
+only Rust's standard library. Source and binaries are cached under
+`$XDG_CACHE_HOME/eventcv/kernels-v1` (otherwise `~/.cache/eventcv/kernels-v1`),
+keyed by source, platform, compiler version and flags. Compatible cached kernels
+can be loaded without the compiler. Kernel execution releases the GIL and borrows
+event columns directly. Cold compilation and warm execution have different costs;
+benchmark your representation before assuming handwritten-kernel performance.
+
+Custom representations are CPU-only, including when the session device is GPU.
+They work as direct calls and reader objects passed to `with_repr`; custom string
+selectors, `open(repr=...)`, live capture integration, state across windows, sparse
+outputs and GPU compilation are outside this experimental API. Saved frames retain
+custom channel names and values, but do not contain executable kernels. Functions
+are trusted Python code and execute during tracing; this API is not a sandbox.

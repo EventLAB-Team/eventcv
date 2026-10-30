@@ -1731,6 +1731,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "eventcv-core",
+ "libloading 0.8.9",
  "numpy",
  "pollster 0.3.0",
  "pyo3",

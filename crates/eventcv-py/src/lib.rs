@@ -1,6 +1,7 @@
 #[cfg(feature = "camera")]
 mod capture;
 mod viewer;
+mod custom;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -2411,7 +2412,7 @@ impl PyEventReader {
     #[allow(clippy::too_many_arguments)]
     fn with_repr(
         &self,
-        repr: &str,
+        repr: &Bound<'_, PyAny>,
         bins: Option<i64>,
         window_ms: Option<f64>,
         window_s: Option<f64>,
@@ -2435,6 +2436,25 @@ impl PyEventReader {
         white_frame: Option<bool>,
         downsample: Option<i64>,
     ) -> PyResult<PyEventReader> {
+        if !repr.is_instance_of::<pyo3::types::PyString>() {
+            if bins.is_some() || window_ms.is_some() || window_s.is_some() || window_us.is_some() || window_ns.is_some()
+                || tau_ms.is_some() || tau_s.is_some() || tau_us.is_some() || tau_ns.is_some()
+                || max_window_ms.is_some() || max_window_s.is_some() || max_window_us.is_some() || max_window_ns.is_some()
+                || windows_ms.is_some() || windows_s.is_some() || windows_us.is_some() || windows_ns.is_some()
+                || window.is_some() || normalize.is_some() || pct.is_some() || white_frame.is_some() || downsample.is_some() {
+                return Err(PyTypeError::new_err("configure custom representations when constructing them"));
+            }
+            let compiled = repr.call_method0("compile")?;
+            let native = compiled.getattr("_native")?;
+            let kernel = native.extract::<PyRef<'_, custom::PyCustomKernel>>()?;
+            return Ok(PyEventReader {
+                inner: Arc::clone(&self.inner), mode: self.mode,
+                repr: Some(ReprSpec::Custom(Arc::clone(&kernel.inner))),
+                slice_ops: self.slice_ops.clone(), offset_us: self.offset_us,
+                base_index: self.base_index, hot_pixel_mask: self.hot_pixel_mask.clone(),
+            });
+        }
+        let repr: String = repr.extract()?;
         let max_window_ms = resolve_ms(
             "max_window",
             max_window_s,
@@ -2458,7 +2478,7 @@ impl PyEventReader {
             _ => None,
         };
         let spec = ReprSpec::new(
-            repr,
+            &repr,
             bins,
             resolve_ms("window", window_s, window_ms, window_us, window_ns)?.or(span),
             resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.or(span),
@@ -4776,6 +4796,7 @@ fn stack_frames<'py>(
 /// to the core generator, shared by `open(repr=…)`, `with_repr`, `__getitem__`, and `batch`.
 #[derive(Clone, Debug)]
 enum ReprSpec {
+    Custom(Arc<custom::Compiled>),
     Binary,
     Count { normalize: bool },
     Polarity { normalize: bool, downsample: usize },
@@ -4902,6 +4923,7 @@ impl ReprSpec {
 
     fn name(&self) -> &'static str {
         match self {
+            Self::Custom(_) => "custom",
             Self::Binary => "binary",
             Self::Count { .. } => "count",
             Self::Polarity { .. } => "polarity",
@@ -4932,6 +4954,7 @@ impl ReprSpec {
         device: eventcv_core::accel::Device,
     ) -> Result<EventFrame, RepresentationError> {
         match self {
+            Self::Custom(kernel) => kernel.generate(stream),
             Self::Binary => Binary.generate_on(stream, device),
             Self::Count { normalize } => EventCount::new(*normalize).generate_on(stream, device),
             Self::Polarity {
@@ -7087,6 +7110,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // published wheels have all four). `gpu` here means the shaders were built, not that an
     // adapter exists — `eventcv.gpu_available()` is what answers that.
     m.add("__features__", FEATURES)?;
+    m.add_class::<custom::PyCustomKernel>()?;
     m.add_class::<PyEventStream>()?;
     m.add_class::<PyEventFrame>()?;
     m.add_class::<PyEventPointSet>()?;

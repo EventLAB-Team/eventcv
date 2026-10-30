@@ -77,7 +77,8 @@ where
 /// volumetric kinds become an orbitable point cloud.
 pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> Result<(), String> {
     let scene = match frame.kind() {
-        RepresentationKind::Polarity
+        RepresentationKind::Custom
+        | RepresentationKind::Polarity
         | RepresentationKind::Binary
         | RepresentationKind::Count
         | RepresentationKind::CountMask
