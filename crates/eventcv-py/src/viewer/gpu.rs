@@ -917,13 +917,13 @@ fn build_cloud(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_points",
+            entry_point: Some("vs_points"),
             buffers: &[QUAD_LAYOUT, INSTANCE_LAYOUT],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_points",
+            entry_point: Some("fs_points"),
             targets: &[Some(format.into())],
             compilation_options: Default::default(),
         }),
@@ -938,13 +938,13 @@ fn build_cloud(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_axes",
+            entry_point: Some("vs_axes"),
             buffers: &[AXIS_LAYOUT],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_axes",
+            entry_point: Some("fs_axes"),
             targets: &[Some(format.into())],
             compilation_options: Default::default(),
         }),
@@ -964,13 +964,13 @@ fn build_cloud(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_labels",
+            entry_point: Some("vs_labels"),
             buffers: &[LABEL_LAYOUT],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_axes",
+            entry_point: Some("fs_axes"),
             targets: &[Some(format.into())],
             compilation_options: Default::default(),
         }),
@@ -1094,13 +1094,13 @@ fn build_image(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_image",
+            entry_point: Some("vs_image"),
             buffers: &[],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_image",
+            entry_point: Some("fs_image"),
             targets: &[Some(format.into())],
             compilation_options: Default::default(),
         }),

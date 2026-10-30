@@ -41,7 +41,7 @@ lz4 = "1.28"
 # through that buffer — a per-packet cost, and a recording is thousands of packets. `lz4-sys` is the
 # binding `lz4` itself is built on, so this links no second copy of anything.
 lz4-sys = "1.11"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 # Pure-Rust GIF encoder for animated export. Same no-system-deps story as `png`; `color_quant`
 # (pulled in by default) builds the 256-colour palette each frame needs. MP4 deliberately has no
 # crate here — it is piped to a system ffmpeg, see `video.rs` for why.
@@ -93,8 +93,8 @@ libloading = { version = "0.9", optional = true }
 # covers every platform and nothing needs a vendor toolkit at build time — the reason this is not
 # a CUDA path plus a Metal path. The versions match the ones `eventcv-py` already pins for the
 # viewer, so a wheel links one wgpu rather than two. Enable with `--features gpu`.
-wgpu = { version = "22", optional = true }
-pollster = { version = "0.3", optional = true }   # block on wgpu's async device/adapter requests
+wgpu = { version = "23", optional = true }
+pollster = { version = "0.4", optional = true }   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 # Optional: ROS 2 publish/subscribe over Zenoh. `hiroz` is a ROS 2 stack in pure Rust, so this

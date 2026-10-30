@@ -152,7 +152,7 @@ fn build(context: &super::gpu::Context) -> SimPipeline {
         label: Some("simulate"),
         layout: Some(&pipeline_layout),
         module: &module,
-        entry_point: "simulate",
+        entry_point: Some("simulate"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
