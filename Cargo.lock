@@ -2289,9 +2289,9 @@ dependencies = [
 
 [[package]]
 name = "hiroz-codegen"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ead8754b67b3b6ee782825ea0b405bcc718d6f6b5d1352cf6e3013bd0771711"
+checksum = "01e336b5b2f61885fad4ec0504b85b97621edf7434597305de35025d5ee5f17e"
 dependencies = [
  "anyhow",
  "hex",
