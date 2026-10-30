@@ -1,13 +1,12 @@
 version: 2
 
 updates:
-  # Rust workspace and its member crates
+  # Rust workspace and member crates
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
-    versioning-strategy: "increase-if-necessary"
     groups:
       rust-patches:
         patterns: ["*"]
@@ -27,7 +26,7 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # GitHub Actions used by CI and release workflows
+  # GitHub Actions workflows
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
