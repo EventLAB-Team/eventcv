@@ -34,6 +34,13 @@ from pathlib import Path
 # the binding, so this pin can move freely; bump it here and nowhere else.
 ONNXRUNTIME_VERSION = "1.28.0"
 
+# The Python whose `onnxruntime` wheel is fetched, independent of the Python running this script.
+# Only the library is lifted out, and it is the same in every cpXY wheel of a release, but
+# `onnxruntime` publishes wheels for a new Python months after it ships — so asking for the host's
+# tag breaks the build whenever CI's `python-version: "3.x"` moves ahead (3.15 had none for 1.28.0).
+# Any version this release has wheels for on every target works; the host platform still applies.
+WHEEL_PYTHON = "3.12"
+
 # Where the library lands, next to the Python package so it travels in the wheel.
 DESTINATION = Path(__file__).resolve().parent.parent / "python" / "eventcv" / "_libs"
 
@@ -61,7 +68,8 @@ def _download(version: str, into: Path) -> Path:
     """Downloads the `onnxruntime` wheel for this platform and returns its path.
 
     `pip download` rather than a hand-written URL table: it resolves the right wheel for the host
-    platform, and checks the hash the index publishes.
+    platform, and checks the hash the index publishes. The Python tag is pinned to
+    [`WHEEL_PYTHON`] rather than the host's, which `onnxruntime` may not have wheels for yet.
     """
     subprocess.run(
         [
@@ -72,6 +80,8 @@ def _download(version: str, into: Path) -> Path:
             f"onnxruntime=={version}",
             "--only-binary=:all:",
             "--no-deps",
+            "--python-version",
+            WHEEL_PYTHON,
             "--dest",
             str(into),
         ],
