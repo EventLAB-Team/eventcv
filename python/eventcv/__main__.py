@@ -35,7 +35,7 @@ def _onnx_runtime_line() -> str | None:
 
 
 def version_text() -> str:
-    """``eventcv 1.0.9 (hdf5, camera)`` plus the runtime and the interpreter it is installed under."""
+    """``eventcv X.Y.Z (hdf5, camera)`` plus the runtime and the interpreter it is installed under."""
     features = ", ".join(getattr(_rust, "__features__", ())) or "no optional features"
     lines = [
         f"eventcv {__version__} ({features})",

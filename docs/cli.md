@@ -11,7 +11,7 @@ are in play and you want to be sure which interpreter is answering.
 
 ```console
 $ eventcv --version
-eventcv 1.0.9 (hdf5, camera, onnx)
+eventcv 1.0.10 (hdf5, camera, onnx)
 Python 3.12.10 on macOS-14.8.3-arm64-arm-64bit
 ```
 

@@ -1,5 +1,5 @@
 <h1 align="center">
-<img src="assets/logo.svg" width="200">
+<img src="https://eventcv.net/wp-content/uploads/2026/10/logo.svg" width="200">
 </h1><br>
 
 # EventCV: Open source event-based computer vision library
