@@ -164,7 +164,7 @@ impl Context {
                     label: Some(entry),
                     layout: Some(&self.pipeline_layout),
                     module: &self.module,
-                    entry_point: entry,
+                    entry_point: Some(entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 })
