@@ -22,7 +22,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # stack rather than multiple incompatible versions.
 egui = "=0.30.0"
 egui-winit = { version = "=0.30.0", features = ["accesskit"] }
-egui-wgpu = "=0.36.2"
+egui-wgpu = "=0.30.0"
 # Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and
 # the CLI path remain available when a desktop portal is absent.
 rfd = "=0.17.2"
