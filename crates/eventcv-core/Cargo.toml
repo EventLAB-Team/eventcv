@@ -94,7 +94,7 @@ libloading = { version = "0.9", optional = true }
 # a CUDA path plus a Metal path. The versions match the ones `eventcv-py` already pins for the
 # viewer, so a wheel links one wgpu rather than two. Enable with `--features gpu`.
 wgpu = { version = "22", optional = true }
-pollster = { version = "0.3", optional = true }   # block on wgpu's async device/adapter requests
+pollster = { version = "0.4", optional = true }   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 # Optional: ROS 2 publish/subscribe over Zenoh. `hiroz` is a ROS 2 stack in pure Rust, so this
