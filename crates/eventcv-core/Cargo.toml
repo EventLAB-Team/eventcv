@@ -93,7 +93,7 @@ libloading = { version = "0.9", optional = true }
 # covers every platform and nothing needs a vendor toolkit at build time — the reason this is not
 # a CUDA path plus a Metal path. The versions match the ones `eventcv-py` already pins for the
 # viewer, so a wheel links one wgpu rather than two. Enable with `--features gpu`.
-wgpu = { version = "22", optional = true }
+wgpu = { version = "23", optional = true }
 pollster = { version = "0.4", optional = true }   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 
