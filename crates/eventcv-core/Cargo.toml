@@ -23,7 +23,7 @@ rayon = "1.10"
 rosbag = "0.6.3"
 # Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.
 # Same major version npyz already pulls transitively; only `FileOptions` is named here.
-zip = { version = "0.6", default-features = false }
+zip = { version = "9.0", default-features = false }
 # Pure-Rust PNG encoder for colormapped frame export (`.png`) — no system deps, keeps wheels easy.
 # Also writes animated PNG (`acTL`/`fcTL`), so `.apng` export costs no extra dependency.
 png = "0.17"
