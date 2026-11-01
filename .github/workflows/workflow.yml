@@ -42,9 +42,27 @@ jobs:
           args: --release --out dist
           manylinux: "2_28"
           before-script-linux: |
-            if command -v dnf >/dev/null; then dnf install -y cmake make gcc gcc-c++; \
-            elif command -v yum >/dev/null; then yum install -y cmake make gcc gcc-c++; \
-            elif command -v apk >/dev/null; then apk add --no-cache cmake make g++; fi
+            set -e
+
+            if command -v cmake >/dev/null &&
+               command -v make >/dev/null &&
+               command -v gcc >/dev/null &&
+               command -v g++ >/dev/null; then
+              echo "Build dependencies already installed."
+            else
+              echo "Installing missing build dependencies..."
+
+              if command -v dnf >/dev/null; then
+                dnf install -y cmake make gcc gcc-c++
+              elif command -v yum >/dev/null; then
+                yum install -y cmake make gcc gcc-c++
+              elif command -v apk >/dev/null; then
+                apk add --no-cache cmake make g++
+              else
+                echo "Unsupported package manager"
+                exit 1
+              fi
+            fi
       - name: Check the wheel really is manylinux_2_28
         # maturin's compatibility check reads versioned symbol requirements only, so an
         # *unversioned* reference to a newer glibc — what a prebuilt C dependency built on a
