@@ -68,9 +68,7 @@ def _add_source_options(parser: argparse.ArgumentParser) -> None:
         metavar="COLS",
         help="column order of a text source, e.g. txyp or xytp",
     )
-    parser.add_argument(
-        "--topic", default=None, metavar="TOPIC", help="rosbag connection to read"
-    )
+    parser.add_argument("--topic", default=None, metavar="TOPIC", help="rosbag connection to read")
 
 
 def _source_options(args: argparse.Namespace) -> dict:
@@ -123,7 +121,8 @@ def _cmd_info(args: argparse.Namespace) -> int:
 
 def _cmd_convert(args: argparse.Namespace) -> int:
     """Re-encode a recording into another format."""
-    from . import load, open as open_reader
+    from . import load
+    from . import open as open_reader
 
     options = _source_options(args)
     reader = open_reader(args.input, **options)
@@ -172,7 +171,8 @@ def _cmd_render(args: argparse.Namespace) -> int:
 
 def _cmd_play(args: argparse.Namespace) -> int:
     """Play a recording in an interactive window."""
-    from . import open as open_reader, play
+    from . import open as open_reader
+    from . import play
 
     kwargs = dict(
         fps=args.fps,
@@ -279,8 +279,11 @@ def _cmd_ros2_represent(args: argparse.Namespace) -> int:
     images = context.image_publisher(args.image_topic)
     made = 0
     while (stream := subscriber.recv(timeout_ms=args.idle * 1000.0)) is not None:
-        images.publish(stream.view(args.repr, bins=args.bins) if args.repr == "voxel"
-                       else stream.view(args.repr))
+        images.publish(
+            stream.view(args.repr, bins=args.bins)
+            if args.repr == "voxel"
+            else stream.view(args.repr)
+        )
         made += 1
     if not args.quiet:
         note = f", {subscriber.dropped} dropped" if subscriber.dropped else ""
@@ -290,7 +293,8 @@ def _cmd_ros2_represent(args: argparse.Namespace) -> int:
 
 def _cmd_reconstruct(args: argparse.Namespace) -> int:
     """Run a reconstruction model over a recording to recover an intensity video."""
-    from . import Model, open as open_reader, reconstruct
+    from . import Model, reconstruct
+    from . import open as open_reader
 
     reader = open_reader(args.input, dt_ms=args.dt_ms, **_source_options(args)).with_repr(
         args.repr, bins=args.bins
@@ -354,9 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--dt-ms", type=float, default=30.0, metavar="MS", help="time per frame (default: 30)"
     )
-    render.add_argument(
-        "--fps", type=float, default=30.0, help="playback frame rate (default: 30)"
-    )
+    render.add_argument("--fps", type=float, default=30.0, help="playback frame rate (default: 30)")
     render.add_argument(
         "--repr",
         default="raw",
@@ -370,9 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MS",
         help="raw view only: fade time for an event's trail (default: one frame's worth)",
     )
-    render.add_argument(
-        "--colormap", default="viridis", help="colormap for scalar representations"
-    )
+    render.add_argument("--colormap", default="viridis", help="colormap for scalar representations")
     render.add_argument(
         "--clim",
         type=float,
@@ -387,9 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
     render.set_defaults(func=_cmd_render)
 
-    play = subparsers.add_parser(
-        "play", help="open the interactive recording player"
-    )
+    play = subparsers.add_parser("play", help="open the interactive recording player")
     play.add_argument("input", nargs="?", default=None, help="source recording (optional)")
     _add_source_options(play)
     play.add_argument(
@@ -411,7 +409,10 @@ def build_parser() -> argparse.ArgumentParser:
         help='what to draw: "raw" for the event stream itself (default), or a representation name',
     )
     play.add_argument(
-        "--decay-ms", type=float, default=None, metavar="MS",
+        "--decay-ms",
+        type=float,
+        default=None,
+        metavar="MS",
         help="raw view only: fade time for an event's trail (default: one frame's worth)",
     )
     play.add_argument("--colormap", default="viridis", help="colormap for scalar representations")
@@ -440,47 +441,78 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("input", help="source video")
     simulate.add_argument("output", help="destination event file; the extension picks the format")
     simulate.add_argument(
-        "--threshold", type=float, default=0.2, metavar="C",
+        "--threshold",
+        type=float,
+        default=0.2,
+        metavar="C",
         help="log-contrast threshold for both polarities (default: 0.2)",
     )
     simulate.add_argument(
-        "--sigma-thres", type=float, default=0.03, metavar="S",
+        "--sigma-thres",
+        type=float,
+        default=0.03,
+        metavar="S",
         help="per-pixel threshold spread; 0 for an ideal sensor (default: 0.03)",
     )
     simulate.add_argument(
-        "--cutoff-hz", type=float, default=200.0, metavar="HZ",
+        "--cutoff-hz",
+        type=float,
+        default=200.0,
+        metavar="HZ",
         help="photoreceptor bandwidth for a white pixel; 0 disables (default: 200)",
     )
     simulate.add_argument(
-        "--leak-rate-hz", type=float, default=1.0, metavar="HZ",
+        "--leak-rate-hz",
+        type=float,
+        default=1.0,
+        metavar="HZ",
         help="spontaneous ON events per pixel per second (default: 1)",
     )
     simulate.add_argument(
-        "--shot-noise-rate-hz", type=float, default=10.0, metavar="HZ",
+        "--shot-noise-rate-hz",
+        type=float,
+        default=10.0,
+        metavar="HZ",
         help="noise floor in dark pixels (default: 10)",
     )
     simulate.add_argument(
-        "--refractory-us", type=int, default=100, metavar="US",
+        "--refractory-us",
+        type=int,
+        default=100,
+        metavar="US",
         help="dead time after each event (default: 100)",
     )
     simulate.add_argument(
-        "--upsample", default=None, metavar="MODE",
+        "--upsample",
+        default=None,
+        metavar="MODE",
         help='frame subdivision: "adaptive" (default), "off", or an integer factor',
     )
     simulate.add_argument(
-        "--scale", type=int, nargs=2, default=None, metavar=("W", "H"),
+        "--scale",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("W", "H"),
         help="decode the video at this size instead of its native one",
     )
-    simulate.add_argument("--max-frames", type=int, default=None, metavar="N",
-                          help="stop after N frames")
     simulate.add_argument(
-        "--max-upsample", type=int, default=None, metavar="N",
+        "--max-frames", type=int, default=None, metavar="N", help="stop after N frames"
+    )
+    simulate.add_argument(
+        "--max-upsample",
+        type=int,
+        default=None,
+        metavar="N",
         help="cap the sub-steps any frame pair is split into (default: 64). Each costs a full "
         "pass over every pixel and the busiest pixel sets the factor, so lowering this bounds "
         "the worst case at some cost in timestamp accuracy",
     )
     simulate.add_argument(
-        "--compression", type=int, default=None, metavar="LEVEL",
+        "--compression",
+        type=int,
+        default=None,
+        metavar="LEVEL",
         help="HDF5 gzip level 0..9; 0 stores uncompressed (default: 1)",
     )
     simulate.add_argument("--seed", type=int, default=0, help="seed for mismatch and noise")
@@ -494,56 +526,96 @@ def build_parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("output", help="destination video; the extension picks the format")
     reconstruct.add_argument("model", help="ONNX reconstruction model (e.g. an E2VID export)")
     _add_source_options(reconstruct)
-    reconstruct.add_argument("--dt-ms", type=float, default=33.0, metavar="MS",
-                             help="time per reconstructed frame (default: 33)")
+    reconstruct.add_argument(
+        "--dt-ms",
+        type=float,
+        default=33.0,
+        metavar="MS",
+        help="time per reconstructed frame (default: 33)",
+    )
     reconstruct.add_argument("--fps", type=float, default=30.0, help="playback rate (default: 30)")
-    reconstruct.add_argument("--repr", default="voxel",
-                             help="representation the model expects (default: voxel)")
-    reconstruct.add_argument("--bins", type=int, default=5,
-                             help="bins for the voxel representation (default: 5)")
-    reconstruct.add_argument("--max-frames", type=int, default=None, metavar="N",
-                             help="stop after N frames")
-    reconstruct.add_argument("-q", "--quiet", action="store_true",
-                             help="suppress the summary line")
+    reconstruct.add_argument(
+        "--repr", default="voxel", help="representation the model expects (default: voxel)"
+    )
+    reconstruct.add_argument(
+        "--bins", type=int, default=5, help="bins for the voxel representation (default: 5)"
+    )
+    reconstruct.add_argument(
+        "--max-frames", type=int, default=None, metavar="N", help="stop after N frames"
+    )
+    reconstruct.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
     reconstruct.set_defaults(func=_cmd_reconstruct)
 
     def _add_ros2_options(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--router", default="", metavar="ENDPOINT",
-                         help="Zenoh router (default: the local rmw_zenohd)")
-        sub.add_argument("--mode", default="", choices=["", "client", "peer", "router"],
-                         help="Zenoh session mode (default: client, as rmw_zenoh_cpp uses)")
-        sub.add_argument("-q", "--quiet", action="store_true",
-                         help="suppress the summary line")
+        sub.add_argument(
+            "--router",
+            default="",
+            metavar="ENDPOINT",
+            help="Zenoh router (default: the local rmw_zenohd)",
+        )
+        sub.add_argument(
+            "--mode",
+            default="",
+            choices=["", "client", "peer", "router"],
+            help="Zenoh session mode (default: client, as rmw_zenoh_cpp uses)",
+        )
+        sub.add_argument("-q", "--quiet", action="store_true", help="suppress the summary line")
 
     ros2_publish = subparsers.add_parser(
         "ros2-publish", help="replay a recording onto a ROS 2 topic"
     )
     ros2_publish.add_argument("input", help="source recording")
-    ros2_publish.add_argument("--topic", default="/event_camera/events",
-                              help="topic (default: /event_camera/events)")
-    ros2_publish.add_argument("--window-ms", type=float, default=33.0, metavar="MS",
-                              help="events per packet, in milliseconds (default: 33)")
-    ros2_publish.add_argument("--encoding", default="evt3", choices=["evt3", "evt2"],
-                              help="how the events are packed into the message (default: evt3)")
-    ros2_publish.add_argument("--frame-id", default="event_camera",
-                              help="frame_id on every header (default: event_camera)")
-    ros2_publish.add_argument("--settle", type=float, default=2.0, metavar="S",
-                              help="wait this long for discovery before publishing (default: 2)")
-    ros2_publish.add_argument("--as-fast-as-possible", action="store_true",
-                              help="do not pace to the recording's own clock")
+    ros2_publish.add_argument(
+        "--topic", default="/event_camera/events", help="topic (default: /event_camera/events)"
+    )
+    ros2_publish.add_argument(
+        "--window-ms",
+        type=float,
+        default=33.0,
+        metavar="MS",
+        help="events per packet, in milliseconds (default: 33)",
+    )
+    ros2_publish.add_argument(
+        "--encoding",
+        default="evt3",
+        choices=["evt3", "evt2"],
+        help="how the events are packed into the message (default: evt3)",
+    )
+    ros2_publish.add_argument(
+        "--frame-id",
+        default="event_camera",
+        help="frame_id on every header (default: event_camera)",
+    )
+    ros2_publish.add_argument(
+        "--settle",
+        type=float,
+        default=2.0,
+        metavar="S",
+        help="wait this long for discovery before publishing (default: 2)",
+    )
+    ros2_publish.add_argument(
+        "--as-fast-as-possible",
+        action="store_true",
+        help="do not pace to the recording's own clock",
+    )
     _add_ros2_options(ros2_publish)
     ros2_publish.set_defaults(func=_cmd_ros2_publish)
 
-    ros2_record = subparsers.add_parser(
-        "ros2-record", help="record a ROS 2 topic to a file"
-    )
+    ros2_record = subparsers.add_parser("ros2-record", help="record a ROS 2 topic to a file")
     ros2_record.add_argument("output", help="destination; the extension picks the format")
-    ros2_record.add_argument("--topic", default="/event_camera/events",
-                             help="topic (default: /event_camera/events)")
-    ros2_record.add_argument("--idle", type=float, default=5.0, metavar="S",
-                             help="stop after this long with nothing on the topic (default: 5)")
-    ros2_record.add_argument("--max-packets", type=int, default=None, metavar="N",
-                             help="stop after N packets")
+    ros2_record.add_argument(
+        "--topic", default="/event_camera/events", help="topic (default: /event_camera/events)"
+    )
+    ros2_record.add_argument(
+        "--idle",
+        type=float,
+        default=5.0,
+        metavar="S",
+        help="stop after this long with nothing on the topic (default: 5)",
+    )
+    ros2_record.add_argument(
+        "--max-packets", type=int, default=None, metavar="N", help="stop after N packets"
+    )
     _add_ros2_options(ros2_record)
     ros2_record.set_defaults(func=_cmd_ros2_record)
 
@@ -551,16 +623,29 @@ def build_parser() -> argparse.ArgumentParser:
         "ros2-represent",
         help="subscribe to a topic and republish a representation as sensor_msgs/Image",
     )
-    ros2_represent.add_argument("--topic", default="/event_camera/events",
-                                help="topic to subscribe to (default: /event_camera/events)")
-    ros2_represent.add_argument("--image-topic", default="/event_camera/image",
-                                help="topic to publish on (default: /event_camera/image)")
-    ros2_represent.add_argument("--repr", default="voxel",
-                                help="representation to build (default: voxel)")
-    ros2_represent.add_argument("--bins", type=int, default=3,
-                                help="bins, for the voxel representation (default: 3)")
-    ros2_represent.add_argument("--idle", type=float, default=5.0, metavar="S",
-                                help="stop after this long with nothing on the topic (default: 5)")
+    ros2_represent.add_argument(
+        "--topic",
+        default="/event_camera/events",
+        help="topic to subscribe to (default: /event_camera/events)",
+    )
+    ros2_represent.add_argument(
+        "--image-topic",
+        default="/event_camera/image",
+        help="topic to publish on (default: /event_camera/image)",
+    )
+    ros2_represent.add_argument(
+        "--repr", default="voxel", help="representation to build (default: voxel)"
+    )
+    ros2_represent.add_argument(
+        "--bins", type=int, default=3, help="bins, for the voxel representation (default: 3)"
+    )
+    ros2_represent.add_argument(
+        "--idle",
+        type=float,
+        default=5.0,
+        metavar="S",
+        help="stop after this long with nothing on the topic (default: 5)",
+    )
     _add_ros2_options(ros2_represent)
     ros2_represent.set_defaults(func=_cmd_ros2_represent)
 

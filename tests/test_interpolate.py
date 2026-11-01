@@ -12,9 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 try:
     import onnx
@@ -43,7 +42,11 @@ def _blend_with_timestep(path, height, width):
             helper.make_node("Add", ["first", "scaled"], ["output"]),
         ],
         "blend",
-        [image("first"), image("second"), helper.make_tensor_value_info("timestep", TensorProto.FLOAT, [1])],
+        [
+            image("first"),
+            image("second"),
+            helper.make_tensor_value_info("timestep", TensorProto.FLOAT, [1]),
+        ],
         [image("output")],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
@@ -101,7 +104,11 @@ def _step_at_midpoint(path, height, width):
             helper.make_node("Where", ["late", "second", "first"], ["output"]),
         ],
         "step",
-        [image("first"), image("second"), helper.make_tensor_value_info("timestep", TensorProto.FLOAT, [1])],
+        [
+            image("first"),
+            image("second"),
+            helper.make_tensor_value_info("timestep", TensorProto.FLOAT, [1]),
+        ],
         [image("output")],
         initializer=[helper.make_tensor("half", TensorProto.FLOAT, [1], [0.5])],
     )

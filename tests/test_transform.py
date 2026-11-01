@@ -10,9 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 EXAMPLE_NPZ = Path(__file__).resolve().parent.parent / "data" / "test" / "example.npz"
 AEDAT2 = "data/development/+0+2+0_l_qry.aedat"
@@ -87,12 +86,7 @@ class TransformChainingTests(unittest.TestCase):
         self.stream = eventcv.load(str(EXAMPLE_NPZ))  # 640×480 N-ImageNet
 
     def test_pipeline_chains_and_tracks_sensor_size(self):
-        out = (
-            self.stream.crop(0, 0, 320, 240)
-            .flip_x()
-            .resize(160, 120)
-            .filter_polarity(1)
-        )
+        out = self.stream.crop(0, 0, 320, 240).flip_x().resize(160, 120).filter_polarity(1)
         self.assertIsInstance(out, eventcv.EventStream)
         self.assertEqual(out.sensor_size, (160, 120))
         coords = out.numpy()

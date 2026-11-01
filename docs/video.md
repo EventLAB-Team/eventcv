@@ -33,9 +33,9 @@ choice of representation to be meaningful, which is what makes it the right defa
 a recording rather than training on one.
 
 ```python
-ecv.save_video(reader, "raw.mp4", dt_ms=5)                 # raw, the default
-ecv.save_video(reader, "raw.mp4", dt_ms=5, decay_ms=20)    # longer trails
-ecv.save_video(reader, "count.mp4", dt_ms=5, repr="count") # a representation instead
+ecv.save_video(reader, "raw.mp4", dt_ms=5)  # raw, the default
+ecv.save_video(reader, "raw.mp4", dt_ms=5, decay_ms=20)  # longer trails
+ecv.save_video(reader, "count.mp4", dt_ms=5, repr="count")  # a representation instead
 ```
 
 A reader opened with `repr=` uses that representation unless `repr="raw"` overrides it.
@@ -77,8 +77,8 @@ look as busy as a loud one.
 video. Override it when you need to:
 
 ```python
-reader.save_video("out.mp4", clim=500.0)   # 500 maps to the top of the colormap
-reader.save_video("out.mp4", clim=0)       # per-frame auto-contrast (the flickering behaviour)
+reader.save_video("out.mp4", clim=500.0)  # 500 maps to the top of the colormap
+reader.save_video("out.mp4", clim=0)  # per-frame auto-contrast (the flickering behaviour)
 ```
 
 Pass an explicit `clim` whenever two videos need to be **comparable** — two conditions, two
@@ -114,10 +114,10 @@ into a paper — use {func}`eventcv.export_png`.
 {meth}`~eventcv.EventCamera.show`, and the same raw polarity-and-decay view by default:
 
 ```python
-ecv.play()                                             # open empty, then choose or drop a file
-ecv.play("recording.h5", dt_ms=5)                    # raw
-ecv.play("recording.h5", dt_ms=20, repr="count")     # a representation
-ecv.play(events, speed=0.25)                         # an in-memory stream, quarter speed
+ecv.play()  # open empty, then choose or drop a file
+ecv.play("recording.h5", dt_ms=5)  # raw
+ecv.play("recording.h5", dt_ms=20, repr="count")  # a representation
+ecv.play(events, speed=0.25)  # an in-memory stream, quarter speed
 ```
 
 The window provides play/pause, stepping, seeking, accumulation time, refresh rate, loop and speed
@@ -131,8 +131,8 @@ work queue.
 A single still image of the raw view, without a window:
 
 ```python
-image = events.raw_image(decay_ms=20)   # (H, W, 3) uint8
-events.view("raw")                      # or show it
+image = events.raw_image(decay_ms=20)  # (H, W, 3) uint8
+events.view("raw")  # or show it
 ```
 
 From the command line:

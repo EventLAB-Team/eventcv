@@ -27,8 +27,9 @@ There is **no official ONNX export of E2VID**. The reference implementation
 ([rpg_e2vid](https://github.com/uzh-rpg/rpg_e2vid)) is PyTorch, so export it yourself:
 
 ```python
-torch.onnx.export(model, example_inputs, "e2vid.onnx",
-                  input_names=["voxel"], output_names=["image"])
+torch.onnx.export(
+    model, example_inputs, "e2vid.onnx", input_names=["voxel"], output_names=["image"]
+)
 ```
 
 The number of voxel bins the export expects is what `with_repr("voxel", bins=…)` has to match.
@@ -48,13 +49,13 @@ does not carry state, so a recurrent export needs {class}`~eventcv.StatefulModel
 ```python
 model = ecv.StatefulModel(
     ecv.Model("e2vid_recurrent.onnx"),
-    state_map={"new_state": "state"},     # output name -> input name
+    state_map={"new_state": "state"},  # output name -> input name
 )
 
 for i in range(len(reader)):
     image = model(reader[i])
 
-model.reset()      # before an unrelated recording
+model.reset()  # before an unrelated recording
 ```
 
 `state_map` says which output feeds back into which input. It is explicit rather than inferred from

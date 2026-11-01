@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Validate a proposed EventCV release version.
 
@@ -18,6 +17,7 @@ import pathlib
 import re
 import subprocess
 import sys
+
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -32,10 +32,7 @@ VERSION_PATTERN = re.compile(
 def parse_version(version: str) -> tuple[int, int, int]:
     """Parse and validate an X.Y.Z version."""
     if not VERSION_PATTERN.fullmatch(version):
-        raise ValueError(
-            f"Invalid version '{version}'. "
-            "Expected MAJOR.MINOR.PATCH (e.g. 1.0.11)."
-        )
+        raise ValueError(f"Invalid version '{version}'. Expected MAJOR.MINOR.PATCH (e.g. 1.0.11).")
 
     return tuple(map(int, version.split(".")))
 
@@ -77,23 +74,18 @@ def validate_version(proposed: str) -> None:
     # Check version ordering
     if new <= old:
         raise ValueError(
-            f"Proposed version {proposed} must be "
-            f"newer than current version {current}."
+            f"Proposed version {proposed} must be newer than current version {current}."
         )
 
     # Check existing tags
     if tag_exists(proposed):
-        raise ValueError(
-            f"Git tag v{proposed} already exists."
-        )
+        raise ValueError(f"Git tag v{proposed} already exists.")
 
     print(f"Validation passed: {current} -> {proposed}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Validate a proposed EventCV release version."
-    )
+    parser = argparse.ArgumentParser(description="Validate a proposed EventCV release version.")
 
     parser.add_argument(
         "version",

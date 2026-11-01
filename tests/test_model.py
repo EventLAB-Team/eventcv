@@ -14,9 +14,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 try:
     import onnx
@@ -170,9 +169,7 @@ class RuntimeDiscoveryTests(unittest.TestCase):
             ("third", lambda: "/third/libonnxruntime.so"),
         )
         with mock.patch.object(eventcv._ort, "_SOURCES", sources):
-            self.assertEqual(
-                eventcv._ort.find_runtime(), ("/second/libonnxruntime.so", "second")
-            )
+            self.assertEqual(eventcv._ort.find_runtime(), ("/second/libonnxruntime.so", "second"))
 
     def test_the_bundled_copy_is_what_a_wheel_uses(self):
         bundled = eventcv._ort._bundled()

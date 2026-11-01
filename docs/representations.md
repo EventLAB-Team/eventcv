@@ -5,9 +5,9 @@ A **representation** turns a sparse {class}`~eventcv.EventStream` into a dense t
 point array. Most are reachable three ways:
 
 ```python
-stream.voxel(bins=5)                       # method
-ecv.voxel(stream, bins=5)                  # free function (OpenCV-style)
-stream.flatten("voxel")                    # by name (defaults; see "By name" below)
+stream.voxel(bins=5)  # method
+ecv.voxel(stream, bins=5)  # free function (OpenCV-style)
+stream.flatten("voxel")  # by name (defaults; see "By name" below)
 ```
 
 The **method** and **free-function** forms take the representation's parameters directly. The
@@ -56,7 +56,7 @@ display regardless of the frame's dtype.
 ## Polarity
 
 ```python
-stream.view()                  # implicit — polarity is the default when nothing is stored/named
+stream.view()  # implicit — polarity is the default when nothing is stored/named
 stream.flatten("polarity")
 ecv.flatten(stream, "polarity", normalize=False)
 ```
@@ -71,8 +71,8 @@ to polarity.)
 ## Binary
 
 ```python
-stream.flatten(binary=True)    # dedicated flag
-stream.flatten("binary")       # equivalent, by name
+stream.flatten(binary=True)  # dedicated flag
+stream.flatten("binary")  # equivalent, by name
 ```
 
 Single channel, `uint8`, `1` where a pixel fired at all (either polarity) and `0` elsewhere.
@@ -82,8 +82,8 @@ No parameters, and — like `polarity` — no dedicated method; only reachable v
 ## Count
 
 ```python
-stream.count()                    # raw uint64 counts (default)
-ecv.count(stream, normalize=True) # uint8, busiest pixel → 255
+stream.count()  # raw uint64 counts (default)
+ecv.count(stream, normalize=True)  # uint8, busiest pixel → 255
 ```
 
 - `normalize` (`bool`, default `False`) — when `True`, rescale to `uint8` (busiest pixel → 255)
@@ -203,7 +203,7 @@ normalization stays on the CPU. Colors pass through unchanged when displayed or 
 ```python
 stream.mcts(max_window_ms=30.0)
 ecv.mcts(stream, max_window_ms=16.0)
-stream.mcts(windows_ms=[1, 5, 20])   # explicit windows: 6 channels
+stream.mcts(windows_ms=[1, 5, 20])  # explicit windows: 6 channels
 ```
 
 - `max_window_ms` (`float`, default: the slice/capture window, else `30.0`) — largest of the
@@ -225,7 +225,7 @@ multi-timescale generalization of `tsurf`.
 ```python
 stream.optical_flow(window=3)
 ecv.optical_flow(stream, window=5)
-stream.view("flow")             # by name; also valid for open(repr="flow")
+stream.view("flow")  # by name; also valid for open(repr="flow")
 ```
 
 - `window` (`int`, default `3`) — half-width of the least-squares neighbourhood (a
@@ -241,7 +241,7 @@ stream is sorted ascending by time.
 
 ```python
 points = stream.pset()
-ecv.pset(stream).numpy()        # [N, 4] float32 array: columns (x, y, t, p)
+ecv.pset(stream).numpy()  # [N, 4] float32 array: columns (x, y, t, p)
 ```
 
 No parameters. Unlike the frame representations above, `pset` returns an
@@ -284,18 +284,18 @@ new dataset reader:
 
 ```python
 # defaults, by name:
-stream.flatten("voxel")                                  # == stream.voxel()  (bins=9)
-reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")    # mcts, max_window_ms follows dt (30)
+stream.flatten("voxel")  # == stream.voxel()  (bins=9)
+reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")  # mcts, max_window_ms follows dt (30)
 
 # parameters by name — only with_repr forwards them:
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("voxel", bins=5)
-array = reader[0]                                        # [5, H, W] voxel for frame 0
-frame = reader.slice(7)                                  # EventFrame — voxel(bins=5) applied
+array = reader[0]  # [5, H, W] voxel for frame 0
+frame = reader.slice(7)  # EventFrame — voxel(bins=5) applied
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("countmask", pct=95.0)
 reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("mcts", windows_ms=[1, 5, 20])
 
 # a repr-less reader yields a stream; name the representation on the slice:
-frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")   # → EventFrame
+frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")  # → EventFrame
 ```
 
 `"pset"` and `"labels"` are not valid names here — `pset` is sparse (see above), and `labels`
@@ -311,9 +311,9 @@ without touching any code.
 ```python
 frame = stream.voxel(bins=5, device="gpu")
 
-ecv.set_device("gpu")        # everything from here on, including reader slices
-print(ecv.get_device())      # "gpu"
-print(ecv.gpu_available())   # False on a build or a machine without one
+ecv.set_device("gpu")  # everything from here on, including reader slices
+print(ecv.get_device())  # "gpu"
+print(ecv.gpu_available())  # False on a build or a machine without one
 ```
 
 The backend is `wgpu`, so the same shaders run on **Metal** (macOS), **Vulkan** (Linux) and

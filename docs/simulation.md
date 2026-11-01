@@ -6,8 +6,8 @@ produced watching the same scene.
 ```python
 import eventcv as ecv
 
-events = ecv.simulate("clip.mp4")                 # realistic defaults
-events = ecv.simulate(frames, fps=1000)           # from a [N, H, W] array
+events = ecv.simulate("clip.mp4")  # realistic defaults
+events = ecv.simulate(frames, fps=1000)  # from a [N, H, W] array
 ```
 
 The result is an ordinary {class}`~eventcv.EventStream` — save it, slice it, build representations
@@ -64,8 +64,9 @@ temporal precision that motivates using an event camera at all.
 For a clean, ideal sensor:
 
 ```python
-events = ecv.simulate("clip.mp4", sigma_thres=0, cutoff_hz=0,
-                      leak_rate_hz=0, shot_noise_rate_hz=0, refractory_us=0)
+events = ecv.simulate(
+    "clip.mp4", sigma_thres=0, cutoff_hz=0, leak_rate_hz=0, shot_noise_rate_hz=0, refractory_us=0
+)
 ```
 
 That configuration is also what makes the simulator testable: an ideal pixel's event count is
@@ -78,9 +79,9 @@ Between two frames the true intensity path is unknown and is assumed linear. The
 in between, the worse that assumption gets — so `upsample` subdivides the interval first.
 
 ```python
-ecv.simulate("clip.mp4", upsample="adaptive")   # default
-ecv.simulate("clip.mp4", upsample="off")        # straight from the source frames
-ecv.simulate("clip.mp4", upsample="8")          # fixed factor
+ecv.simulate("clip.mp4", upsample="adaptive")  # default
+ecv.simulate("clip.mp4", upsample="off")  # straight from the source frames
+ecv.simulate("clip.mp4", upsample="8")  # fixed factor
 ```
 
 `"adaptive"` subdivides until no pixel would emit more than `max_events_per_pixel` (default 1) per
@@ -98,7 +99,7 @@ hard edge can push an otherwise quiet 1080p frame to the maximum, 64 passes over
 for that pair. `max_upsample` caps it:
 
 ```python
-ecv.simulate("clip.mp4", max_upsample=8)        # bound the worst case
+ecv.simulate("clip.mp4", max_upsample=8)  # bound the worst case
 ```
 
 Lowering it trades timestamp accuracy on the fastest content for time, and does nothing at all to
@@ -114,7 +115,7 @@ long the clip is:
 ```python
 result = ecv.simulate("clip.mp4", out="events.h5", progress=True)
 result.frames, result.events, result.path
-len(result)                    # the event count
+len(result)  # the event count
 ```
 
 With `out=` the return value is a `SimulationResult` rather than an `EventStream`; open the file to
@@ -145,7 +146,7 @@ full-size and downsampling afterwards, and quarters the output for each halving 
 `max_frames` stops early.
 
 ```python
-ecv.simulate("clip.mp4", scale=(960, 540), out="events.h5")   # ~4x less of everything
+ecv.simulate("clip.mp4", scale=(960, 540), out="events.h5")  # ~4x less of everything
 ```
 
 Note that the noise floor is charged per pixel per second regardless of what is happening: at the

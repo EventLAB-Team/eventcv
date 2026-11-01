@@ -293,7 +293,7 @@ def open(
         eventcv.export_png((w.count() for w in corners.windows()), "corners/", colormap="turbo")
         # Optical-flow video:
         eventcv.export_png((w.optical_flow() for w in r.windows()), "flow/")
-    
+
     ``downsample=k`` (polarity only) bins ``k``×``k`` sensor pixels into one cell while counting; with
     ``repr="polarity"`` the RAW decoder feeds the histogram directly, without building the window's events.
     """
@@ -1251,9 +1251,7 @@ def circle_mask(sensor_size: tuple[int, int], cx: float, cy: float, r: float):
     return _rust.circle_mask(sensor_size, cx, cy, r)
 
 
-def ellipse_mask(
-    sensor_size: tuple[int, int], cx: float, cy: float, rx: float, ry: float
-):
+def ellipse_mask(sensor_size: tuple[int, int], cx: float, cy: float, rx: float, ry: float):
     """Build an elliptical ROI mask centred on ``(cx, cy)`` with semi-axes ``rx``, ``ry``.
 
     The axis-independent form of :func:`circle_mask`; see it for the conventions.
@@ -1261,9 +1259,7 @@ def ellipse_mask(
     return _rust.ellipse_mask(sensor_size, cx, cy, rx, ry)
 
 
-def rect_mask(
-    sensor_size: tuple[int, int], x0: float, y0: float, width: float, height: float
-):
+def rect_mask(sensor_size: tuple[int, int], x0: float, y0: float, width: float, height: float):
     """Build a rectangular ROI mask keeping the ``width``×``height`` box at ``(x0, y0)``.
 
     Unlike :meth:`EventStream.crop`, which shrinks the sensor grid, a mask keeps the coordinates
@@ -1459,9 +1455,7 @@ _op_names = sorted(
         name
         for cls in _OP_CLASSES
         for name in dir(cls)
-        if not name.startswith("_")
-        and callable(getattr(cls, name))
-        and name not in __all__
+        if not name.startswith("_") and callable(getattr(cls, name)) and name not in __all__
     }
 )
 

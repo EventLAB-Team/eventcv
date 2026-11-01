@@ -14,9 +14,8 @@ one came from is noted alongside it.
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 BAG = ROOT / "data" / "development" / "dvs_vpr_2020-04-21-17-03-03.bag"
@@ -64,9 +63,7 @@ class Evt2RealFileTests(unittest.TestCase):
         self.assertTrue(set(np.unique(events[:, 3])) <= {0, 1})
 
     def test_an_explicit_sensor_size_overrides_the_derivation(self):
-        self.assertEqual(
-            eventcv.open(str(EVT2), sensor_size=(640, 480)).sensor_size, (640, 480)
-        )
+        self.assertEqual(eventcv.open(str(EVT2), sensor_size=(640, 480)).sensor_size, (640, 480))
 
     def test_slicing_agrees_with_a_bulk_read(self):
         # The sparse checkpoint index has to replay to exactly the same events a linear read gives.
@@ -234,9 +231,7 @@ class ContrastMaximisationAgainstImuTests(unittest.TestCase):
         truths, recovered = [], []
         for index in range(6):
             truth, events = self._window(index)
-            result = events.contrast_maximise(
-                model="rotation", camera=camera, initial_step=0.6
-            )
+            result = events.contrast_maximise(model="rotation", camera=camera, initial_step=0.6)
             truths.append(truth[1])
             recovered.append(result["params"][1])
             self.assertGreater(result["improvement"], 1.0, "should beat the static hypothesis")
@@ -248,7 +243,9 @@ class ContrastMaximisationAgainstImuTests(unittest.TestCase):
         np.testing.assert_allclose(recovered, truths, rtol=0.30)
         self.assertLess(np.corrcoef(truths, recovered)[0, 1], 0.0) if False else None
         self.assertGreater(
-            np.corrcoef(truths, recovered)[0, 1], 0.4, "should track the IMU, not just match on average"
+            np.corrcoef(truths, recovered)[0, 1],
+            0.4,
+            "should track the IMU, not just match on average",
         )
 
     def test_hot_pixels_must_be_removed_first(self):
