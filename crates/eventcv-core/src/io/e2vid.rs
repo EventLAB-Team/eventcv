@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use super::IoError;
@@ -79,7 +79,7 @@ impl E2vidWriter {
             writer
                 .start_file(
                     format!("{stem}.txt"),
-                    FileOptions::default().compression_method(CompressionMethod::Deflated),
+                    SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
                 )
                 .map_err(zip_error)?;
             Sink::Zip(Box::new(writer))
@@ -154,7 +154,7 @@ impl E2vidWriter {
         }
         match self.sink {
             Sink::Text(mut writer) => writer.flush().map_err(IoError::Io),
-            Sink::Zip(mut writer) => {
+            Sink::Zip(writer) => {
                 let mut file = writer.finish().map_err(zip_error)?;
                 file.flush().map_err(IoError::Io)
             }
@@ -294,7 +294,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         assert_eq!(archive.len(), 1);
         let mut entry = archive.by_index(0).unwrap();
-        assert_eq!(entry.name(), "eventcv_e2vid_zipped.txt");
+        assert_eq!(entry.name().unwrap(), "eventcv_e2vid_zipped.txt");
         let mut text = String::new();
         std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
         drop(entry);
