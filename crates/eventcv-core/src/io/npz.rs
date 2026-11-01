@@ -4,8 +4,9 @@ use std::path::Path;
 
 use npyz::npz::{NpzArchive, NpzWriter};
 use npyz::{AutoSerialize, Deserialize, Serialize, WriterBuilder};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
+use zip06::write::FileOptions;
 
 use super::IoError;
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
@@ -230,7 +231,8 @@ impl NpzEventSink {
         column: &Column,
         len: usize,
     ) -> Result<(), IoError> {
-        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        let options =
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         zip.start_file(format!("{}.npy", column.name), options)
             .map_err(|error| IoError::Format(format!("zip: {error}")))?;
         zip.write_all(&npy_header(column.descr, len))
@@ -310,7 +312,7 @@ impl super::EventSink for NpzEventSink {
         // `infer_size` produces for one, so the file still round-trips.
         let ((width, height), scale) = self.metadata.unwrap_or(((1, 1), DEFAULT_SCALE_MS));
         let mut scalar = |name: &str, descr: &str, bytes: &[u8]| -> Result<(), IoError> {
-            let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
             zip.start_file(format!("{name}.npy"), options)
                 .map_err(|error| IoError::Format(format!("zip: {error}")))?;
             zip.write_all(&npy_header(descr, 1)).map_err(IoError::Io)?;
@@ -452,7 +454,7 @@ where
     T: Serialize + AutoSerialize + Clone,
     W: Write + Seek,
 {
-    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    let options = FileOptions::default().compression_method(zip06::CompressionMethod::Stored);
     let mut writer = npz
         .array::<T>(name, options)
         .map_err(IoError::Io)?
