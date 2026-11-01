@@ -87,7 +87,9 @@ impl GpuPixelState {
             lowpass: state.lowpass,
             thres_pos: state.thres_pos,
             thres_neg: state.thres_neg,
-            last_t: state.last_t.clamp(i64::from(i32::MIN / 4), i64::from(i32::MAX)) as i32,
+            last_t: state
+                .last_t
+                .clamp(i64::from(i32::MIN / 4), i64::from(i32::MAX)) as i32,
         }
     }
 
@@ -190,8 +192,20 @@ pub(crate) fn run_interval(
     }
     let mut events = Vec::new();
     run_range(
-        width, height, config, frame, 0, total_steps, total_steps, bounds, prev_log, log_now,
-        prev_luma, luma_now, state, &mut events,
+        width,
+        height,
+        config,
+        frame,
+        0,
+        total_steps,
+        total_steps,
+        bounds,
+        prev_log,
+        log_now,
+        prev_luma,
+        luma_now,
+        state,
+        &mut events,
     )
     .then_some(events)
 }
@@ -247,8 +261,20 @@ fn run_range(
         Dispatch::TooLarge => {
             let half = count / 2;
             run_range(
-                width, height, config, frame, offset, half, total_steps, bounds, prev_log, log_now,
-                prev_luma, luma_now, state, events,
+                width,
+                height,
+                config,
+                frame,
+                offset,
+                half,
+                total_steps,
+                bounds,
+                prev_log,
+                log_now,
+                prev_luma,
+                luma_now,
+                state,
+                events,
             ) && run_range(
                 width,
                 height,
@@ -297,8 +323,20 @@ fn run_steps(
     super::gpu::with_context(|context| {
         let sim = context.sim.get_or_init(|| build(context));
         run_dispatch(
-            context, sim, width, height, config, frame, step_offset, total_steps, bounds, prev_log,
-            log_now, prev_luma, luma_now, state,
+            context,
+            sim,
+            width,
+            height,
+            config,
+            frame,
+            step_offset,
+            total_steps,
+            bounds,
+            prev_log,
+            log_now,
+            prev_luma,
+            luma_now,
+            state,
         )
     })
     .unwrap_or(Dispatch::NoDevice)
@@ -469,8 +507,9 @@ fn run_dispatch(
         for (gpu, cpu) in states.iter().zip(state.iter_mut()) {
             gpu.to_cpu(cpu);
         }
-        let produced: &[GpuEvent] =
-            bytemuck::cast_slice(&mapped[state_bytes as usize..(state_bytes + event_bytes) as usize]);
+        let produced: &[GpuEvent] = bytemuck::cast_slice(
+            &mapped[state_bytes as usize..(state_bytes + event_bytes) as usize],
+        );
         let events: Vec<SimEvent> = produced
             .iter()
             .map(|event| SimEvent {
@@ -484,16 +523,14 @@ fn run_dispatch(
         readback.unmap();
         // Next interval starts from what this one needed. Video is temporally coherent, so after
         // the first frame pair the buffer is the right size and the retry above never fires.
-        sim.capacity.store(capacity.max(wanted), std::sync::atomic::Ordering::Relaxed);
+        sim.capacity
+            .store(capacity.max(wanted), std::sync::atomic::Ordering::Relaxed);
         return Dispatch::Events(events);
     }
 }
 
 /// Blocks until `buffer` is mapped, returning its bytes.
-fn map_read<'a>(
-    device: &wgpu::Device,
-    buffer: &'a wgpu::Buffer,
-) -> Option<wgpu::BufferView<'a>> {
+fn map_read<'a>(device: &wgpu::Device, buffer: &'a wgpu::Buffer) -> Option<wgpu::BufferView<'a>> {
     let slice = buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {

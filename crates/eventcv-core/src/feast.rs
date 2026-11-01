@@ -362,22 +362,32 @@ impl Feast {
 
 fn validate(config: &FeastConfig) -> Result<(), FeastError> {
     if config.n_features == 0 {
-        return Err(FeastError::InvalidParameter("n_features must be at least 1"));
+        return Err(FeastError::InvalidParameter(
+            "n_features must be at least 1",
+        ));
     }
     if config.patch == 0 || config.patch.is_multiple_of(2) {
-        return Err(FeastError::InvalidParameter("patch must be odd and at least 1"));
+        return Err(FeastError::InvalidParameter(
+            "patch must be odd and at least 1",
+        ));
     }
     if !config.tau_ms.is_finite() || config.tau_ms <= 0.0 {
-        return Err(FeastError::InvalidParameter("tau_ms must be finite and positive"));
+        return Err(FeastError::InvalidParameter(
+            "tau_ms must be finite and positive",
+        ));
     }
     if !config.eta.is_finite() || config.eta <= 0.0 || config.eta > 1.0 {
         return Err(FeastError::InvalidParameter("eta must be in (0, 1]"));
     }
     if !config.delta_i.is_finite() || config.delta_i < 0.0 {
-        return Err(FeastError::InvalidParameter("delta_i must be finite and non-negative"));
+        return Err(FeastError::InvalidParameter(
+            "delta_i must be finite and non-negative",
+        ));
     }
     if !config.delta_e.is_finite() || config.delta_e < 0.0 {
-        return Err(FeastError::InvalidParameter("delta_e must be finite and non-negative"));
+        return Err(FeastError::InvalidParameter(
+            "delta_e must be finite and non-negative",
+        ));
     }
     Ok(())
 }
@@ -481,7 +491,10 @@ mod tests {
         // percent), so the converged rate is both far below the first epoch and small in absolute
         // terms.
         assert!(first > 0.1, "cold network should miss heavily, got {first}");
-        assert!(last < first, "miss rate should fall with training: {first} → {last}");
+        assert!(
+            last < first,
+            "miss rate should fall with training: {first} → {last}"
+        );
         assert!(last < 0.05, "converged miss rate too high: {last}");
     }
 
@@ -493,7 +506,9 @@ mod tests {
 
         let ids = feast.transform(&stream);
         assert_eq!(ids.len(), stream.len());
-        assert!(ids.iter().all(|&id| (-1..feast.n_features_total() as i32).contains(&id)));
+        assert!(ids
+            .iter()
+            .all(|&id| (-1..feast.n_features_total() as i32).contains(&id)));
         // Most events sit inside the border, so most are labelled.
         let labelled = ids.iter().filter(|&&id| id >= 0).count();
         assert!(labelled > stream.len() / 2);

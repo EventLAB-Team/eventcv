@@ -283,9 +283,11 @@ impl BiasOverrides {
             period: self.period.unwrap_or(base.period),
             target_rate: self.target_rate.unwrap_or(base.target_rate),
             // An explicit band is a deliberate choice, so measuring one would only override it.
-            calibrate: self
-                .calibrate
-                .unwrap_or(if self.target_rate.is_some() { 0 } else { base.calibrate }),
+            calibrate: self.calibrate.unwrap_or(if self.target_rate.is_some() {
+                0
+            } else {
+                base.calibrate
+            }),
             throttle_range: self.throttle_range.unwrap_or(base.throttle_range),
             max_slew: self.max_slew.unwrap_or(base.max_slew),
             patience: self.patience.unwrap_or(base.patience),
@@ -634,7 +636,6 @@ impl BiasController {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{Authority, BiasConfig, BiasController, BiasLimits, BiasValues};
@@ -654,7 +655,10 @@ mod tests {
     /// The reference tuning with calibration switched off — these tests exercise the control law,
     /// and the measuring phase would just shift every period count by a constant.
     fn config() -> BiasConfig {
-        BiasConfig { calibrate: 0, ..BiasConfig::davis346() }
+        BiasConfig {
+            calibrate: 0,
+            ..BiasConfig::davis346()
+        }
     }
 
     /// Runs one whole control period at `rate` events/second, as a single batch.
@@ -688,8 +692,14 @@ mod tests {
         // threshold above it inverts the comparator and floods the sensor. The bounds must keep
         // the slow loop clear of that no matter how long it runs.
         let limits = BiasConfig::prophesee_evk4().limits;
-        assert!(limits.on_threshold.0 > 77, "ON threshold must stay above diff");
-        assert!(limits.off_threshold.1 < 77, "OFF threshold must stay below diff");
+        assert!(
+            limits.on_threshold.0 > 77,
+            "ON threshold must stay above diff"
+        );
+        assert!(
+            limits.off_threshold.1 < 77,
+            "OFF threshold must stay below diff"
+        );
     }
 
     #[test]
@@ -698,7 +708,10 @@ mod tests {
         // controller would think it had moved something it had not.
         let config = BiasConfig::prophesee_evk4();
         for (_, high) in config.limits.each() {
-            assert!(high <= u16::from(u8::MAX), "{high} does not fit a byte register");
+            assert!(
+                high <= u16::from(u8::MAX),
+                "{high} does not fit a byte register"
+            );
         }
         assert!(config.throttle_range.1 <= u16::from(u8::MAX));
     }
@@ -711,7 +724,11 @@ mod tests {
         // that the reference condition is the scene as the camera actually saw it.
         assert!(controller.state().calibrating);
         for remaining in (0..calibrated.calibrate).rev() {
-            assert_eq!(period(&mut controller, 3e4), None, "no bias may move while measuring");
+            assert_eq!(
+                period(&mut controller, 3e4),
+                None,
+                "no bias may move while measuring"
+            );
             // The last measuring period is the one that resolves the band.
             assert_eq!(controller.state().calibrating, remaining > 0);
         }
@@ -719,8 +736,14 @@ mod tests {
 
         let (low, high) = controller.state().target_rate;
         assert!(!controller.state().calibrating);
-        assert!(low < 3e4 && 3e4 < high, "the band must bracket the measured rate");
-        assert!((high / low - 5.0).abs() < 0.1, "spanning the reference paper's 5:1");
+        assert!(
+            low < 3e4 && 3e4 < high,
+            "the band must bracket the measured rate"
+        );
+        assert!(
+            (high / low - 5.0).abs() < 0.1,
+            "spanning the reference paper's 5:1"
+        );
         // And now it controls: a rate well outside the *calibrated* band moves the fast loop, even
         // though it sits inside the configured default the calibration replaced.
         assert!(period(&mut controller, 1e6).is_some());
@@ -743,7 +766,10 @@ mod tests {
             ..Default::default()
         };
         let config = overrides.apply(BiasConfig::davis346());
-        assert_eq!(config.calibrate, 0, "an explicit band must not be measured over");
+        assert_eq!(
+            config.calibrate, 0,
+            "an explicit band must not be measured over"
+        );
         assert_eq!(config.target_rate, (1e4, 1e5));
         // Asking for calibration *and* a band is allowed — the measurement wins, as documented.
         let both = super::BiasOverrides {
@@ -762,7 +788,10 @@ mod tests {
         period(&mut controller, 0.0); // dropped buffers: ignored, not counted as a quiet scene
         drive(&mut controller, 4e4, (calibrated.calibrate - 1) as usize);
         let (low, high) = controller.state().target_rate;
-        assert!(low < 4e4 && 4e4 < high, "the band follows only the periods that counted");
+        assert!(
+            low < 4e4 && 4e4 < high,
+            "the band follows only the periods that counted"
+        );
     }
 
     #[test]
@@ -775,7 +804,13 @@ mod tests {
             },
             ..BiasConfig::prophesee_evk4()
         };
-        let controller = BiasController::new(narrow, BiasValues { off_threshold: 73, ..start() });
+        let controller = BiasController::new(
+            narrow,
+            BiasValues {
+                off_threshold: 73,
+                ..start()
+            },
+        );
         assert_eq!(controller.state().values.off_threshold, 60);
     }
 
@@ -792,7 +827,10 @@ mod tests {
         assert_eq!(davis.target_rate, (1e4, 1e5));
         assert_eq!(evk4.target_rate, (1e4, 1e5));
         assert_eq!(davis.throttle_range, BiasConfig::davis346().throttle_range);
-        assert_eq!(evk4.throttle_range, BiasConfig::prophesee_evk4().throttle_range);
+        assert_eq!(
+            evk4.throttle_range,
+            BiasConfig::prophesee_evk4().throttle_range
+        );
         assert!(overrides.validate().is_ok());
     }
 
@@ -810,11 +848,26 @@ mod tests {
     #[test]
     fn validate_rejects_unusable_tuning() {
         for broken in [
-            BiasConfig { target_rate: (2.5e6, 5e5), ..config() },
-            BiasConfig { period: Duration::ZERO, ..config() },
-            BiasConfig { throttle_range: (1084, 801), ..config() },
-            BiasConfig { limits: BiasLimits::uniform(2040, 0), ..config() },
-            BiasConfig { max_slew: 0, ..config() },
+            BiasConfig {
+                target_rate: (2.5e6, 5e5),
+                ..config()
+            },
+            BiasConfig {
+                period: Duration::ZERO,
+                ..config()
+            },
+            BiasConfig {
+                throttle_range: (1084, 801),
+                ..config()
+            },
+            BiasConfig {
+                limits: BiasLimits::uniform(2040, 0),
+                ..config()
+            },
+            BiasConfig {
+                max_slew: 0,
+                ..config()
+            },
         ] {
             assert!(broken.validate().is_err(), "{broken:?} should be rejected");
         }
@@ -825,12 +878,21 @@ mod tests {
         let slew = config().max_slew;
         // Starved: open the sensor up, but only a step at a time.
         let mut controller = BiasController::new(config(), start());
-        assert_eq!(period(&mut controller, 1e4).unwrap().refractory, start().refractory + slew);
-        assert_eq!(period(&mut controller, 1e4).unwrap().refractory, start().refractory + 2 * slew);
+        assert_eq!(
+            period(&mut controller, 1e4).unwrap().refractory,
+            start().refractory + slew
+        );
+        assert_eq!(
+            period(&mut controller, 1e4).unwrap().refractory,
+            start().refractory + 2 * slew
+        );
 
         // Flooded: throttle, one step at a time, in the other direction.
         let mut controller = BiasController::new(config(), start());
-        assert_eq!(period(&mut controller, 1e8).unwrap().refractory, start().refractory - slew);
+        assert_eq!(
+            period(&mut controller, 1e8).unwrap().refractory,
+            start().refractory - slew
+        );
     }
 
     #[test]
@@ -839,7 +901,11 @@ mod tests {
 
         let mut controller = BiasController::new(config(), start());
         drive(&mut controller, 1e4, periods_to(open) + 4);
-        assert_eq!(controller.state().values.refractory, open, "never past the rail");
+        assert_eq!(
+            controller.state().values.refractory,
+            open,
+            "never past the rail"
+        );
 
         let mut controller = BiasController::new(config(), start());
         drive(&mut controller, 1e8, periods_to(throttled) + 4);
@@ -888,7 +954,11 @@ mod tests {
         let open = config().throttle_range.1;
         let mut controller = BiasController::new(config(), start());
         drive(&mut controller, 1e4, periods_to(open) - 1);
-        assert_eq!(controller.state().authority, Authority::Tracking, "still slewing");
+        assert_eq!(
+            controller.state().authority,
+            Authority::Tracking,
+            "still slewing"
+        );
         assert_eq!(controller.state().slow_steps, 0);
 
         period(&mut controller, 1e4); // arrives at the rail: saturated, count 1 of 2
@@ -911,7 +981,11 @@ mod tests {
     fn a_flooded_rail_steps_the_other_way() {
         let throttled = config().throttle_range.0;
         let mut controller = BiasController::new(config(), start());
-        drive(&mut controller, 1e8, periods_to(throttled) + config().patience as usize);
+        drive(
+            &mut controller,
+            1e8,
+            periods_to(throttled) + config().patience as usize,
+        );
         let state = controller.state();
         assert_eq!(state.authority, Authority::Flooded);
         assert_eq!(state.slow_steps, 1);
@@ -933,7 +1007,11 @@ mod tests {
         // Having left the rail it must climb back and then spend `patience` periods there again,
         // rather than resuming the count it had before.
         period(&mut controller, 1e4); // back at the rail: count 1 of 2
-        assert_eq!(controller.state().slow_steps, 0, "count restarted, not resumed");
+        assert_eq!(
+            controller.state().slow_steps,
+            0,
+            "count restarted, not resumed"
+        );
         period(&mut controller, 1e4); // count 2 of 2
         assert_eq!(controller.state().slow_steps, 1);
     }
@@ -959,7 +1037,10 @@ mod tests {
         // Reach the rail, then six more periods at patience 2 is three steps.
         drive(&mut controller, 1e4, periods_to(open) - 1 + 6);
         assert_eq!(controller.state().slow_steps, 3);
-        assert_eq!(controller.state().values.photoreceptor, start().photoreceptor + 3 * config().step);
+        assert_eq!(
+            controller.state().values.photoreceptor,
+            start().photoreceptor + 3 * config().step
+        );
     }
 
     #[test]
@@ -978,7 +1059,10 @@ mod tests {
         );
         drive(&mut controller, 1e4, 40);
         let values = controller.state().values;
-        assert_eq!(values.photoreceptor, high, "clamped, never wrapped past the ladder");
+        assert_eq!(
+            values.photoreceptor, high,
+            "clamped, never wrapped past the ladder"
+        );
         assert!(values.on_threshold >= low);
     }
 
@@ -988,7 +1072,11 @@ mod tests {
         let mut controller = BiasController::new(config(), start());
         // Reach the rail and take the slow step that follows, which resets the count. The period
         // that arrives at the rail is itself the first of the `patience` count, hence the -1.
-        drive(&mut controller, 1e4, periods_to(open) + config().patience as usize - 1);
+        drive(
+            &mut controller,
+            1e4,
+            periods_to(open) + config().patience as usize - 1,
+        );
         assert_eq!(controller.state().slow_steps, 1);
         // ...now a period that neither moves the fast loop nor completes the next slow count has
         // nothing to write.
@@ -1006,9 +1094,16 @@ mod tests {
         assert_eq!(update.refractory, start().refractory + config().max_slew);
         assert_eq!(controller.state().event_rate, 0.0);
 
-        drive(&mut controller, 0.0, periods_to(config().throttle_range.1) + 1);
+        drive(
+            &mut controller,
+            0.0,
+            periods_to(config().throttle_range.1) + 1,
+        );
         assert_eq!(controller.state().authority, Authority::Starved);
-        assert!(controller.state().slow_steps >= 1, "the slow loop takes over");
+        assert!(
+            controller.state().slow_steps >= 1,
+            "the slow loop takes over"
+        );
     }
 
     #[test]
@@ -1038,7 +1133,11 @@ mod tests {
         let mut controller = BiasController::new(config(), start());
         controller.invalidate();
         period(&mut controller, 1e4);
-        assert_eq!(controller.state().values, start(), "the marked period was ignored");
+        assert_eq!(
+            controller.state().values,
+            start(),
+            "the marked period was ignored"
+        );
         // The next period counted cleanly, so the starved reading is trusted again.
         let update = period(&mut controller, 1e4).expect("a clean period acts");
         assert_eq!(update.refractory, start().refractory + config().max_slew);
@@ -1073,12 +1172,24 @@ mod tests {
         against(&mut controller, cliff, 12);
         let state = controller.state();
         assert_eq!(state.authority, Authority::Hunting);
-        assert!(state.slow_steps >= 1, "the slow loop must engage on an unreachable band");
+        assert!(
+            state.slow_steps >= 1,
+            "the slow loop must engage on an unreachable band"
+        );
         // The hunt delivers ~4 Mev/s on average, above the band, so the operating point has to
         // become *less* sensitive — even though half the periods measured far too few events.
-        assert!(state.values.photoreceptor < start().photoreceptor, "photoreceptor turned down");
-        assert!(state.values.on_threshold > start().on_threshold, "ON threshold raised");
-        assert!(state.values.off_threshold < start().off_threshold, "OFF threshold raised");
+        assert!(
+            state.values.photoreceptor < start().photoreceptor,
+            "photoreceptor turned down"
+        );
+        assert!(
+            state.values.on_threshold > start().on_threshold,
+            "ON threshold raised"
+        );
+        assert!(
+            state.values.off_threshold < start().off_threshold,
+            "OFF threshold raised"
+        );
     }
 
     #[test]
@@ -1099,7 +1210,10 @@ mod tests {
         against(&mut controller, gentle_cliff, 24);
         let state = controller.state();
         assert_eq!(state.authority, Authority::Hunting, "it is still hunting");
-        assert_eq!(state.slow_steps, 0, "but the average is fine, so nothing is moved");
+        assert_eq!(
+            state.slow_steps, 0,
+            "but the average is fine, so nothing is moved"
+        );
         assert_eq!(state.values.photoreceptor, start().photoreceptor);
         assert_eq!(state.values.on_threshold, start().on_threshold);
     }
@@ -1111,7 +1225,11 @@ mod tests {
         period(&mut controller, 1e4); // wants up
         period(&mut controller, 1e8); // wants down: one reversal, out of band
         assert_eq!(controller.state().authority, Authority::Hunting);
-        assert_eq!(controller.state().slow_steps, 0, "one reversal is not enough");
+        assert_eq!(
+            controller.state().slow_steps,
+            0,
+            "one reversal is not enough"
+        );
         period(&mut controller, 1.5e6); // back in band: the evidence is discarded
         assert_eq!(controller.state().authority, Authority::Tracking);
         assert_eq!(controller.state().slow_steps, 0);
@@ -1130,7 +1248,10 @@ mod tests {
                 6e3
             }
         }
-        let patient = BiasConfig { max_slew: 4, ..config() }; // 4 slewing periods per excursion
+        let patient = BiasConfig {
+            max_slew: 4,
+            ..config()
+        }; // 4 slewing periods per excursion
         let mut controller = BiasController::new(patient, start());
         against(&mut controller, wide_cliff, 60);
         assert!(

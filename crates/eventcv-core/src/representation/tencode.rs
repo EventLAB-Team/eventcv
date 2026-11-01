@@ -61,8 +61,7 @@ impl Representation for Tencode {
                     NEGATIVE => values[2 * plane_len + index] = u8::MAX,
                     _ => continue,
                 }
-                values[plane_len + index] = (255.0
-                    * age_ms(stream, reference, latest_t[index])
+                values[plane_len + index] = (255.0 * age_ms(stream, reference, latest_t[index])
                     / self.window_ms)
                     .round()
                     .clamp(0.0, 255.0) as u8;

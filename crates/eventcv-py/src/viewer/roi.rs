@@ -141,7 +141,10 @@ impl MaskEditor {
         if image.width != self.width || image.height != self.height {
             return;
         }
-        let preview = self.drag.as_ref().map(|drag| (self.shape(drag), drag.subtract));
+        let preview = self
+            .drag
+            .as_ref()
+            .map(|drag| (self.shape(drag), drag.subtract));
         let (pixels, _) = image.pixels.as_chunks_mut::<3>();
         for (index, pixel) in pixels.iter_mut().enumerate() {
             let keep = match &preview {

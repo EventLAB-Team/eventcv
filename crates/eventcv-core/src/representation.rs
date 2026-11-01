@@ -61,11 +61,10 @@ pub(crate) fn on_gpu(
 ) -> Result<Vec<i32>, RepresentationError> {
     #[cfg(feature = "gpu")]
     {
-        crate::accel::gpu::with_context(|context| {
-            crate::accel::gpu::run(context, stream, dispatch)
-        })
-        .ok_or_else(|| RepresentationError::Device(crate::accel::unavailable_reason()))?
-        .map_err(|error| match error {
+        crate::accel::gpu::with_context(|context| crate::accel::gpu::run(context, stream, dispatch))
+            .ok_or_else(|| RepresentationError::Device(crate::accel::unavailable_reason()))?
+            .map_err(|error| {
+                match error {
             crate::accel::gpu::GpuError::Saturated => RepresentationError::Device(
                 "a GPU accumulator overflowed: the kernels sum in fixed point so that the result \
                  does not depend on the order the events arrived, and a cell of this frame exceeds \
@@ -75,7 +74,8 @@ pub(crate) fn on_gpu(
             crate::accel::gpu::GpuError::Driver(message) => {
                 RepresentationError::Device(format!("the GPU driver refused the work: {message}"))
             }
-        })
+        }
+            })
     }
     #[cfg(not(feature = "gpu"))]
     {

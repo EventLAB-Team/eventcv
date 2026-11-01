@@ -95,7 +95,10 @@ impl FrameInterpolator for LinearInterpolator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Layout {
     /// One input of six channels: the two frames stacked.
-    Stacked { image: String, timestep: Option<String> },
+    Stacked {
+        image: String,
+        timestep: Option<String>,
+    },
     /// Two image inputs.
     Separate {
         first: String,
@@ -123,7 +126,8 @@ pub struct OnnxInterpolator {
 impl OnnxInterpolator {
     /// Loads `path` and works out how to feed it.
     pub fn load(path: &str) -> Result<Self, InterpError> {
-        let model = crate::model::Model::load(path).map_err(|error| InterpError::Model(error.to_string()))?;
+        let model = crate::model::Model::load(path)
+            .map_err(|error| InterpError::Model(error.to_string()))?;
         let layout = Self::detect(&model)?;
         Ok(Self { model, layout })
     }
@@ -206,10 +210,9 @@ impl OnnxInterpolator {
                 both.extend(rgb(b));
                 vec![(image, shaped(both, 6)?)]
             }
-            Layout::Separate { first, second, .. } => vec![
-                (first, shaped(rgb(a), 3)?),
-                (second, shaped(rgb(b), 3)?),
-            ],
+            Layout::Separate { first, second, .. } => {
+                vec![(first, shaped(rgb(a), 3)?), (second, shaped(rgb(b), 3)?)]
+            }
         };
         if let Some(name) = self.timestep().map(str::to_owned) {
             inputs.push((

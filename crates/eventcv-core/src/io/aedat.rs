@@ -483,7 +483,11 @@ impl FrameDecoder {
         }
         let (x, y) = (usize::from(x), usize::from(y));
         if x < self.width && y < self.height {
-            let plane = if reset { &mut self.reset } else { &mut self.signal };
+            let plane = if reset {
+                &mut self.reset
+            } else {
+                &mut self.signal
+            };
             plane.samples[(self.height - 1 - y) * self.width + x] = adc;
             plane.written += 1;
         }
@@ -684,7 +688,10 @@ impl AedatSliceSource {
         let (width, height) = resolve_sensor(&header, options.sensor_size)?;
         drop(reader);
 
-        let body = File::open(path)?.metadata()?.len().saturating_sub(data_offset);
+        let body = File::open(path)?
+            .metadata()?
+            .len()
+            .saturating_sub(data_offset);
         // A trailing partial record is truncation, not data; ignore it as the sequential
         // reader's `UnexpectedEof` already does.
         let body = body - body % RECORD as u64;
@@ -1092,8 +1099,8 @@ mod tests {
     #[test]
     fn a_preferences_dump_naming_other_chips_does_not_decide_the_geometry() {
         // jAER writes every chip's preferences into the header; only the AEChip line counts.
-        let mut data = b"#!AER-DAT2.0\r\n# AEChip: eu.seebetter.ini.chips.davis.Davis240C\r\n"
-            .to_vec();
+        let mut data =
+            b"#!AER-DAT2.0\r\n# AEChip: eu.seebetter.ini.chips.davis.Davis240C\r\n".to_vec();
         data.extend_from_slice(b"#  <entry key=\"Davis346red.APS.Run\" value=\"true\"/>\r\n");
         data.extend_from_slice(&record(dvs_address(1, 1, true), 1));
         assert_eq!(
@@ -1104,8 +1111,8 @@ mod tests {
 
     #[test]
     fn a_dvs128_recording_is_refused_rather_than_mis_decoded() {
-        let mut data = b"#!AER-DAT2.0\r\n# AEChip: ch.unizh.ini.caviar.chip.retina.DVS128\r\n"
-            .to_vec();
+        let mut data =
+            b"#!AER-DAT2.0\r\n# AEChip: ch.unizh.ini.caviar.chip.retina.DVS128\r\n".to_vec();
         data.extend_from_slice(&record(dvs_address(1, 1, true), 1));
         match read(&data, &LoadOptions::default()) {
             Err(IoError::Unsupported(message)) => assert!(message.contains("DVS128")),
@@ -1123,11 +1130,7 @@ mod tests {
         let stream = read(&data, &LoadOptions::default()).unwrap();
         assert_eq!(
             stream.ts(),
-            &[
-                i64::from(u32::MAX - 1),
-                WRAP_PERIOD + 5,
-                WRAP_PERIOD + 9
-            ]
+            &[i64::from(u32::MAX - 1), WRAP_PERIOD + 5, WRAP_PERIOD + 9]
         );
     }
 
@@ -1154,7 +1157,10 @@ mod tests {
         assert_eq!(middle.ys(), &whole.ys()[3_000..3_010]);
 
         let window = source.slice_time(1_000, 1_100).unwrap();
-        assert_eq!(window.ts(), &[1_000, 1_010, 1_020, 1_030, 1_040, 1_050, 1_060, 1_070, 1_080, 1_090]);
+        assert_eq!(
+            window.ts(),
+            &[1_000, 1_010, 1_020, 1_030, 1_040, 1_050, 1_060, 1_070, 1_080, 1_090]
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -1254,7 +1260,10 @@ mod tests {
     #[test]
     fn formats_without_auxiliary_streams_report_none() {
         // The trait defaults are what every other reader inherits.
-        let (path, source) = slice_source(&file_with(&[record(dvs_address(1, 1, true), 1)]), &two_by_two());
+        let (path, source) = slice_source(
+            &file_with(&[record(dvs_address(1, 1, true), 1)]),
+            &two_by_two(),
+        );
         assert!(source.frames(0, i64::MAX).unwrap().is_empty());
         assert!(source.imu(0, i64::MAX).unwrap().is_empty());
         assert!(source.camera().unwrap().is_none());
