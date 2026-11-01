@@ -106,7 +106,11 @@ impl Representation for CountMask {
             let negative = counts[plane_len + index];
             let active = f32::from(u8::from(positive + negative > 0));
             values[index] = byte(level(positive));
-            values[plane_len + index] = byte(if self.white_frame { 1.0 - active } else { active });
+            values[plane_len + index] = byte(if self.white_frame {
+                1.0 - active
+            } else {
+                active
+            });
             values[2 * plane_len + index] = byte(level(negative));
         }
 
@@ -275,7 +279,14 @@ mod tests {
     fn normalizes_both_planes_by_one_pooled_percentile() {
         // Positive: one event each at x = 0, 1, 2. Negative: 4 at x = 3, 8 at x = 4, 12 at x = 5.
         let mut rows = Vec::new();
-        let pixels = [(0, 1, 1), (1, 1, 1), (2, 1, 1), (3, 4, 0), (4, 8, 0), (5, 12, 0)];
+        let pixels = [
+            (0, 1, 1),
+            (1, 1, 1),
+            (2, 1, 1),
+            (3, 4, 0),
+            (4, 8, 0),
+            (5, 12, 0),
+        ];
         for (x, count, polarity) in pixels {
             for _ in 0..count {
                 let timestamp = rows.len() as u64;

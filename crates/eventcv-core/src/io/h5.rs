@@ -1077,7 +1077,9 @@ fn write_event_column<T: H5Type>(
     data: &[T],
     compression: Compression,
 ) -> Result<(), IoError> {
-    let mut builder = group.new_dataset::<T>().chunk(EVENT_CHUNK.min(data.len().max(1)));
+    let mut builder = group
+        .new_dataset::<T>()
+        .chunk(EVENT_CHUNK.min(data.len().max(1)));
     if let Some(level) = compression.level() {
         // Shuffle before deflate, not instead of it: on its own the shuffle changes nothing about
         // the size, but grouping like-significance bytes together is what gives deflate the long
@@ -1089,9 +1091,7 @@ fn write_event_column<T: H5Type>(
         .create(name)
         .map_err(map_hdf5_error)?;
     if !data.is_empty() {
-        dataset
-            .write_raw(data)
-            .map_err(map_hdf5_error)?;
+        dataset.write_raw(data).map_err(map_hdf5_error)?;
     }
     Ok(())
 }
@@ -1303,7 +1303,11 @@ impl Hdf5EventSink {
             };
             write_scalar_attr(&self.file, "width", width as u64)?;
             write_scalar_attr(&self.file, "height", height as u64)?;
-            write_scalar_attr(&self.file, "timestamp_scale_ms", stream.timestamp_scale_ms())?;
+            write_scalar_attr(
+                &self.file,
+                "timestamp_scale_ms",
+                stream.timestamp_scale_ms(),
+            )?;
             self.columns = Some(columns);
         }
         let columns = self.columns.as_ref().expect("created above");

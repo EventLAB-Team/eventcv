@@ -305,7 +305,10 @@ impl VideoInfo {
     pub fn probe(path: &Path) -> std::io::Result<Self> {
         let output = Command::new("ffprobe")
             .args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-show_entries", "stream=width,height,r_frame_rate,nb_frames"])
+            .args([
+                "-show_entries",
+                "stream=width,height,r_frame_rate,nb_frames",
+            ])
             .args(["-of", "csv=p=0"])
             .arg(path)
             .output()

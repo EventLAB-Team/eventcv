@@ -237,8 +237,8 @@ impl Compression {
     fn from_header(value: i32) -> Result<Self, IoError> {
         match value {
             0 => Ok(Self::None),
-            1 | 2 => Ok(Self::Lz4),   // LZ4, LZ4_HIGH — same decoder, different effort
-            3 | 4 => Ok(Self::Zstd),  // ZSTD, ZSTD_HIGH
+            1 | 2 => Ok(Self::Lz4), // LZ4, LZ4_HIGH — same decoder, different effort
+            3 | 4 => Ok(Self::Zstd), // ZSTD, ZSTD_HIGH
             other => Err(IoError::Unsupported(format!(
                 "unknown AEDAT4 compression type {other}"
             ))),
@@ -248,7 +248,12 @@ impl Compression {
     /// Decompresses into a caller-owned buffer. A recording is thousands of packets of similar
     /// size, so one buffer that keeps its capacity replaces thousands of Vecs that each grow to
     /// the packet size by doubling, and `lz4` holds one decompression context for all of them.
-    fn decode_into(self, body: &[u8], lz4: &mut Lz4Frame, out: &mut Vec<u8>) -> Result<(), IoError> {
+    fn decode_into(
+        self,
+        body: &[u8],
+        lz4: &mut Lz4Frame,
+        out: &mut Vec<u8>,
+    ) -> Result<(), IoError> {
         out.clear();
         match self {
             Self::None => out.extend_from_slice(body),
@@ -280,7 +285,8 @@ impl Lz4Frame {
         let mut ctx = lz4_sys::LZ4FDecompressionContext(std::ptr::null_mut());
         // SAFETY: `ctx` is a valid out-pointer and `LZ4F_VERSION` is the constant the C header
         // requires. A failure leaves the null pointer, which `decompress_into` rejects.
-        let code = unsafe { lz4_sys::LZ4F_createDecompressionContext(&mut ctx, lz4_sys::LZ4F_VERSION) };
+        let code =
+            unsafe { lz4_sys::LZ4F_createDecompressionContext(&mut ctx, lz4_sys::LZ4F_VERSION) };
         if unsafe { lz4_sys::LZ4F_isError(code) } != 0 {
             ctx = lz4_sys::LZ4FDecompressionContext(std::ptr::null_mut());
         }
@@ -534,7 +540,15 @@ const PARALLEL_PACKET_THRESHOLD: usize = 8;
 
 /// One packet and the slice of each output column it alone writes: `(packet, lo, hi, x, y, t, p)`,
 /// where `lo`/`hi` bound the stream indices the caller asked for.
-type PacketTask<'a> = (&'a Packet, usize, usize, &'a mut [u16], &'a mut [u16], &'a mut [i64], &'a mut [bool]);
+type PacketTask<'a> = (
+    &'a Packet,
+    usize,
+    usize,
+    &'a mut [u16],
+    &'a mut [u16],
+    &'a mut [i64],
+    &'a mut [bool],
+);
 
 /// Lazy, indexed source for an AEDAT 4 recording.
 pub struct Aedat4SliceSource {
@@ -812,18 +826,16 @@ impl SliceSource for Aedat4SliceSource {
         ts.truncate(filled);
         ps.truncate(filled);
 
-        Ok(
-            EventStreamBuilder::from_columns(
-                self.width,
-                self.height,
-                TIMESTAMP_SCALE_MS,
-                xs,
-                ys,
-                ts,
-                ps,
-            )
-            .build(),
+        Ok(EventStreamBuilder::from_columns(
+            self.width,
+            self.height,
+            TIMESTAMP_SCALE_MS,
+            xs,
+            ys,
+            ts,
+            ps,
         )
+        .build())
     }
 
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {
@@ -1013,7 +1025,8 @@ fn span_of(body: &[u8]) -> (usize, i64, i64) {
     };
     if let Some((bytes, elements)) = table.vector(slot::ELEMENTS, EVENT_STRIDE) {
         if elements > 0 && bytes.len() >= EVENT_STRIDE {
-            let at = |chunk: &[u8]| i64::from_le_bytes(chunk[0..8].try_into().expect("eight bytes"));
+            let at =
+                |chunk: &[u8]| i64::from_le_bytes(chunk[0..8].try_into().expect("eight bytes"));
             return (
                 elements,
                 at(&bytes[..EVENT_STRIDE]),
@@ -1056,10 +1069,7 @@ mod tests {
     /// The same 64x48 DAVIS recording written by iniVation's own DV under each compression it
     /// offers, so these tests check this reader against the format's reference implementation
     /// rather than against itself.
-    const SAMPLE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../data/test/sample.aedat4"
-    );
+    const SAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/test/sample.aedat4");
     const SAMPLE_ZSTD: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../data/test/sample_zstd.aedat4"
@@ -1078,7 +1088,12 @@ mod tests {
 
         let stream = source.slice_index(0, source.n_events()).unwrap();
         assert_eq!(
-            (stream.xs()[0], stream.ys()[0], stream.ts()[0], stream.ps()[0]),
+            (
+                stream.xs()[0],
+                stream.ys()[0],
+                stream.ts()[0],
+                stream.ps()[0]
+            ),
             (0, 0, 1_000_000, false)
         );
         assert_eq!(
@@ -1099,7 +1114,10 @@ mod tests {
         let head = source.slice_index(0, 10).unwrap();
         assert_eq!(head.ts(), &whole.ts()[..10]);
         let window = source.slice_time(1_010_000, 1_015_000).unwrap();
-        assert_eq!(window.ts(), &[1_010_000, 1_011_000, 1_012_000, 1_013_000, 1_014_000]);
+        assert_eq!(
+            window.ts(),
+            &[1_010_000, 1_011_000, 1_012_000, 1_013_000, 1_014_000]
+        );
     }
 
     #[test]
@@ -1141,12 +1159,18 @@ mod tests {
             lz4.slice_index(0, lz4.n_events()).unwrap(),
             zstd.slice_index(0, zstd.n_events()).unwrap(),
         );
-        assert_eq!((a.xs(), a.ys(), a.ts(), a.ps()), (b.xs(), b.ys(), b.ts(), b.ps()));
+        assert_eq!(
+            (a.xs(), a.ys(), a.ts(), a.ps()),
+            (b.xs(), b.ys(), b.ts(), b.ps())
+        );
         assert_eq!(
             lz4.frames(0, i64::MAX).unwrap()[0].1.data(),
             zstd.frames(0, i64::MAX).unwrap()[0].1.data()
         );
-        assert_eq!(lz4.imu(0, i64::MAX).unwrap(), zstd.imu(0, i64::MAX).unwrap());
+        assert_eq!(
+            lz4.imu(0, i64::MAX).unwrap(),
+            zstd.imu(0, i64::MAX).unwrap()
+        );
     }
 
     /// Builds a minimal uncompressed AEDAT 4 file: an `IOHeader` naming one event stream, then
@@ -1155,7 +1179,6 @@ mod tests {
     fn minimal_file(events: &[(i64, i16, i16, bool)]) -> Vec<u8> {
         minimal_file_packets(&[events.to_vec()])
     }
-
 
     #[test]
     fn a_multi_packet_file_decodes_the_same_in_parallel_as_in_sequence() {
@@ -1189,7 +1212,12 @@ mod tests {
             .collect();
         for (index, &(t, x, y, p)) in expected.iter().enumerate() {
             assert_eq!(
-                (whole.ts()[index], whole.xs()[index], whole.ys()[index], whole.ps()[index]),
+                (
+                    whole.ts()[index],
+                    whole.xs()[index],
+                    whole.ys()[index],
+                    whole.ps()[index]
+                ),
                 (t, x, y, p),
                 "event {index}"
             );
@@ -1317,7 +1345,11 @@ mod tests {
 
     #[test]
     fn a_file_without_a_data_table_is_indexed_by_walking_its_packets() {
-        let events = [(10i64, 1i16, 2i16, true), (20, 3, 0, false), (30, 7, 3, true)];
+        let events = [
+            (10i64, 1i16, 2i16, true),
+            (20, 3, 0, false),
+            (30, 7, 3, true),
+        ];
         let path = write_temporary(&minimal_file(&events), "walk");
         let source = open_aedat4_slice(&path, &LoadOptions::default()).unwrap();
 
@@ -1335,7 +1367,13 @@ mod tests {
     fn a_truncated_file_errors_rather_than_reading_past_its_end() {
         let full = minimal_file(&[(10, 1, 2, true), (20, 3, 0, false)]);
         // Every prefix must fail cleanly — the point is that none of them panics.
-        for cut in [4, MAGIC.len(), MAGIC.len() + 8, full.len() - 40, full.len() - 8] {
+        for cut in [
+            4,
+            MAGIC.len(),
+            MAGIC.len() + 8,
+            full.len() - 40,
+            full.len() - 8,
+        ] {
             let path = write_temporary(&full[..cut], "cut");
             match open_aedat4_slice(&path, &LoadOptions::default()) {
                 Err(_) => {}
@@ -1697,14 +1735,17 @@ impl Aedat4EventSink {
     }
 
     /// Compresses and writes one packet, recording its data-table entry.
-    fn write_packet(&mut self, stream: &EventStream, range: std::ops::Range<usize>) -> Result<(), IoError> {
+    fn write_packet(
+        &mut self,
+        stream: &EventStream,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), IoError> {
         let ts = stream.ts();
         let body = self
             .compression
             .encode(&build_event_packet(stream, range.clone()))?;
-        let size = i32::try_from(body.len()).map_err(|_| {
-            IoError::Unsupported("an AEDAT4 packet body exceeds 2 GB".to_owned())
-        })?;
+        let size = i32::try_from(body.len())
+            .map_err(|_| IoError::Unsupported("an AEDAT4 packet body exceeds 2 GB".to_owned()))?;
         self.file.write_all(&EVENT_STREAM_ID.to_le_bytes())?;
         self.file.write_all(&size.to_le_bytes())?;
         let byte_offset = self.file.stream_position()?;
@@ -1763,7 +1804,9 @@ impl super::EventSink for Aedat4EventSink {
             return self.file.flush().map_err(IoError::Io);
         };
         let position = self.file.stream_position()?;
-        let table = self.compression.encode(&build_data_table(&self.definitions))?;
+        let table = self
+            .compression
+            .encode(&build_data_table(&self.definitions))?;
         self.file.write_all(&table)?;
         self.file.seek(SeekFrom::Start(field))?;
         self.file.write_all(&(position as i64).to_le_bytes())?;

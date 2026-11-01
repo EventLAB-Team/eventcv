@@ -2,11 +2,12 @@ use std::fs::File;
 use std::io::{BufReader, Seek, Write};
 use std::path::Path;
 
-use npyz::npz::{NpzArchive, NpzWriter};
-use npyz::{AutoSerialize, Deserialize, Serialize, WriterBuilder};
+use npyz::npz::file_name_from_array_name;
+use npyz::{AutoSerialize, Deserialize, NpyFile, Serialize, WriterBuilder};
+use zip::read::ZipFile;
+use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
-use zip::CompressionMethod;
-use zip06::write::FileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::IoError;
 use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
@@ -34,11 +35,7 @@ pub fn read_npz(
     sensor: Option<(usize, usize)>,
 ) -> Result<EventStream, IoError> {
     let mut archive = open_archive(path)?;
-    if archive
-        .by_name(EVENT_DATA_KEY)
-        .map_err(IoError::Io)?
-        .is_some()
-    {
+    if by_name(&mut archive, EVENT_DATA_KEY)?.is_some() {
         read_n_imagenet(&mut archive, sensor)
     } else {
         read_native_stream(&mut archive, sensor)
@@ -48,13 +45,11 @@ pub fn read_npz(
 /// Reads the N-ImageNet `event_data` structured array (`t` is a `u16`); the historical
 /// default layout. `sensor` overrides the default 640x480 grid.
 fn read_n_imagenet(
-    archive: &mut NpzArchive<BufReader<File>>,
+    archive: &mut Archive,
     sensor: Option<(usize, usize)>,
 ) -> Result<EventStream, IoError> {
     let (width, height) = sensor.unwrap_or((N_IMAGENET_WIDTH, N_IMAGENET_HEIGHT));
-    let npy = archive
-        .by_name(EVENT_DATA_KEY)
-        .map_err(IoError::Io)?
+    let npy = by_name(archive, EVENT_DATA_KEY)?
         .ok_or_else(|| IoError::Format("missing event_data array".to_owned()))?;
 
     let [event_count] = npy.shape() else {
@@ -86,7 +81,7 @@ fn read_n_imagenet(
 /// Reads EventCV's native per-column layout. Metadata is honoured when present; missing
 /// `sensor`/metadata falls back to inference (size from the coordinate range, default scale).
 fn read_native_stream(
-    archive: &mut NpzArchive<BufReader<File>>,
+    archive: &mut Archive,
     sensor: Option<(usize, usize)>,
 ) -> Result<EventStream, IoError> {
     let xs = read_array::<u16>(archive, "x")?;
@@ -123,7 +118,7 @@ fn read_native_stream(
 /// and `timestamp_scale_ms`, so [`read_npz`] reconstructs it exactly. Uncompressed (STORED),
 /// matching `numpy.savez`.
 pub fn write_npz_stream(path: impl AsRef<Path>, stream: &EventStream) -> Result<(), IoError> {
-    let mut npz = NpzWriter::create(path).map_err(IoError::Io)?;
+    let mut npz = create_archive(path)?;
     write_array(&mut npz, "t", stream.ts())?;
     write_array(&mut npz, "x", stream.xs())?;
     write_array(&mut npz, "y", stream.ys())?;
@@ -177,7 +172,9 @@ impl Column {
     /// The open writer, or an error if the sink has already been finished.
     fn writer(&mut self) -> Result<&mut std::io::BufWriter<File>, IoError> {
         self.writer.as_mut().ok_or_else(|| {
-            IoError::Io(std::io::Error::other("this npz sink has already been finished"))
+            IoError::Io(std::io::Error::other(
+                "this npz sink has already been finished",
+            ))
         })
     }
 }
@@ -231,8 +228,7 @@ impl NpzEventSink {
         column: &Column,
         len: usize,
     ) -> Result<(), IoError> {
-        let options =
-            SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         zip.start_file(format!("{}.npy", column.name), options)
             .map_err(|error| IoError::Format(format!("zip: {error}")))?;
         zip.write_all(&npy_header(column.descr, len))
@@ -266,13 +262,17 @@ impl super::EventSink for NpzEventSink {
         {
             let writer = self.columns[0].writer()?;
             for value in ts {
-                writer.write_all(&value.to_le_bytes()).map_err(IoError::Io)?;
+                writer
+                    .write_all(&value.to_le_bytes())
+                    .map_err(IoError::Io)?;
             }
         }
         for (column, values) in self.columns[1..3].iter_mut().zip([xs, ys]) {
             let writer = column.writer()?;
             for value in values {
-                writer.write_all(&value.to_le_bytes()).map_err(IoError::Io)?;
+                writer
+                    .write_all(&value.to_le_bytes())
+                    .map_err(IoError::Io)?;
             }
         }
         {
@@ -312,7 +312,8 @@ impl super::EventSink for NpzEventSink {
         // `infer_size` produces for one, so the file still round-trips.
         let ((width, height), scale) = self.metadata.unwrap_or(((1, 1), DEFAULT_SCALE_MS));
         let mut scalar = |name: &str, descr: &str, bytes: &[u8]| -> Result<(), IoError> {
-            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
             zip.start_file(format!("{name}.npy"), options)
                 .map_err(|error| IoError::Format(format!("zip: {error}")))?;
             zip.write_all(&npy_header(descr, 1)).map_err(IoError::Io)?;
@@ -332,7 +333,7 @@ impl super::EventSink for NpzEventSink {
 /// recovers the frame verbatim.
 pub fn write_npz_frame(path: impl AsRef<Path>, frame: &EventFrame) -> Result<(), IoError> {
     let (channels, height, width) = frame.shape();
-    let mut npz = NpzWriter::create(path).map_err(IoError::Io)?;
+    let mut npz = create_archive(path)?;
     write_array(
         &mut npz,
         "shape",
@@ -412,54 +413,67 @@ pub fn read_npz_frame(path: impl AsRef<Path>) -> Result<EventFrame, IoError> {
     ))
 }
 
-/// Opens the archive, mapping a non-archive file to a `Format` error (matching the reader's
-/// historical behaviour).
-fn open_archive(path: impl AsRef<Path>) -> Result<NpzArchive<BufReader<File>>, IoError> {
-    NpzArchive::open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::InvalidData {
-            IoError::Format(error.to_string())
-        } else {
-            IoError::Io(error)
-        }
-    })
+type Archive = ZipArchive<BufReader<File>>;
+
+/// Maps a zip error, keeping I/O failures as `Io` and everything else (not an archive, corrupt,
+/// unsupported) as `Format`, matching the reader's historical behaviour.
+fn zip_error(error: ZipError) -> IoError {
+    match error {
+        ZipError::Io(error) => IoError::Io(error),
+        other => IoError::Format(format!("zip: {other}")),
+    }
+}
+
+fn open_archive(path: impl AsRef<Path>) -> Result<Archive, IoError> {
+    let file = File::open(path).map_err(IoError::Io)?;
+    ZipArchive::new(BufReader::new(file)).map_err(zip_error)
+}
+
+/// The `.npy` member for array `name`, or `None` if the archive has no such array.
+fn by_name<'a>(
+    archive: &'a mut Archive,
+    name: &str,
+) -> Result<Option<NpyFile<ZipFile<'a, BufReader<File>>>>, IoError> {
+    match archive.by_name(&file_name_from_array_name(name)) {
+        Ok(file) => NpyFile::new(file).map(Some).map_err(IoError::Io),
+        Err(ZipError::FileNotFound) => Ok(None),
+        Err(error) => Err(zip_error(error)),
+    }
 }
 
 /// Reads a required array by name into an owned `Vec`.
-fn read_array<T: Deserialize>(
-    archive: &mut NpzArchive<BufReader<File>>,
-    name: &str,
-) -> Result<Vec<T>, IoError> {
-    archive
-        .by_name(name)
-        .map_err(IoError::Io)?
+fn read_array<T: Deserialize>(archive: &mut Archive, name: &str) -> Result<Vec<T>, IoError> {
+    by_name(archive, name)?
         .ok_or_else(|| IoError::Format(format!("missing array '{name}'")))?
         .into_vec::<T>()
         .map_err(IoError::Io)
 }
 
 /// Reads the first element of an optional 1-element metadata array, or `None` if absent.
-fn read_scalar<T: Deserialize>(
-    archive: &mut NpzArchive<BufReader<File>>,
-    name: &str,
-) -> Result<Option<T>, IoError> {
-    match archive.by_name(name).map_err(IoError::Io)? {
+fn read_scalar<T: Deserialize>(archive: &mut Archive, name: &str) -> Result<Option<T>, IoError> {
+    match by_name(archive, name)? {
         Some(npy) => Ok(npy.into_vec::<T>().map_err(IoError::Io)?.into_iter().next()),
         None => Ok(None),
     }
 }
 
+fn create_archive(path: impl AsRef<Path>) -> Result<ZipWriter<File>, IoError> {
+    Ok(ZipWriter::new(File::create(path).map_err(IoError::Io)?))
+}
+
 /// Writes one named 1-D array as an uncompressed (STORED) `.npy` entry in the archive.
-fn write_array<T, W>(npz: &mut NpzWriter<W>, name: &str, data: &[T]) -> Result<(), IoError>
+fn write_array<T, W>(npz: &mut ZipWriter<W>, name: &str, data: &[T]) -> Result<(), IoError>
 where
     T: Serialize + AutoSerialize + Clone,
     W: Write + Seek,
 {
-    let options = FileOptions::default().compression_method(zip06::CompressionMethod::Stored);
-    let mut writer = npz
-        .array::<T>(name, options)
-        .map_err(IoError::Io)?
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    npz.start_file(file_name_from_array_name(name), options)
+        .map_err(zip_error)?;
+    let mut writer = npyz::WriteOptions::new()
         .default_dtype()
         .shape(&[data.len() as u64])
+        .writer(npz)
         .begin_nd()
         .map_err(IoError::Io)?;
     writer.extend(data.iter().cloned()).map_err(IoError::Io)?;
@@ -467,11 +481,8 @@ where
 }
 
 /// Finalises the zip central directory (otherwise the archive is truncated).
-fn finish<W: Write + Seek>(mut npz: NpzWriter<W>) -> Result<(), IoError> {
-    npz.zip_writer()
-        .finish()
-        .map(|_| ())
-        .map_err(|error| IoError::Format(format!("zip: {error}")))
+fn finish<W: Write + Seek>(npz: ZipWriter<W>) -> Result<(), IoError> {
+    npz.finish().map(|_| ()).map_err(zip_error)
 }
 
 /// `(max x + 1, max y + 1)`, or `(1, 1)` for an empty stream — the size-inference fallback
