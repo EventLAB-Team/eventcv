@@ -1,6 +1,8 @@
 name: Publish Python Package
 
 on:
+  pull_request:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -13,6 +15,9 @@ permissions:
 # extra user installs. abi3 means one wheel per platform covers every CPython >= 3.9.
 jobs:
   linux:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -104,6 +109,9 @@ jobs:
         shell: bash
 
   macos:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -129,6 +137,9 @@ jobs:
           path: dist
 
   windows:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -149,6 +160,9 @@ jobs:
           path: dist
 
   sdist:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
