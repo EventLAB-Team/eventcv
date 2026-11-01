@@ -242,9 +242,7 @@ class CameraApiTests(unittest.TestCase):
         import inspect
 
         parameters = inspect.signature(eventcv.record).parameters
-        self.assertIs(
-            parameters["path"].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD
-        )
+        self.assertIs(parameters["path"].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         for name in ("seconds", "serial", "dt_ms", "roi", "mask", "max_event_rate"):
             self.assertIn(name, parameters)
             self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)

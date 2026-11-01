@@ -11,9 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 
 class SliceSpanTests(unittest.TestCase):
@@ -23,9 +22,7 @@ class SliceSpanTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
         cls.path = str(Path(cls.directory.name) / "spans.npz")
-        events = np.array(
-            [[0, 0, 0, 1], [1, 0, 10_000, 1], [2, 0, 49_000, 0]], dtype=np.int64
-        )
+        events = np.array([[0, 0, 0, 1], [1, 0, 10_000, 1], [2, 0, 49_000, 0]], dtype=np.int64)
         stream = eventcv.from_numpy(events, sensor_size=(4, 2), time_unit="us")
         eventcv.save(stream, cls.path)
 
@@ -56,15 +53,11 @@ class SliceSpanTests(unittest.TestCase):
 
     def test_named_representation_follows_dt(self):
         expected = self.open(dt_ms=50).slice(0).mcts(max_window_ms=50).numpy()
-        np.testing.assert_array_equal(
-            self.open(dt_ms=50, repr="mcts").slice(0).numpy(), expected
-        )
+        np.testing.assert_array_equal(self.open(dt_ms=50, repr="mcts").slice(0).numpy(), expected)
         np.testing.assert_array_equal(
             self.open(dt_ms=50).slice(0).flatten("mcts").numpy(), expected
         )
-        np.testing.assert_array_equal(
-            self.open(dt_ms=50).with_repr("mcts")[0], expected
-        )
+        np.testing.assert_array_equal(self.open(dt_ms=50).with_repr("mcts")[0], expected)
 
     def test_explicit_span_wins_over_dt(self):
         explicit = self.open(dt_ms=50).slice(0).mcts(max_window_ms=30).numpy()
@@ -80,9 +73,7 @@ class SliceSpanTests(unittest.TestCase):
 
     def test_windows_iterator_follows_the_span(self):
         first = next(iter(self.open(dt_ms=50).windows()))
-        np.testing.assert_array_equal(
-            first.mcts().numpy(), first.mcts(max_window_ms=50).numpy()
-        )
+        np.testing.assert_array_equal(first.mcts().numpy(), first.mcts(max_window_ms=50).numpy())
 
     def test_count_slices_keep_the_default_span(self):
         slice0 = self.open(max_events=3).slice(0)
@@ -98,9 +89,7 @@ class SliceSpanTests(unittest.TestCase):
 
     def test_whole_loads_keep_the_default_span(self):
         stream = eventcv.load(self.path, sensor_size=(4, 2), time_unit="us")
-        np.testing.assert_array_equal(
-            stream.mcts().numpy(), stream.mcts(max_window_ms=30).numpy()
-        )
+        np.testing.assert_array_equal(stream.mcts().numpy(), stream.mcts(max_window_ms=30).numpy())
 
     def test_explicit_mcts_windows_beat_the_dt_follow_default(self):
         reader = self.open(dt_ms=50).with_repr("mcts", windows_ms=[1, 5, 20])

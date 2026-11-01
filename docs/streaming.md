@@ -8,8 +8,8 @@ a live feed exactly as it does on a recording.
 ```python
 import eventcv as ecv
 
-ecv.list_cameras()          # [{'kind': 'prophesee_evk4', 'name': 'Prophesee EVK4', 'serial': ...}]
-ecv.stream().show()         # live raw view; Ctrl+C or close the window to stop
+ecv.list_cameras()  # [{'kind': 'prophesee_evk4', 'name': 'Prophesee EVK4', 'serial': ...}]
+ecv.stream().show()  # live raw view; Ctrl+C or close the window to stop
 ```
 
 Supported: Prophesee EVK4 / EVK3-HD, iniVation DVXplorer / DAVIS346, CenturyArks VGA. Camera support
@@ -21,11 +21,11 @@ A camera allows exactly one open handle, so the device — and any `record=` fil
 before the next `stream()` can use it. Closing does that, and it happens in one of three ways:
 
 ```python
-with ecv.stream(dt_ms=50) as cam:   # closed on the way out, even on an exception
+with ecv.stream(dt_ms=50) as cam:  # closed on the way out, even on an exception
     ...
 
 cam = ecv.stream(dt_ms=50)
-cam.close()                         # or explicitly
+cam.close()  # or explicitly
 
 ecv.record("session.h5", seconds=10)  # opened, recorded, and closed in one call
 ```
@@ -42,12 +42,12 @@ when the camera was opened with `repr=`, otherwise a raw {class}`~eventcv.EventS
 mirrors {func}`~eventcv.open`: `dt_ms` for fixed durations, `max_events` for a fixed event count.
 
 ```python
-cam = ecv.stream(dt_ms=50, repr="mcts")     # one MCTS frame per ~50 ms of events
+cam = ecv.stream(dt_ms=50, repr="mcts")  # one MCTS frame per ~50 ms of events
 while running:
-    frame = cam.read()                      # blocks for the next window
+    frame = cam.read()  # blocks for the next window
     infer(frame.numpy())
 
-frame = cam.read(timeout_ms=100)            # None if nothing completed in 100 ms
+frame = cam.read(timeout_ms=100)  # None if nothing completed in 100 ms
 ```
 
 `timeout_ms` is a cap on the *wait*, not the window length — it lets an idle scene fall through to
@@ -62,10 +62,10 @@ spans **follow the capture window**, so a live representation covers exactly the
 handed:
 
 ```python
-ecv.stream(dt_ms=50, repr="tencode")                # window_ms = 50, matching the window
+ecv.stream(dt_ms=50, repr="tencode")  # window_ms = 50, matching the window
 ecv.stream(dt_ms=50, repr="tencode", window_ms=20)  # explicit: keep only the newest 20 ms
-ecv.stream(dt_ms=50, repr="voxel", bins=5)          # 5 bins across the 50 ms window
-ecv.stream(max_events=50_000, repr="tsurf")         # no fixed duration -> tau_ms stays 30 ms
+ecv.stream(dt_ms=50, repr="voxel", bins=5)  # 5 bins across the 50 ms window
+ecv.stream(max_events=50_000, repr="tsurf")  # no fixed duration -> tau_ms stays 30 ms
 ```
 
 Without that default a `dt_ms=50` window rendered with tencode's stock 30 ms span would silently
@@ -80,9 +80,9 @@ later:
 ```python
 with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
     while running:
-        infer(cam.read().numpy())       # this window's raw events are already on disk
+        infer(cam.read().numpy())  # this window's raw events are already on disk
 
-ecv.open("session.h5")                  # reads back like any other recording
+ecv.open("session.h5")  # reads back like any other recording
 ```
 
 Writing happens on the capture thread, so there is no per-window Python round trip, and the file is
@@ -109,9 +109,9 @@ To record without a loop or window, use {func}`~eventcv.record`, which opens the
 and closes it:
 
 ```python
-ecv.record("session.h5", seconds=10)     # blocks 10 s (or Ctrl+C); returns the event count
-ecv.record("session.npz")                # npz/txt/bag buffer in memory, write at the end
-ecv.open("session.h5")                   # safe straight after: nothing is still writing
+ecv.record("session.h5", seconds=10)  # blocks 10 s (or Ctrl+C); returns the event count
+ecv.record("session.npz")  # npz/txt/bag buffer in memory, write at the end
+ecv.open("session.h5")  # safe straight after: nothing is still writing
 ```
 
 {meth}`~eventcv.EventCamera.record` is the same thing on a camera you already hold open — use it
@@ -124,8 +124,8 @@ twin of {class}`~eventcv.FrameSink`, which appends windows to an extendable HDF5
 ```python
 with ecv.stream(dt_ms=50) as cam, ecv.EventSink("session.h5") as sink:
     for events in cam:
-        sink.append(events)     # to disk, window-by-window
-        track(events)           # ...and process the same window live
+        sink.append(events)  # to disk, window-by-window
+        track(events)  # ...and process the same window live
 ```
 
 Any event format can be recorded this way, not just HDF5: `record=` and {class}`~eventcv.EventSink`
@@ -142,7 +142,7 @@ recording, but they are no longer thrown away: pass `frames=True` / `imu=True` t
 ```python
 with ecv.stream(dt_ms=50, frames=True, imu=True) as cam:
     for events in cam:
-        for t_us, frame in cam.read_frames():    # EventFrame, uint16 greyscale
+        for t_us, frame in cam.read_frames():  # EventFrame, uint16 greyscale
             reference(frame.numpy())
         gyro = cam.read_imu()["angular_velocity"]  # rad/s, [N, 3]
 ```
@@ -199,8 +199,8 @@ emits. `max_event_rate` (events per second) enables the sensor's on-chip event-r
 so neither costs the host anything:
 
 ```python
-ecv.stream(dt_ms=50, max_event_rate=40_000_000)   # 40 Mev/s ceiling, enforced on-chip
-ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))    # centre quarter only
+ecv.stream(dt_ms=50, max_event_rate=40_000_000)  # 40 Mev/s ceiling, enforced on-chip
+ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))  # centre quarter only
 ```
 
 Both are on-chip on the sensors built around Prophesee's pipeline — the EVK4, the EVK3-HD, and the
@@ -212,7 +212,7 @@ rate on the host would save none of the work the setting exists to avoid.
 
 ```python
 cam = ecv.stream(roi=(320, 180, 640, 360))
-cam.roi     # {'rect': (320, 180, 640, 360), 'applied': 'hardware'}
+cam.roi  # {'rect': (320, 180, 640, 360), 'applied': 'hardware'}
 ```
 
 A saturating scene on a 1280×720 sensor can emit far more than one core can decode, and capping the
@@ -248,7 +248,7 @@ a `record=` file, the windows your loop reads, or `show()`:
 aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
 
 with ecv.stream(dt_ms=50, mask=aperture, record="session.h5") as cam:
-    for events in cam:          # already masked — and so is the recording
+    for events in cam:  # already masked — and so is the recording
         track(events)
 ```
 
@@ -257,8 +257,8 @@ lets you drag shapes, and applies what you drew to the camera:
 
 ```python
 cam = ecv.stream(dt_ms=50)
-cam.draw_mask()                 # drag an ellipse over the aperture, press Enter
-ecv.save_mask(cam.mask, "aperture.png")     # reuse it next session with mask=ecv.load_mask(...)
+cam.draw_mask()  # drag an ellipse over the aperture, press Enter
+ecv.save_mask(cam.mask, "aperture.png")  # reuse it next session with mask=ecv.load_mask(...)
 ```
 
 Drag to keep an area, shift+drag to drop one, `e`/`r`/`f` to switch between ellipse, rectangle, and
@@ -289,7 +289,7 @@ event stream (polarity dots with exponential decay, tuned by `decay_ms`); pass a
 to render that instead:
 
 ```python
-ecv.stream().show()                     # raw polarity view (the default)
+ecv.stream().show()  # raw polarity view (the default)
 ecv.stream(dt_ms=30).show("count", refresh_hz=60)
 ```
 
@@ -314,14 +314,14 @@ Events can be sent and received over UDP, wire-compatible with
 import eventcv as ecv
 
 sender = ecv.UdpSender("127.0.0.1:3333")
-for events in ecv.stream(dt_ms=10):        # from a live camera
+for events in ecv.stream(dt_ms=10):  # from a live camera
     sender.send(events)
 ```
 
 ```python
 receiver = ecv.UdpReceiver("0.0.0.0:3333", sensor_size=(640, 480))
 while True:
-    events = receiver.recv(dt_ms=30)       # empty means silence, not failure
+    events = receiver.recv(dt_ms=30)  # empty means silence, not failure
     frame = events.tencode()
 ```
 

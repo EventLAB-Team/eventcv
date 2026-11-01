@@ -10,9 +10,8 @@ import inspect
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 EXAMPLE_NPZ = Path(__file__).resolve().parent.parent / "data" / "test" / "example.npz"
 
@@ -53,9 +52,7 @@ class TestFunctionalApi(unittest.TestCase):
 
     def test_reader_native_free_function_matches_method(self):
         reader = eventcv.open(str(EXAMPLE_NPZ), dt_ms=20)
-        np.testing.assert_array_equal(
-            eventcv.slice(reader, 0).numpy(), reader.slice(0).numpy()
-        )
+        np.testing.assert_array_equal(eventcv.slice(reader, 0).numpy(), reader.slice(0).numpy())
 
     def test_camera_free_function_matches_method(self):
         cam = eventcv.Camera(200.0, 200.0, 160.0, 120.0, k1=0.1)

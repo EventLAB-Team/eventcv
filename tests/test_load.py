@@ -2,10 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
-
+import numpy as np
 
 EXAMPLE_PATH = Path(__file__).parents[1] / "data" / "test" / "example.npz"
 EVENT_DTYPE = [("x", "<u2"), ("y", "<u2"), ("t", "<u2"), ("p", "?")]
@@ -62,9 +60,7 @@ class LoadTests(unittest.TestCase):
     def test_from_numpy_round_trips_a_stream(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
-        rebuilt = eventcv.from_numpy(
-            stream.numpy(), sensor_size=(640, 480), time_unit="us"
-        )
+        rebuilt = eventcv.from_numpy(stream.numpy(), sensor_size=(640, 480), time_unit="us")
 
         self.assertIsInstance(rebuilt, eventcv.EventStream)
         self.assertEqual(rebuilt.sensor_size, (640, 480))
@@ -76,9 +72,7 @@ class LoadTests(unittest.TestCase):
         stream = eventcv.from_numpy(events, order="txyp", time_unit="us")
 
         self.assertEqual(stream.sensor_size, (4, 3))
-        np.testing.assert_array_equal(
-            stream.numpy(), [[3, 1, 100, 1], [0, 2, 250, 0]]
-        )
+        np.testing.assert_array_equal(stream.numpy(), [[3, 1, 100, 1], [0, 2, 250, 0]])
 
     def test_from_numpy_converts_float_seconds(self):
         events = np.array([[0.0, 0.0, 0.5, 1.0], [1.0, 1.0, 1.5, 0.0]])  # x y t p
@@ -153,9 +147,7 @@ class LoadTests(unittest.TestCase):
         self.assertEqual(stream.timestamp_scale_ms, 0.001)
         self.assertEqual((voxel.kind, voxel.shape), ("voxel", (9, 480, 640)))
         self.assertEqual(voxel.numpy().dtype, np.float32)
-        self.assertEqual(
-            (surface.kind, surface.shape), ("tsurf", (2, 480, 640))
-        )
+        self.assertEqual((surface.kind, surface.shape), ("tsurf", (2, 480, 640)))
         self.assertEqual(surface.channel_names, ("positive", "negative"))
         self.assertEqual(surface.numpy().dtype, np.float32)
         self.assertIsInstance(points, eventcv.EventPointSet)
@@ -208,12 +200,8 @@ class LoadTests(unittest.TestCase):
 
         countmask = stream.countmask()
 
-        self.assertEqual(
-            (countmask.kind, countmask.shape), ("countmask", (3, 480, 640))
-        )
-        self.assertEqual(
-            countmask.channel_names, ("positive", "activity", "negative")
-        )
+        self.assertEqual((countmask.kind, countmask.shape), ("countmask", (3, 480, 640)))
+        self.assertEqual(countmask.channel_names, ("positive", "activity", "negative"))
         self.assertEqual(countmask.numpy().dtype, np.uint8)
         self.assertTrue(callable(countmask.view))
 
@@ -237,35 +225,161 @@ class LoadTests(unittest.TestCase):
         # 40 pseudo-random events on a 6x8 sensor, from the reference renderer's
         # np.random.default_rng(12345) fixture. Here the pooled 99th percentile is 2, so a count
         # of 1 must truncate to 127 rather than round to 128.
-        x = [5, 1, 6, 2, 1, 6, 5, 5, 7, 3, 6, 2, 4, 4, 1, 1, 1, 5, 4, 7,
-             5, 1, 7, 7, 5, 5, 1, 0, 2, 3, 0, 7, 3, 5, 1, 2, 0, 5, 6, 1]
-        y = [4, 0, 2, 0, 4, 2, 2, 2, 2, 1, 3, 4, 2, 1, 0, 0, 0, 0, 0, 3,
-             4, 5, 3, 3, 1, 5, 3, 4, 4, 5, 4, 5, 3, 3, 1, 5, 3, 2, 1, 1]
-        p = [1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0,
-             0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1]
+        x = [
+            5,
+            1,
+            6,
+            2,
+            1,
+            6,
+            5,
+            5,
+            7,
+            3,
+            6,
+            2,
+            4,
+            4,
+            1,
+            1,
+            1,
+            5,
+            4,
+            7,
+            5,
+            1,
+            7,
+            7,
+            5,
+            5,
+            1,
+            0,
+            2,
+            3,
+            0,
+            7,
+            3,
+            5,
+            1,
+            2,
+            0,
+            5,
+            6,
+            1,
+        ]
+        y = [
+            4,
+            0,
+            2,
+            0,
+            4,
+            2,
+            2,
+            2,
+            2,
+            1,
+            3,
+            4,
+            2,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            4,
+            5,
+            3,
+            3,
+            1,
+            5,
+            3,
+            4,
+            4,
+            5,
+            4,
+            5,
+            3,
+            3,
+            1,
+            5,
+            3,
+            2,
+            1,
+            1,
+        ]
+        p = [
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+        ]
         events = np.stack([x, y, np.arange(40), p], axis=1)
         stream = eventcv.from_numpy(events, sensor_size=(8, 6), time_unit="us")
 
         expected = np.array(
             [
-                [[0, 255, 0, 0, 0, 127, 0, 0],
-                 [0, 127, 0, 0, 0, 0, 127, 0],
-                 [0, 0, 0, 0, 127, 255, 0, 127],
-                 [0, 0, 0, 0, 0, 0, 127, 127],
-                 [255, 127, 127, 0, 0, 127, 0, 0],
-                 [0, 127, 0, 0, 0, 127, 0, 127]],
-                [[0, 255, 255, 0, 255, 255, 0, 0],
-                 [0, 255, 0, 255, 255, 255, 255, 0],
-                 [0, 0, 0, 0, 255, 255, 255, 255],
-                 [255, 255, 0, 255, 0, 255, 255, 255],
-                 [255, 255, 255, 0, 0, 255, 0, 0],
-                 [0, 255, 255, 255, 0, 255, 0, 255]],
-                [[0, 255, 127, 0, 127, 0, 0, 0],
-                 [0, 127, 0, 127, 127, 127, 0, 0],
-                 [0, 0, 0, 0, 0, 127, 255, 0],
-                 [127, 127, 0, 127, 0, 127, 0, 255],
-                 [0, 0, 127, 0, 0, 127, 0, 0],
-                 [0, 0, 127, 127, 0, 0, 0, 0]],
+                [
+                    [0, 255, 0, 0, 0, 127, 0, 0],
+                    [0, 127, 0, 0, 0, 0, 127, 0],
+                    [0, 0, 0, 0, 127, 255, 0, 127],
+                    [0, 0, 0, 0, 0, 0, 127, 127],
+                    [255, 127, 127, 0, 0, 127, 0, 0],
+                    [0, 127, 0, 0, 0, 127, 0, 127],
+                ],
+                [
+                    [0, 255, 255, 0, 255, 255, 0, 0],
+                    [0, 255, 0, 255, 255, 255, 255, 0],
+                    [0, 0, 0, 0, 255, 255, 255, 255],
+                    [255, 255, 0, 255, 0, 255, 255, 255],
+                    [255, 255, 255, 0, 0, 255, 0, 0],
+                    [0, 255, 255, 255, 0, 255, 0, 255],
+                ],
+                [
+                    [0, 255, 127, 0, 127, 0, 0, 0],
+                    [0, 127, 0, 127, 127, 127, 0, 0],
+                    [0, 0, 0, 0, 0, 127, 255, 0],
+                    [127, 127, 0, 127, 0, 127, 0, 255],
+                    [0, 0, 127, 0, 0, 127, 0, 0],
+                    [0, 0, 127, 127, 0, 0, 0, 0],
+                ],
             ],
             dtype=np.uint8,
         )
@@ -369,9 +483,7 @@ class LoadTests(unittest.TestCase):
     def test_sum_resize_preserves_raw_event_count(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 
-        events = stream.flatten(normalize=False).resize(
-            256, 256, pooling="sum"
-        ).numpy()
+        events = stream.flatten(normalize=False).resize(256, 256, pooling="sum").numpy()
 
         self.assertEqual(events.dtype, np.uint64)
         self.assertEqual(events.shape, (2, 256, 256))

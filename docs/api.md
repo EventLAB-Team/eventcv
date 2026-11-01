@@ -73,8 +73,8 @@ ascending in time. That removes the conversion script between an EventCV recordi
 event-to-video reconstruction.
 
 ```python
-ecv.save(stream, "events.zip")                       # from a stream
-ecv.save(ecv.open("rec.h5"), "events.zip")           # or straight from a reader
+ecv.save(stream, "events.zip")  # from a stream
+ecv.save(ecv.open("rec.h5"), "events.zip")  # or straight from a reader
 # python run_reconstruction.py --input_file events.zip --fixed_duration -T 33
 ```
 
@@ -95,12 +95,12 @@ they never reach a `record=` file or the windows a loop reads.
 ```python
 import eventcv as ecv
 
-aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)   # a circular sensor aperture
-aperture &= ~ecv.rect_mask((640, 480), 0, 0, 64, 64)            # minus a hot corner
-ecv.save_mask(aperture, "aperture.png")                         # reuse it next session
+aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)  # a circular sensor aperture
+aperture &= ~ecv.rect_mask((640, 480), 0, 0, 64, 64)  # minus a hot corner
+ecv.save_mask(aperture, "aperture.png")  # reuse it next session
 
-ecv.open("rec.h5", dt_ms=30).mask(aperture)                     # every slice, lazily
-ecv.stream(dt_ms=50, mask=aperture, record="session.h5")        # live, before the recorder
+ecv.open("rec.h5", dt_ms=30).mask(aperture)  # every slice, lazily
+ecv.stream(dt_ms=50, mask=aperture, record="session.h5")  # live, before the recorder
 ```
 
 `sensor_size` is `(width, height)` — the same order as everywhere else in eventcv — while the array
@@ -187,14 +187,14 @@ import eventcv as ecv
 
 stream = ecv.load("recording.npz")
 feast = ecv.FEAST(n_features=100, patch=11, tau_ms=30.0, per_polarity=True, seed=0)
-feast.fit(stream, epochs=2)             # online, unsupervised; returns the miss rate
+feast.fit(stream, epochs=2)  # online, unsupervised; returns the miss rate
 
-ids  = feast.transform(stream)          # (N,) nearest-feature id per event (-1 at borders)
-hist = feast.histogram(stream)          # pooled feature-event counts (classifier input)
-imgs = feast.feature_images()           # (n_features_total, patch, patch) learned patches
+ids = feast.transform(stream)  # (N,) nearest-feature id per event (-1 at borders)
+hist = feast.histogram(stream)  # pooled feature-event counts (classifier input)
+imgs = feast.feature_images()  # (n_features_total, patch, patch) learned patches
 
-ecv.save(feast, "model.npz")            # persist the trained model
-feast = ecv.load_feast("model.npz")     # ...and reload it
+ecv.save(feast, "model.npz")  # persist the trained model
+feast = ecv.load_feast("model.npz")  # ...and reload it
 ```
 
 ```{eval-rst}
@@ -215,7 +215,7 @@ import eventcv as ecv
 
 with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
     while running:
-        infer(cam.read().numpy())   # a representation per window; raw events archived as you go
+        infer(cam.read().numpy())  # a representation per window; raw events archived as you go
 ```
 
 {func}`~eventcv.record` is the one-shot form for scripts that only want a file — it opens the
@@ -249,7 +249,7 @@ of travel. It starts from the camera's stock biases, so enabling it never jumps 
 with ecv.stream(dt_ms=50, adaptive_bias={"target_rate": (3e4, 1.2e5)}) as cam:
     while running:
         infer(cam.read().numpy())
-        print(cam.bias_state)   # event_rate, the five bias values, authority, n_slow_steps
+        print(cam.bias_state)  # event_rate, the five bias values, authority, n_slow_steps
 ```
 
 **It measures your scene first.** For about the first second the controller changes nothing and

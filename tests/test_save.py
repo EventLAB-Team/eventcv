@@ -9,9 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 SENSOR = (64, 48)
 
@@ -135,7 +134,9 @@ class PngExportTests(unittest.TestCase):
         frames = (self.stream.count() for _ in range(3))
         paths = eventcv.export_png(frames, str(out), prefix="f_", colormap="grayscale")
 
-        self.assertEqual([Path(p).name for p in paths], ["f_00000.png", "f_00001.png", "f_00002.png"])
+        self.assertEqual(
+            [Path(p).name for p in paths], ["f_00000.png", "f_00001.png", "f_00002.png"]
+        )
         for path in paths:
             self.assertEqual(self._read_png_header(path), SENSOR)
 

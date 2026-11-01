@@ -10,9 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 EXAMPLE_NPZ = Path(__file__).resolve().parent.parent / "data" / "test" / "example.npz"
 
@@ -33,15 +32,11 @@ class EventRateTests(unittest.TestCase):
 
     def test_polarities_sum_to_the_total(self):
         rate = self.stream.event_rate(bin_ms=5)
-        np.testing.assert_array_equal(
-            rate["positive"] + rate["negative"], rate["count"]
-        )
+        np.testing.assert_array_equal(rate["positive"] + rate["negative"], rate["count"])
 
     def test_rate_is_counts_over_the_bin_width(self):
         rate = self.stream.event_rate(bin_ms=5)
-        np.testing.assert_allclose(
-            rate["rate"], rate["count"] / (rate["bin_us"] / 1e6), rtol=1e-9
-        )
+        np.testing.assert_allclose(rate["rate"], rate["count"] / (rate["bin_us"] / 1e6), rtol=1e-9)
 
     def test_bins_are_evenly_spaced_and_ascending(self):
         rate = self.stream.event_rate(bin_ms=5)

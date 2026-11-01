@@ -10,12 +10,11 @@ import io
 import shutil
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
-
-import numpy as np
+from unittest import mock
 
 import eventcv
+import numpy as np
 from eventcv.__main__ import main
 
 EXAMPLE_NPZ = Path(__file__).resolve().parent.parent / "data" / "test" / "example.npz"
@@ -111,9 +110,7 @@ class RenderTests(unittest.TestCase):
 
     def test_render_writes_a_gif(self):
         target = self.dir / "out.gif"
-        code, out, _ = _run(
-            "render", str(EXAMPLE_NPZ), str(target), "--dt-ms", "5", "--fps", "10"
-        )
+        code, out, _ = _run("render", str(EXAMPLE_NPZ), str(target), "--dt-ms", "5", "--fps", "10")
         self.assertEqual(code, 0)
         self.assertIn("frames", out)
         self.assertEqual(target.read_bytes()[:6], b"GIF89a")
@@ -200,8 +197,20 @@ class SimulateCommandTests(unittest.TestCase):
 
         source = self.dir / "clip.mp4"
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-             "-i", "testsrc=size=32x24:rate=30:duration=1", "-pix_fmt", "yuv420p", str(source)],
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=32x24:rate=30:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                str(source),
+            ],
             check=True,
         )
         target = self.dir / "events.npz"
@@ -218,8 +227,20 @@ class SimulateCommandTests(unittest.TestCase):
 
         source = self.dir / "clip.mp4"
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-             "-i", "testsrc=size=32x24:rate=30:duration=1", "-pix_fmt", "yuv420p", str(source)],
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=32x24:rate=30:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                str(source),
+            ],
             check=True,
         )
         # A high threshold must produce fewer events than a low one; if the flag were ignored the

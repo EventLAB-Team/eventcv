@@ -11,9 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 try:
     import onnx
@@ -133,17 +132,27 @@ class ReconstructTests(unittest.TestCase):
         # A model expecting a different number of bins must fail loudly, not silently reshape.
         wrong = _write_reducer(self.dir / "wrong.onnx", self.BINS + 2, self.height, self.width)
         with self.assertRaises(ValueError):
-            eventcv.reconstruct(
-                self._reader(), eventcv.Model(str(wrong)), str(self.dir / "y.gif")
-            )
+            eventcv.reconstruct(self._reader(), eventcv.Model(str(wrong)), str(self.dir / "y.gif"))
 
     @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg is not installed")
     def test_the_full_round_trip(self):
         # video -> events -> reconstruction. The end-to-end path both directions have to support.
         source = self.dir / "clip.mp4"
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-             "-i", "testsrc=size=64x48:rate=30:duration=1", "-pix_fmt", "yuv420p", str(source)],
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                str(source),
+            ],
             check=True,
         )
         events = eventcv.simulate(str(source))

@@ -8,9 +8,8 @@ silently picking one.
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 EXAMPLE = Path(__file__).parents[1] / "data" / "test" / "example.npz"
 
@@ -119,9 +118,7 @@ class StreamOpUnitTests(unittest.TestCase):
 
     def test_time_shift_accepts_any_unit_and_may_be_negative(self):
         shifted = self.stream.time_shift(dt_ms=1.5)
-        np.testing.assert_array_equal(
-            shifted.numpy()[:, 2], self.stream.numpy()[:, 2] + 1500
-        )
+        np.testing.assert_array_equal(shifted.numpy()[:, 2], self.stream.numpy()[:, 2] + 1500)
         back = shifted.time_shift(dt_us=-1500)
         np.testing.assert_array_equal(back.numpy(), self.stream.numpy())
 

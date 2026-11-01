@@ -10,9 +10,8 @@ out of order rather than straight through.
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 EXAMPLE_NPZ = Path(__file__).resolve().parent.parent / "data" / "test" / "example.npz"
 
@@ -43,9 +42,7 @@ class AugmentationBasicsTests(unittest.TestCase):
         stream = _stream()
         n = len(stream)
         # p=0 never fires, p=1 always does — no reliance on a lucky draw.
-        np.testing.assert_array_equal(
-            _columns(stream.random_flip_x(0.0)), _columns(stream)
-        )
+        np.testing.assert_array_equal(_columns(stream.random_flip_x(0.0)), _columns(stream))
         np.testing.assert_array_equal(
             _columns(stream.random_flip_x(1.0)), _columns(stream.flip_x())
         )
@@ -78,9 +75,7 @@ class AugmentationBasicsTests(unittest.TestCase):
         # A window at least as large as the sensor is a no-op, so the op is safe to leave in a
         # pipeline that also runs on smaller recordings.
         width, height = stream.sensor_size
-        self.assertEqual(
-            len(stream.random_crop(width * 2, height * 2, seed=3)), len(stream)
-        )
+        self.assertEqual(len(stream.random_crop(width * 2, height * 2, seed=3)), len(stream))
 
     def test_time_reversal_mirrors_the_span_and_inverts_polarity(self):
         stream = _stream()
@@ -91,9 +86,7 @@ class AugmentationBasicsTests(unittest.TestCase):
         self.assertEqual(mirrored[:, 0].min(), original[:, 0].min())
         self.assertEqual(mirrored[:, 0].max(), original[:, 0].max())
         self.assertTrue(np.all(np.diff(mirrored[:, 0]) >= 0))
-        self.assertEqual(
-            sorted(np.unique(mirrored[:, 3])), sorted(np.unique(original[:, 3]))
-        )
+        self.assertEqual(sorted(np.unique(mirrored[:, 3])), sorted(np.unique(original[:, 3])))
 
     def test_time_jitter_leaves_the_stream_sorted(self):
         # The correlation filters require ascending time, so jitter must re-sort.
@@ -139,11 +132,7 @@ class ReaderSeedingTests(unittest.TestCase):
     """Per-slice seeding — the property a shuffled, multi-worker DataLoader depends on."""
 
     def _reader(self, seed=123):
-        return (
-            eventcv.open(str(EXAMPLE_NPZ), dt_ms=5)
-            .event_drop(0.4, seed=seed)
-            .with_repr("count")
-        )
+        return eventcv.open(str(EXAMPLE_NPZ), dt_ms=5).event_drop(0.4, seed=seed).with_repr("count")
 
     def test_out_of_order_access_matches_sequential(self):
         n = len(self._reader())

@@ -8,6 +8,7 @@ script rewrites that line, refreshes `Cargo.lock` for the two eventcv crates, up
 
     python scripts/bump_version.py 1.0.11
 """
+
 import pathlib
 import re
 import subprocess
