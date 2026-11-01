@@ -154,7 +154,7 @@ impl E2vidWriter {
         }
         match self.sink {
             Sink::Text(mut writer) => writer.flush().map_err(IoError::Io),
-            Sink::Zip(mut writer) => {
+            Sink::Zip(writer) => {
                 let mut file = writer.finish().map_err(zip_error)?;
                 file.flush().map_err(IoError::Io)
             }
