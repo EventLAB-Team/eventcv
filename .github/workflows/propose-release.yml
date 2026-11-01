@@ -1,0 +1,94 @@
+
+name: Propose Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New EventCV version (e.g. 1.0.11)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    name: Propose EventCV Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate proposed version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python scripts/validate_version.py "$RELEASE_VERSION"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Bump version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python scripts/bump_version.py "$RELEASE_VERSION"
+          cargo metadata --locked --no-deps --format-version=1 > /dev/null
+
+      - name: Generate GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open release PR
+        id: pr
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ steps.app.outputs.token }}
+          branch: release/v${{ inputs.version }}
+          base: main
+          delete-branch: true
+          title: "Release EventCV ${{ inputs.version }}"
+          commit-message: "chore(release): v${{ inputs.version }}"
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+            docs/cli.md
+          body: |
+            ## EventCV v${{ inputs.version }}
+
+            Automated release proposal.
+
+            ### Release checklist
+            - [ ] Version numbers updated correctly
+            - [ ] Rust and Python tests pass
+            - [ ] Package builds successfully
+            - [ ] Release changes reviewed
+
+            Once all required checks pass, merge this PR
+            to approve the release.
+
+      - name: Release proposal summary
+        if: steps.pr.outputs.pull-request-url != ''
+        env:
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+        run: |
+          echo "### EventCV Release Proposal" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pull request: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
