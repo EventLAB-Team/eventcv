@@ -693,7 +693,12 @@ impl SliceSource for RawSliceSource {
         Ok(builder.build())
     }
 
-    fn slice_time_into(&self, t0: i64, t1: i64, sink: &mut dyn EventConsumer) -> Result<(), IoError> {
+    fn slice_time_into(
+        &self,
+        t0: i64,
+        t1: i64,
+        sink: &mut dyn EventConsumer,
+    ) -> Result<(), IoError> {
         self.stream_time(t0, t1, sink);
         Ok(())
     }
@@ -721,8 +726,12 @@ pub fn decode_words(
     let word_size = codec.word_size();
     // At most one event per word for EVT2, and vectorised EVT3 words emit more, so this is a
     // starting point rather than a bound.
-    let mut builder =
-        EventStreamBuilder::with_capacity(width, height, TIMESTAMP_SCALE_MS, bytes.len() / word_size);
+    let mut builder = EventStreamBuilder::with_capacity(
+        width,
+        height,
+        TIMESTAMP_SCALE_MS,
+        bytes.len() / word_size,
+    );
     for word in bytes.chunks_exact(word_size) {
         codec.decode(word, |event| {
             if usize::from(event.x) < width && usize::from(event.y) < height {
@@ -880,7 +889,6 @@ impl RawEventSink<BufWriter<File>> {
             state: EncoderState::default(),
         })
     }
-
 }
 
 impl<W: Write> RawEventSink<W> {
@@ -914,7 +922,9 @@ impl<W: Write> RawEventSink<W> {
     }
 
     fn word32(&mut self, word: u32) -> Result<(), IoError> {
-        self.writer.write_all(&word.to_le_bytes()).map_err(IoError::Io)
+        self.writer
+            .write_all(&word.to_le_bytes())
+            .map_err(IoError::Io)
     }
 
     /// EVT2: an `EVT_TIME_HIGH` whenever the 28-bit high half moves, then one CD word per event.
@@ -999,10 +1009,7 @@ impl<W: Write> RawEventSink<W> {
                 index = end;
             } else {
                 for offset in 0..run {
-                    self.word16(
-                        0x2,
-                        (xs[index + offset] & 0x07FF) | ((p as u16) << 11),
-                    )?;
+                    self.word16(0x2, (xs[index + offset] & 0x07FF) | ((p as u16) << 11))?;
                 }
                 index += run;
             }
@@ -1018,7 +1025,11 @@ impl<W: Write + Send> super::EventSink for RawEventSink<W> {
         }
         let ts = stream.ts();
         for index in 0..stream.len() {
-            let previous = if index == 0 { self.last_t } else { Some(ts[index - 1]) };
+            let previous = if index == 0 {
+                self.last_t
+            } else {
+                Some(ts[index - 1])
+            };
             if previous.is_some_and(|previous| ts[index] < previous) {
                 return Err(IoError::Unsupported(format!(
                     "Prophesee .raw carries the timestamp as a coarse half emitted only when it \
@@ -1066,9 +1077,9 @@ impl<W: Write + Send> super::EventSink for RawEventSink<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn word(kind: u16, payload: u16) -> [u8; 2] {
         ((kind << 12) | (payload & 0x0fff)).to_le_bytes()
@@ -1250,9 +1261,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(source.checkpoints.len() > 2, "the stream must span several checkpoints");
-        let window = source.slice_time(time_base + 500, time_base + 4000).unwrap();
-        assert_eq!(window.len(), expected, "events before a checkpoint boundary were replayed past");
+        assert!(
+            source.checkpoints.len() > 2,
+            "the stream must span several checkpoints"
+        );
+        let window = source
+            .slice_time(time_base + 500, time_base + 4000)
+            .unwrap();
+        assert_eq!(
+            window.len(),
+            expected,
+            "events before a checkpoint boundary were replayed past"
+        );
         let mut sink = EventStreamBuilder::new(64, 8, TIMESTAMP_SCALE_MS);
         source
             .slice_time_into(time_base + 500, time_base + 4000, &mut sink)

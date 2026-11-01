@@ -1,6 +1,8 @@
 name: Publish Python Package
 
 on:
+  pull_request:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -13,6 +15,9 @@ permissions:
 # extra user installs. abi3 means one wheel per platform covers every CPython >= 3.9.
 jobs:
   linux:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -104,6 +109,9 @@ jobs:
         shell: bash
 
   macos:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -129,6 +137,9 @@ jobs:
           path: dist
 
   windows:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -149,6 +160,9 @@ jobs:
           path: dist
 
   sdist:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -181,3 +195,36 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+
+  release-checks:
+    name: Release package checks
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [linux, macos, windows, sdist, smoke]
+
+    steps:
+      - name: Verify release builds
+        shell: bash
+        env:
+          RELEASE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/v') }}
+          LINUX: ${{ needs.linux.result }}
+          MACOS: ${{ needs.macos.result }}
+          WINDOWS: ${{ needs.windows.result }}
+          SDIST: ${{ needs.sdist.result }}
+          SMOKE: ${{ needs.smoke.result }}
+        run: |
+          if [[ "$RELEASE_PR" != "true" ]]; then
+            echo "Not a release PR. Validation not required."
+            exit 0
+          fi
+
+          for job in LINUX MACOS WINDOWS SDIST SMOKE; do
+            if [[ "${!job}" != "success" ]]; then
+              echo "::error::$job did not pass: ${!job}"
+              exit 1
+            fi
+          done
+
+          echo "All release package checks passed."
+

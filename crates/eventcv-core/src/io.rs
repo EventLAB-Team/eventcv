@@ -277,7 +277,10 @@ pub fn open_sink(
         Format::Hdf5 => {
             #[cfg(feature = "hdf5")]
             {
-                Ok(Box::new(h5::Hdf5EventSink::open(path, options.compression)?))
+                Ok(Box::new(h5::Hdf5EventSink::open(
+                    path,
+                    options.compression,
+                )?))
             }
             #[cfg(not(feature = "hdf5"))]
             {
@@ -296,10 +299,7 @@ pub fn open_sink(
 /// which is to say everything but `.png`. The live recorder and the simulator use this to stream
 /// to disk window-by-window rather than buffering a whole session in memory.
 pub fn supports_event_append(path: impl AsRef<Path>) -> bool {
-    !matches!(
-        detect_format(path.as_ref()),
-        Err(_) | Ok(Format::Png)
-    )
+    !matches!(detect_format(path.as_ref()), Err(_) | Ok(Format::Png))
 }
 
 /// Whether `path` (with an optional explicit `format`) names an E2VID export — the target
@@ -417,7 +417,12 @@ pub trait SliceSource: Send {
     /// The default fetches the slice and replays it, so every source supports it; a source that
     /// decodes lazily overrides it to hand each event to the sink as it comes off the decoder
     /// (the RAW reader does), which is what makes `open(raw, repr="polarity")` a single pass.
-    fn slice_time_into(&self, t0: i64, t1: i64, sink: &mut dyn EventConsumer) -> Result<(), IoError> {
+    fn slice_time_into(
+        &self,
+        t0: i64,
+        t1: i64,
+        sink: &mut dyn EventConsumer,
+    ) -> Result<(), IoError> {
         let stream = self.slice_time(t0, t1)?;
         let (xs, ys, ts, ps) = (stream.xs(), stream.ys(), stream.ts(), stream.ps());
         for index in 0..stream.len() {
@@ -777,7 +782,10 @@ pub fn write_mask(
             width * height
         )));
     }
-    let pixels: Vec<u8> = mask.iter().map(|&keep| if keep { 255 } else { 0 }).collect();
+    let pixels: Vec<u8> = mask
+        .iter()
+        .map(|&keep| if keep { 255 } else { 0 })
+        .collect();
     let writer = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
     encoder.set_color(png::ColorType::Grayscale);
@@ -969,7 +977,11 @@ mod tests {
             let (x, y, polarity) = if group % 2 == 0 {
                 ((index % 20) as u16, group as u16, true)
             } else {
-                (((index * 7) % 300) as u16, ((index * 13) % 200) as u16, index % 3 == 0)
+                (
+                    ((index * 7) % 300) as u16,
+                    ((index * 13) % 200) as u16,
+                    index % 3 == 0,
+                )
             };
             builder.push(x, y, group * 50_000, polarity);
         }
@@ -1092,7 +1104,10 @@ mod tests {
         assert_eq!(evt3.evt_version(), super::EvtVersion::Evt3);
         // Anything else — including a bare `.raw` — is EVT2, the encoding a reader needs no state
         // to decode.
-        assert_eq!(SaveOptions::default().evt_version(), super::EvtVersion::Evt2);
+        assert_eq!(
+            SaveOptions::default().evt_version(),
+            super::EvtVersion::Evt2
+        );
         assert!(matches!(
             super::requested_format(std::path::Path::new("out.raw"), &evt3),
             Ok(Format::PropheseeRaw)
@@ -1108,7 +1123,10 @@ mod tests {
         for extension in ["npz", "bag"] {
             let path = scratch("spill", extension);
             let siblings = |suffix: &str| -> Vec<std::path::PathBuf> {
-                let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("");
                 std::fs::read_dir(path.parent().expect("a parent"))
                     .into_iter()
                     .flatten()

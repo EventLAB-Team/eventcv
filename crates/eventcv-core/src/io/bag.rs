@@ -231,7 +231,10 @@ impl BagEventSink {
         let topic = topic.unwrap_or(DEFAULT_TOPIC).to_owned();
         let mut payload = BufWriter::new(File::create(&scratch).map_err(IoError::Io)?);
         // The connection record opens the chunk, exactly as in `write_bag`.
-        let connection = make_record(&connection_fields(CONN_ID, &topic), &connection_data(&topic));
+        let connection = make_record(
+            &connection_fields(CONN_ID, &topic),
+            &connection_data(&topic),
+        );
         payload.write_all(&connection).map_err(IoError::Io)?;
         Ok(Self {
             path,
@@ -249,7 +252,9 @@ impl BagEventSink {
     /// The open payload writer, or an error if the sink has already been finished.
     fn payload(&mut self) -> Result<&mut BufWriter<File>, IoError> {
         self.payload.as_mut().ok_or_else(|| {
-            IoError::Io(std::io::Error::other("this rosbag sink has already been finished"))
+            IoError::Io(std::io::Error::other(
+                "this rosbag sink has already been finished",
+            ))
         })
     }
 

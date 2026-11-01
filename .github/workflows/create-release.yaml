@@ -1,0 +1,113 @@
+
+name: Create Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eventcv-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Create EventCV Release
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout merged release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Verify merged version
+        id: version
+        shell: bash
+        env:
+          RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(python -c \
+            'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+
+          # Validate version format
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid version: $VERSION"
+            exit 1
+          fi
+
+          # Ensure release branch matches version
+          if [[ "$RELEASE_BRANCH" != "release/v$VERSION" ]]; then
+            echo "::error::Release branch does not match Cargo.toml version"
+            exit 1
+          fi
+
+          # Ensure checkout matches the merge commit
+          if [[ "$(git rev-parse HEAD)" != "$MERGED_SHA" ]]; then
+            echo "::error::Checkout does not match merge commit"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "Validated release v$VERSION"
+
+      - name: Generate GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Avoid creating duplicate releases
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Skipping."
+            exit 0
+          fi
+
+          # Reject existing tags without a release
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "::error::Tag $TAG already exists without a release."
+            exit 1
+          fi
+
+          # Create tag and publish GitHub release
+          gh release create "$TAG" \
+            --target "$MERGED_SHA" \
+            --title "EventCV $VERSION" \
+            --generate-notes
+
+          echo "### EventCV $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release created successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "PyPI publishing workflow should now start." >> "$GITHUB_STEP_SUMMARY"

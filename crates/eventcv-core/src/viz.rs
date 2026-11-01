@@ -199,9 +199,9 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
             true,
         ),
         // Tencode, CountMask and RedBlue are handled before this call (already RGB).
-        RepresentationKind::Tencode | RepresentationKind::CountMask | RepresentationKind::RedBlue => {
-            (vec![0.0; plane_len], false)
-        }
+        RepresentationKind::Tencode
+        | RepresentationKind::CountMask
+        | RepresentationKind::RedBlue => (vec![0.0; plane_len], false),
     }
 }
 
@@ -557,25 +557,28 @@ impl RawSurface {
     pub fn render(&self) -> Rgb8Image {
         let count = self.width * self.height;
         let mut pixels = vec![0u8; count * 3]; // default black; only lit pixels are written.
-        // Past this age the brightest channel (255) scales below 0.5 and rounds to 0, so the pixel
-        // is black anyway. Skipping the lookup for those — and for never-lit pixels (age = +inf) —
-        // makes a typical sparse scene render in a fraction of the time (most pixels are black).
-        // `6.5 · τ` clears the round-to-zero threshold (`ln(255/0.5) ≈ 6.24 · τ`) with margin.
-        //
-        // `intensity` comes from `decay_lut` rather than calling `exp()` per pixel: this loop runs
-        // over every sensor pixel each display frame (up to ~60 Hz at full sensor resolution), and a
-        // dense/fast-moving scene lights most of them, so the per-pixel cost dominates render time on
-        // cores without a fast hardware transcendental path. The table's resolution (`DECAY_LUT_LEN`
-        // buckets over `[0, cutoff]`, and `cutoff ∝ decay_ms`) keeps the quantization error in
-        // `age / decay_ms` below `1 / DECAY_LUT_LEN`; since `d(intensity)/d(age) ≤ 1 / decay_ms`, the
-        // resulting intensity error stays under `1/DECAY_LUT_LEN`, well below one `u8` step
-        // (`1/255`) after rounding — so this reproduces the same rendered bytes as the direct `exp()`
-        // form in practice.
+                                               // Past this age the brightest channel (255) scales below 0.5 and rounds to 0, so the pixel
+                                               // is black anyway. Skipping the lookup for those — and for never-lit pixels (age = +inf) —
+                                               // makes a typical sparse scene render in a fraction of the time (most pixels are black).
+                                               // `6.5 · τ` clears the round-to-zero threshold (`ln(255/0.5) ≈ 6.24 · τ`) with margin.
+                                               //
+                                               // `intensity` comes from `decay_lut` rather than calling `exp()` per pixel: this loop runs
+                                               // over every sensor pixel each display frame (up to ~60 Hz at full sensor resolution), and a
+                                               // dense/fast-moving scene lights most of them, so the per-pixel cost dominates render time on
+                                               // cores without a fast hardware transcendental path. The table's resolution (`DECAY_LUT_LEN`
+                                               // buckets over `[0, cutoff]`, and `cutoff ∝ decay_ms`) keeps the quantization error in
+                                               // `age / decay_ms` below `1 / DECAY_LUT_LEN`; since `d(intensity)/d(age) ≤ 1 / decay_ms`, the
+                                               // resulting intensity error stays under `1/DECAY_LUT_LEN`, well below one `u8` step
+                                               // (`1/255`) after rounding — so this reproduces the same rendered bytes as the direct `exp()`
+                                               // form in practice.
         for index in 0..count {
             let age = self.latest_ms - self.last_t_ms[index];
             // Keep only `age < cutoff`; the `partial_cmp` form also rejects the `+inf` age of
             // never-lit pixels and any NaN (both compare as `None`/not-`Less`).
-            if !matches!(age.partial_cmp(&self.decay_cutoff), Some(std::cmp::Ordering::Less)) {
+            if !matches!(
+                age.partial_cmp(&self.decay_cutoff),
+                Some(std::cmp::Ordering::Less)
+            ) {
                 continue;
             }
             let bucket = ((age / self.decay_lut_step) as usize).min(DECAY_LUT_LEN - 1);
@@ -661,7 +664,12 @@ mod tests {
     fn raw_surface_persists_across_updates() {
         let (width, height) = (2, 1);
         let mut surface = RawSurface::new(width, height, 50.0);
-        surface.update(&EventStream::from_array2(array![[0, 0, 0, 1]], width, height, 0.001));
+        surface.update(&EventStream::from_array2(
+            array![[0, 0, 0, 1]],
+            width,
+            height,
+            0.001,
+        ));
         surface.update(&EventStream::from_array2(
             array![[1, 0, 100_000, 1]],
             width,
@@ -671,8 +679,14 @@ mod tests {
         let image = surface.render();
 
         // The first pixel survives the second update (state persists), still lit but dimmer.
-        assert!(pixel(&image, 0, 0)[0] > 0, "earlier event persists across updates");
-        assert!(pixel(&image, 1, 0)[0] > pixel(&image, 0, 0)[0], "newest event is brightest");
+        assert!(
+            pixel(&image, 0, 0)[0] > 0,
+            "earlier event persists across updates"
+        );
+        assert!(
+            pixel(&image, 1, 0)[0] > pixel(&image, 0, 0)[0],
+            "newest event is brightest"
+        );
     }
 
     #[test]

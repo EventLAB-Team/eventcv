@@ -139,14 +139,21 @@ fn representations_on_gpu(c: &mut Criterion) {
     for (name, run) in [
         (
             "count",
-            &(|stream: &_, device| EventCount::new(false).generate_on(stream, device).map(|_| ()))
-                as &dyn Fn(&_, Device) -> Result<(), _>,
+            &(|stream: &_, device| {
+                EventCount::new(false)
+                    .generate_on(stream, device)
+                    .map(|_| ())
+            }) as &dyn Fn(&_, Device) -> Result<(), _>,
         ),
         ("voxel_5", &|stream, device| {
-            VoxelGrid::new(5, 30.0).generate_on(stream, device).map(|_| ())
+            VoxelGrid::new(5, 30.0)
+                .generate_on(stream, device)
+                .map(|_| ())
         }),
         ("time_surface", &|stream, device| {
-            TimeSurface::new(30.0).generate_on(stream, device).map(|_| ())
+            TimeSurface::new(30.0)
+                .generate_on(stream, device)
+                .map(|_| ())
         }),
         ("averaged_time_surface", &|stream, device| {
             AveragedTimeSurface::new(30.0)
@@ -189,15 +196,18 @@ fn simulation_on_gpu(c: &mut Criterion) {
         .collect();
 
     for device in [Device::Cpu, Device::Gpu] {
-        group.bench_function(BenchmarkId::new("moving_edge_640x480", device.as_str()), |b| {
-            b.iter(|| {
-                let mut simulator =
-                    Simulator::new(width, height, SimulatorConfig::default()).on_device(device);
-                for (index, frame) in stack.iter().enumerate() {
-                    black_box(simulator.push_frame(frame, index as i64 * 10_000));
-                }
-            })
-        });
+        group.bench_function(
+            BenchmarkId::new("moving_edge_640x480", device.as_str()),
+            |b| {
+                b.iter(|| {
+                    let mut simulator =
+                        Simulator::new(width, height, SimulatorConfig::default()).on_device(device);
+                    for (index, frame) in stack.iter().enumerate() {
+                        black_box(simulator.push_frame(frame, index as i64 * 10_000));
+                    }
+                })
+            },
+        );
     }
     group.finish();
 }

@@ -153,7 +153,11 @@ fn open() -> Option<Context> {
 
 impl Context {
     /// Runs `body` with the pipeline for `entry`, compiling it the first time it is asked for.
-    fn with_pipeline<T>(&self, entry: &'static str, body: impl FnOnce(&wgpu::ComputePipeline) -> T) -> T {
+    fn with_pipeline<T>(
+        &self,
+        entry: &'static str,
+        body: impl FnOnce(&wgpu::ComputePipeline) -> T,
+    ) -> T {
         let mut pipelines = self
             .pipelines
             .lock()
@@ -276,9 +280,9 @@ pub(crate) fn run(
         scale_ms: stream.timestamp_scale_ms() as f32,
         span_ms: dispatch.span_ms,
         fixed_one: dispatch.fixed_one,
-        max_age_ticks: dispatch
-            .window_ms
-            .map_or(u32::MAX, |window| max_age_ticks(window, stream.timestamp_scale_ms())),
+        max_age_ticks: dispatch.window_ms.map_or(u32::MAX, |window| {
+            max_age_ticks(window, stream.timestamp_scale_ms())
+        }),
     };
 
     let device = &context.device;

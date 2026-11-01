@@ -139,7 +139,12 @@ impl Representation for Polarity {
             let mut accumulator = PolarityAccumulator::new(width, height, self.downsample)?;
             for event in stream.iter() {
                 event_index(event, width, height)?;
-                accumulator.push(event.x as u16, event.y as u16, event.timestamp as i64, event.polarity);
+                accumulator.push(
+                    event.x as u16,
+                    event.y as u16,
+                    event.timestamp as i64,
+                    event.polarity,
+                );
             }
             return Ok(accumulator.into_frame(self.normalize));
         }
@@ -185,7 +190,11 @@ pub(super) fn polarity_counts_on(
             needs_ages: false,
         },
     )?;
-    Ok((width, height, cells.iter().map(|cell| *cell as u64).collect()))
+    Ok((
+        width,
+        height,
+        cells.iter().map(|cell| *cell as u64).collect(),
+    ))
 }
 
 /// Per-pixel event counts split into a positive plane (offset `0`) and a negative one (offset
@@ -245,23 +254,40 @@ mod tests {
         }
         rows.extend([[7, 5, 100, 1], [7, 5, 101, 1], [6, 4, 102, 0]]);
         let stream = EventStream::from_array2(
-            ndarray::Array2::from_shape_vec((rows.len(), 4), rows.concat()).unwrap(), 8, 6, 0.001,
+            ndarray::Array2::from_shape_vec((rows.len(), 4), rows.concat()).unwrap(),
+            8,
+            6,
+            0.001,
         );
-        let fused = Polarity::new(false).with_downsample(2).generate(&stream).unwrap();
+        let fused = Polarity::new(false)
+            .with_downsample(2)
+            .generate(&stream)
+            .unwrap();
         let two_pass = Polarity::new(false).generate(&stream.resize(4, 3)).unwrap();
         assert_eq!(fused.shape(), (2, 3, 4));
         assert_eq!(fused.data(), two_pass.data());
         // and the sink path gives the same frame as the stream path
         let mut acc = PolarityAccumulator::new(8, 6, 2).unwrap();
         for event in stream.iter() {
-            acc.push(event.x as u16, event.y as u16, event.timestamp as i64, event.polarity);
+            acc.push(
+                event.x as u16,
+                event.y as u16,
+                event.timestamp as i64,
+                event.polarity,
+            );
         }
         assert_eq!(acc.into_frame(false).data(), fused.data());
         // non-integer ratio: 8x6 by 3 -> 3x2 (ceil), every event still lands in the frame
-        let odd = Polarity::new(false).with_downsample(3).generate(&stream).unwrap();
+        let odd = Polarity::new(false)
+            .with_downsample(3)
+            .generate(&stream)
+            .unwrap();
         assert_eq!(odd.shape(), (2, 2, 3));
         assert_eq!(
-            match odd.data() { EventFrameData::U64(v) => v.iter().sum::<u64>(), _ => 0 },
+            match odd.data() {
+                EventFrameData::U64(v) => v.iter().sum::<u64>(),
+                _ => 0,
+            },
             rows.len() as u64
         );
     }

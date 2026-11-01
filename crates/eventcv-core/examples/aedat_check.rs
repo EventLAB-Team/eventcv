@@ -5,9 +5,13 @@ fn main() {
     let o = LoadOptions::default();
     let src = open_aedat4_slice(&path, &o).unwrap();
     let (lo, hi) = src.time_span();
-    let par = read_aedat4(&path, &o).unwrap();          // parallel slice_index
-    let seq = src.slice_time(lo, hi + 1).unwrap();      // sequential, packet by packet
-    println!("parallel {} events, sequential {} events", par.len(), seq.len());
+    let par = read_aedat4(&path, &o).unwrap(); // parallel slice_index
+    let seq = src.slice_time(lo, hi + 1).unwrap(); // sequential, packet by packet
+    println!(
+        "parallel {} events, sequential {} events",
+        par.len(),
+        seq.len()
+    );
     assert_eq!(par.len(), seq.len(), "count");
     assert_eq!(par.xs(), seq.xs(), "x");
     assert_eq!(par.ys(), seq.ys(), "y");

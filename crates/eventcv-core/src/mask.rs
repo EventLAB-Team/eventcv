@@ -115,7 +115,11 @@ mod tests {
         assert!(!mask[(height - 1) * width + width - 1]);
         // Pixel-centre sampling puts the area within a few percent of πr².
         let area = std::f64::consts::PI * radius * radius;
-        assert!((kept(&mask) as f64 - area).abs() < 0.03 * area, "{}", kept(&mask));
+        assert!(
+            (kept(&mask) as f64 - area).abs() < 0.03 * area,
+            "{}",
+            kept(&mask)
+        );
         // Squashing one axis halves it, and a non-positive radius keeps nothing.
         assert!(kept(&ellipse(width, height, 32.0, 32.0, radius, radius / 2.0)) < kept(&mask));
         assert_eq!(kept(&ellipse(width, height, 32.0, 32.0, 0.0, radius)), 0);

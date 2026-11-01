@@ -11,7 +11,8 @@ categories = ["computer-vision"]
 [dependencies]
 ndarray = "0.17"
 memmap2 = "0.9"
-npyz = { version = "0.9", features = ["derive", "npz"] }
+# `npz` feature off: it pins zip 0.6. The archive side goes through `zip` below (`io/npz.rs`).
+npyz = { version = "0.9", features = ["derive"] }
 # Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
 # `small_rng` is the simulator's per-block noise generator: its parallel pixel loop needs one cheap,
 # independently seeded RNG per block, and `StdRng` (ChaCha12) costs far more than the arithmetic it
@@ -22,9 +23,7 @@ rand_distr = "0.4"
 rayon = "1.10"
 rosbag = "0.6.3"
 # Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.
-# npyz 0.9 still needs zip 0.6's `FileOptions`; direct writers use zip 9.
 zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-zip06 = { package = "zip", version = "0.6", default-features = false }
 # Pure-Rust PNG encoder for colormapped frame export (`.png`) — no system deps, keeps wheels easy.
 # Also writes animated PNG (`acTL`/`fcTL`), so `.apng` export costs no extra dependency.
 png = "0.17"

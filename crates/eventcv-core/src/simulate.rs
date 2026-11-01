@@ -368,7 +368,9 @@ impl Simulator {
     /// interact, so a block can walk the whole interval on its own, which keeps its state hot in
     /// cache and costs one rayon dispatch per frame instead of one per sub-step.
     fn simulate_interval(&mut self, t_previous: i64, span: i64, steps: usize) {
-        if self.device == crate::accel::Device::Gpu && self.simulate_interval_on_gpu(t_previous, span, steps) {
+        if self.device == crate::accel::Device::Gpu
+            && self.simulate_interval_on_gpu(t_previous, span, steps)
+        {
             return;
         }
         let width = self.width;
@@ -1086,14 +1088,8 @@ mod tests {
         let events = run_parallel_sensor();
         assert!(!events.is_empty(), "a brightening sensor must emit");
         assert!(events.ts().windows(2).all(|w| w[0] <= w[1]));
-        assert!(events
-            .xs()
-            .iter()
-            .all(|&x| usize::from(x) < PARALLEL_SIDE));
-        assert!(events
-            .ys()
-            .iter()
-            .all(|&y| usize::from(y) < PARALLEL_SIDE));
+        assert!(events.xs().iter().all(|&x| usize::from(x) < PARALLEL_SIDE));
+        assert!(events.ys().iter().all(|&y| usize::from(y) < PARALLEL_SIDE));
     }
 
     #[test]
@@ -1531,7 +1527,10 @@ mod interp_tests {
     /// A short synthetic clip, or `None` when ffmpeg is not on `PATH` — the same shape the other
     /// video-backed test in this module uses.
     fn clip() -> Option<std::path::PathBuf> {
-        std::process::Command::new("ffmpeg").arg("-version").output().ok()?;
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .ok()?;
         let path = std::env::temp_dir().join(format!("eventcv_interp_{}.mp4", std::process::id()));
         let made = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-y"])

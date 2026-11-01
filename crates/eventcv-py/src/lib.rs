@@ -6,6 +6,7 @@ mod custom;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use eventcv_core::representation::PolarityAccumulator;
 use eventcv_core::{
     camera::Camera,
     cluster::ClusterError,
@@ -19,13 +20,12 @@ use eventcv_core::{
     },
     representation::{
         AveragedTimeSurface, Binary, CountMask, EventCount, EventFrame, EventFrameData,
-        EventPointSet, Mcts, PointSet, Polarity, RedBlue, Representation, RepresentationError, Tencode,
-        TimeSurface, VoxelGrid,
+        EventPointSet, Mcts, PointSet, Polarity, RedBlue, Representation, RepresentationError,
+        Tencode, TimeSurface, VoxelGrid,
     },
     viz::Colormap,
     EventStream, EventStreamBuilder,
 };
-use eventcv_core::representation::PolarityAccumulator;
 use numpy::ndarray::Array2;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
@@ -1095,7 +1095,8 @@ impl PyEventStream {
                 .map_err(map_representation_error),
             None => self.generate_polarity(
                 py,
-                Polarity::new(normalize.unwrap_or(true)).with_downsample(downsample_factor(downsample)?),
+                Polarity::new(normalize.unwrap_or(true))
+                    .with_downsample(downsample_factor(downsample)?),
             ),
         }
     }
@@ -1110,13 +1111,15 @@ impl PyEventStream {
         if representation.extract::<PyRef<'_, PyPolarity>>().is_ok() {
             return self.generate_polarity(
                 py,
-                Polarity::new(normalize.unwrap_or(true)).with_downsample(downsample_factor(downsample)?),
+                Polarity::new(normalize.unwrap_or(true))
+                    .with_downsample(downsample_factor(downsample)?),
             );
         }
         // A representation *name* ("count", "flow", "voxel", …) renders that repr with its
         // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
         if let Ok(name) = representation.extract::<String>() {
-            let spec = ReprSpec::named_with_span_downsample(&name, normalize, self.span_ms, downsample)?;
+            let spec =
+                ReprSpec::named_with_span_downsample(&name, normalize, self.span_ms, downsample)?;
             return py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
@@ -2389,7 +2392,14 @@ impl PyEventReader {
     /// `[C, H, W]` array, so a `torch.utils.data.DataLoader` can collate the reader directly.
     fn __getitem__(&self, py: Python<'_>, index: i64) -> PyResult<Py<PyAny>> {
         let window = self.window_for_index(index)?;
-        if let Some(frame) = fused_polarity_frame(py, &self.inner, &self.repr, &self.slice_ops, &self.hot_pixel_mask, &window) {
+        if let Some(frame) = fused_polarity_frame(
+            py,
+            &self.inner,
+            &self.repr,
+            &self.slice_ops,
+            &self.hot_pixel_mask,
+            &window,
+        ) {
             return Ok(frame_into_numpy(py, frame?).unbind());
         }
         let stream = self.fetch(py, window, self.slice_seed(index))?;
@@ -3102,8 +3112,17 @@ impl PyEventReader {
         index: usize,
     ) -> PyResult<Py<PyAny>> {
         let span_ms = window_span_ms(&window);
-        if let Some(frame) = fused_polarity_frame(py, &self.inner, &self.repr, &self.slice_ops, &self.hot_pixel_mask, &window) {
-            return Ok(Bound::new(py, PyEventFrame { inner: frame? })?.into_any().unbind());
+        if let Some(frame) = fused_polarity_frame(
+            py,
+            &self.inner,
+            &self.repr,
+            &self.slice_ops,
+            &self.hot_pixel_mask,
+            &window,
+        ) {
+            return Ok(Bound::new(py, PyEventFrame { inner: frame? })?
+                .into_any()
+                .unbind());
         }
         let stream = fetch_window(
             py,
@@ -3396,8 +3415,19 @@ impl PyWindowIterator {
         let index = self.emitted;
         self.emitted += 1;
         let span_ms = window_span_ms(&window);
-        if let Some(frame) = fused_polarity_frame(py, &self.reader, &self.repr, &self.slice_ops, &self.hot_pixel_mask, &window) {
-            return Ok(Some(Bound::new(py, PyEventFrame { inner: frame? })?.into_any().unbind()));
+        if let Some(frame) = fused_polarity_frame(
+            py,
+            &self.reader,
+            &self.repr,
+            &self.slice_ops,
+            &self.hot_pixel_mask,
+            &window,
+        ) {
+            return Ok(Some(
+                Bound::new(py, PyEventFrame { inner: frame? })?
+                    .into_any()
+                    .unbind(),
+            ));
         }
         let stream = fetch_window(
             py,
@@ -4798,16 +4828,40 @@ fn stack_frames<'py>(
 enum ReprSpec {
     Custom(Arc<custom::Compiled>),
     Binary,
-    Count { normalize: bool },
-    Polarity { normalize: bool, downsample: usize },
-    Voxel { bins: usize, window_ms: f64 },
-    TimeSurface { tau_ms: f64 },
-    AveragedTimeSurface { tau_ms: f64 },
-    Tencode { window_ms: f64 },
-    CountMask { pct: f64, white_frame: bool },
-    RedBlue { pct: f64 },
-    Mcts { max_window_ms: f64, windows: Option<Vec<f64>> },
-    Flow { window: usize },
+    Count {
+        normalize: bool,
+    },
+    Polarity {
+        normalize: bool,
+        downsample: usize,
+    },
+    Voxel {
+        bins: usize,
+        window_ms: f64,
+    },
+    TimeSurface {
+        tau_ms: f64,
+    },
+    AveragedTimeSurface {
+        tau_ms: f64,
+    },
+    Tencode {
+        window_ms: f64,
+    },
+    CountMask {
+        pct: f64,
+        white_frame: bool,
+    },
+    RedBlue {
+        pct: f64,
+    },
+    Mcts {
+        max_window_ms: f64,
+        windows: Option<Vec<f64>>,
+    },
+    Flow {
+        window: usize,
+    },
 }
 
 impl ReprSpec {
