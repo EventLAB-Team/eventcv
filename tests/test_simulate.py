@@ -12,9 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 
@@ -39,9 +38,20 @@ def _moving_edge(frames=20, size=32, start=6):
 
 def _make_video(path, size="64x48", rate=30, duration=1):
     subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
-         "-i", f"testsrc=size={size}:rate={rate}:duration={duration}",
-         "-pix_fmt", "yuv420p", str(path)],
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=size={size}:rate={rate}:duration={duration}",
+            "-pix_fmt",
+            "yuv420p",
+            str(path),
+        ],
         check=True,
     )
     return path
@@ -129,9 +139,14 @@ class NoiseModelTests(unittest.TestCase):
     def test_leak_fires_at_about_its_rate(self):
         # 10 frames of 100 ms = 1 s; at 10 Hz over 256 pixels, expect ~2560 ON events.
         events = eventcv.simulate(
-            self._static(), fps=10, leak_rate_hz=10.0,
-            shot_noise_rate_hz=0.0, sigma_thres=0.0, cutoff_hz=0.0,
-            refractory_us=0, upsample="off",
+            self._static(),
+            fps=10,
+            leak_rate_hz=10.0,
+            shot_noise_rate_hz=0.0,
+            sigma_thres=0.0,
+            cutoff_hz=0.0,
+            refractory_us=0,
+            upsample="off",
         )
         self.assertTrue(np.all(events.numpy()[:, 3] == 1), "leak emits ON events")
         expected = 10.0 * 16 * 16
@@ -142,8 +157,12 @@ class NoiseModelTests(unittest.TestCase):
         def count(rate):
             return len(
                 eventcv.simulate(
-                    self._static(), fps=10, shot_noise_rate_hz=rate,
-                    leak_rate_hz=0.0, cutoff_hz=0.0, upsample="off",
+                    self._static(),
+                    fps=10,
+                    shot_noise_rate_hz=rate,
+                    leak_rate_hz=0.0,
+                    cutoff_hz=0.0,
+                    upsample="off",
                 )
             )
 
@@ -159,8 +178,12 @@ class NoiseModelTests(unittest.TestCase):
         def count(value):
             return len(
                 eventcv.simulate(
-                    self._static(value=value), fps=10, shot_noise_rate_hz=2.0,
-                    leak_rate_hz=0.0, cutoff_hz=0.0, upsample="off",
+                    self._static(value=value),
+                    fps=10,
+                    shot_noise_rate_hz=2.0,
+                    leak_rate_hz=0.0,
+                    cutoff_hz=0.0,
+                    upsample="off",
                 )
             )
 
@@ -170,12 +193,16 @@ class NoiseModelTests(unittest.TestCase):
 
     def test_threshold_mismatch_desynchronises_pixels(self):
         def distinct_times(sigma):
-            frames = np.stack(
-                [np.full((16, 16), 80, np.uint8), np.full((16, 16), 120, np.uint8)]
-            )
+            frames = np.stack([np.full((16, 16), 80, np.uint8), np.full((16, 16), 120, np.uint8)])
             events = eventcv.simulate(
-                frames, fps=100, sigma_thres=sigma, leak_rate_hz=0.0,
-                shot_noise_rate_hz=0.0, cutoff_hz=0.0, refractory_us=0, upsample="off",
+                frames,
+                fps=100,
+                sigma_thres=sigma,
+                leak_rate_hz=0.0,
+                shot_noise_rate_hz=0.0,
+                cutoff_hz=0.0,
+                refractory_us=0,
+                upsample="off",
             )
             return len(np.unique(events.numpy()[:, 2]))
 
@@ -212,8 +239,15 @@ class UpsamplingTests(unittest.TestCase):
 
     def test_subdividing_does_not_coarsen_timing(self):
         frames = np.stack([np.full((8, 8), 20, np.uint8), np.full((8, 8), 220, np.uint8)])
-        common = dict(fps=100, pos_thres=0.1, sigma_thres=0.0, leak_rate_hz=0.0,
-                      shot_noise_rate_hz=0.0, cutoff_hz=0.0, refractory_us=0)
+        common = dict(
+            fps=100,
+            pos_thres=0.1,
+            sigma_thres=0.0,
+            leak_rate_hz=0.0,
+            shot_noise_rate_hz=0.0,
+            cutoff_hz=0.0,
+            refractory_us=0,
+        )
         off = len(np.unique(eventcv.simulate(frames, upsample="off", **common).numpy()[:, 2]))
         adaptive = len(
             np.unique(eventcv.simulate(frames, upsample="adaptive", **common).numpy()[:, 2])

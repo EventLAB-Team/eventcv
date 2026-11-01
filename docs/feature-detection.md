@@ -17,10 +17,10 @@ if not).
 ```python
 import eventcv as ecv
 
-stream  = ecv.load("recording.npz")
-corners = stream.efast()             # events on moving corners (a sub-stream)
-harris  = stream.harris_corners()    # threshold=0.0 keeps corners, rejects straight edges
-corners.count().view()               # corners feed any representation
+stream = ecv.load("recording.npz")
+corners = stream.efast()  # events on moving corners (a sub-stream)
+harris = stream.harris_corners()  # threshold=0.0 keeps corners, rejects straight edges
+corners.count().view()  # corners feed any representation
 ```
 
 | Detector | Method | Keeps an event when… |
@@ -41,14 +41,14 @@ threshold*: a match nudges that feature toward the input and tightens its thresh
 every threshold. Features converge on the recording's most common local patterns.
 
 ```python
-stream = ecv.load("data/test/example.npz")   # N-ImageNet: a photo scanned by a moving camera
-feast  = ecv.FEAST(n_features=25, patch=11, tau_ms=30.0, per_polarity=False, seed=0)
-feast.fit(stream, epochs=3)                  # unsupervised; returns the miss rate
-print(feast.missed_rate)                     # ~0.013 — a convergence proxy (paper reports ~2%)
+stream = ecv.load("data/test/example.npz")  # N-ImageNet: a photo scanned by a moving camera
+feast = ecv.FEAST(n_features=25, patch=11, tau_ms=30.0, per_polarity=False, seed=0)
+feast.fit(stream, epochs=3)  # unsupervised; returns the miss rate
+print(feast.missed_rate)  # ~0.013 — a convergence proxy (paper reports ~2%)
 
-ids  = feast.transform(stream)               # (N,) nearest-feature id per event (-1 at borders)
-hist = feast.histogram(stream)               # pooled feature counts (a classifier input)
-imgs = feast.feature_images()                # (n_features_total, patch, patch) learned patches
+ids = feast.transform(stream)  # (N,) nearest-feature id per event (-1 at borders)
+hist = feast.histogram(stream)  # pooled feature counts (a classifier input)
+imgs = feast.feature_images()  # (n_features_total, patch, patch) learned patches
 ```
 
 :::{figure} images/feast_input.png
@@ -66,6 +66,7 @@ Tile `feature_images()` into a grid to reproduce the paper's feature plots (need
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 def montage(imgs):
     n, w, _ = imgs.shape
     cols = int(np.ceil(np.sqrt(n)))
@@ -74,10 +75,15 @@ def montage(imgs):
     for i, patch in enumerate(imgs):
         r, c = divmod(i, cols)
         lo, hi = patch.min(), patch.max()
-        grid[r*(w+1):r*(w+1)+w, c*(w+1):c*(w+1)+w] = (patch - lo) / (hi - lo) if hi > lo else 0
+        grid[r * (w + 1) : r * (w + 1) + w, c * (w + 1) : c * (w + 1) + w] = (
+            (patch - lo) / (hi - lo) if hi > lo else 0
+        )
     return grid
 
-plt.imshow(montage(feast.feature_images()), cmap="turbo"); plt.axis("off"); plt.show()
+
+plt.imshow(montage(feast.feature_images()), cmap="turbo")
+plt.axis("off")
+plt.show()
 ```
 
 :::{figure} images/feast_features.png

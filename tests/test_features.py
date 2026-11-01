@@ -6,9 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 
 def _write_txt(lines) -> str:
@@ -39,9 +38,7 @@ def _moving_corner(width=32, height=32) -> "eventcv.EventStream":
 def _moving_corner_reader(dt_ms=2.0, repr=None):
     """An EventReader over the swept L-corner recording (32×32, ~64 ms span)."""
     path = _write_txt(_moving_corner_lines(dt_us=1000))
-    return eventcv.open(
-        path, dt_ms=dt_ms, repr=repr, time_unit="us", sensor_size=(32, 32)
-    )
+    return eventcv.open(path, dt_ms=dt_ms, repr=repr, time_unit="us", sensor_size=(32, 32))
 
 
 class CornerTests(unittest.TestCase):

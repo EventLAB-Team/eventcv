@@ -19,6 +19,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check Python linting
+        uses: astral-sh/ruff-action@v3
+        with:
+          version: "0.17.3"
+          args: "check --output-format=github"
+
+      - name: Check Python formatting
+        run: ruff format --check .
   rust:
     name: cargo test
     runs-on: ubuntu-latest

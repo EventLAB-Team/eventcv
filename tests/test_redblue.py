@@ -4,9 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 
 def reference(events, height, width, pct):
@@ -48,8 +47,14 @@ class RedBlueTests(unittest.TestCase):
     def test_matches_numpy(self):
         rng = np.random.default_rng(12345)
         for n in (0, 1, 40, 500, 5000):
-            events = np.column_stack((rng.integers(8, size=n), rng.integers(6, size=n),
-                                      np.arange(n), rng.integers(2, size=n)))
+            events = np.column_stack(
+                (
+                    rng.integers(8, size=n),
+                    rng.integers(6, size=n),
+                    np.arange(n),
+                    rng.integers(2, size=n),
+                )
+            )
             for pct in (0, 25.3, 50, 73.5, 99, 100):
                 with self.subTest(n=n, pct=pct):
                     np.testing.assert_array_equal(
@@ -58,18 +63,24 @@ class RedBlueTests(unittest.TestCase):
 
     def test_dominance_and_independent_scales(self):
         # Positive counts [4, 1, 1, 0], negative [1, 1, 0, 1].
-        events = np.array([[0, 0, 0, 1]] * 4 + [[1, 0, 0, 1], [2, 0, 0, 1]]
-                          + [[0, 0, 0, 0], [1, 0, 0, 0], [3, 0, 0, 0]])
+        events = np.array(
+            [[0, 0, 0, 1]] * 4
+            + [[1, 0, 0, 1], [2, 0, 0, 1]]
+            + [[0, 0, 0, 0], [1, 0, 0, 0], [3, 0, 0, 0]]
+        )
         s = stream(events, (5, 1))
-        expected = np.array([[[255, 0, 255, 0, 255]],
-                             [[0, 0, 191, 0, 255]],
-                             [[0, 255, 191, 255, 255]]], dtype=np.uint8)
+        expected = np.array(
+            [[[255, 0, 255, 0, 255]], [[0, 0, 191, 0, 255]], [[0, 255, 191, 255, 255]]],
+            dtype=np.uint8,
+        )
         frame = s.redblue(pct=100)
         self.assertEqual(frame.kind, "redblue")
         self.assertEqual(frame.shape, (3, 1, 5))
         self.assertEqual(frame.channel_names, ("red", "green", "blue"))
         np.testing.assert_array_equal(frame.numpy(), expected)
-        np.testing.assert_array_equal(eventcv.redblue(s, pct=100, white_frame=False).numpy(), expected)
+        np.testing.assert_array_equal(
+            eventcv.redblue(s, pct=100, white_frame=False).numpy(), expected
+        )
         events[:, 2] = np.arange(len(events)) * 1000
         np.testing.assert_array_equal(stream(events, (5, 1)).redblue(pct=100).numpy(), expected)
 
@@ -99,7 +110,9 @@ class RedBlueTests(unittest.TestCase):
             self.assertEqual(reader.repr, "redblue")
             np.testing.assert_array_equal(reader[0], expected)
             np.testing.assert_array_equal(reader.batch([0]), expected[None])
-            configured = eventcv.open(str(source), dt_ms=1).with_repr("redblue", pct=75, white_frame=False)
+            configured = eventcv.open(str(source), dt_ms=1).with_repr(
+                "redblue", pct=75, white_frame=False
+            )
             np.testing.assert_array_equal(configured[0], s.redblue(pct=75).numpy())
             for suffix in ("npz", "h5"):
                 path = Path(directory) / f"frame.{suffix}"

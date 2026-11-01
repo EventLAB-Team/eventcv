@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.12"
       # On the runner rather than inside the manylinux container: the workspace is mounted into
       # it, and the library is architecture-specific but not glibc-specific (Microsoft builds it
       # for glibc 2.27), so the host's own wheel is the right one for the target.
@@ -81,6 +81,10 @@ jobs:
             fi
           done
         shell: bash
+      - name: Test installed ARM64 wheel
+        if: matrix.target == 'aarch64'
+        shell: bash
+        run: bash scripts/test_wheel.sh
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -140,7 +144,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.12"
       - run: python -m pip install cmake
       - name: Fetch the ONNX Runtime to bundle
         run: python scripts/fetch_onnxruntime.py
@@ -149,6 +153,9 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
+      - name: Test installed macOS wheel
+        shell: bash
+        run: bash scripts/test_wheel.sh
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-${{ matrix.target }}
@@ -163,7 +170,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.12"
       - run: python -m pip install cmake
       - name: Fetch the ONNX Runtime to bundle
         run: python scripts/fetch_onnxruntime.py
@@ -172,6 +179,9 @@ jobs:
         with:
           target: x64
           args: --release --out dist
+      - name: Test installed Windows wheel
+        shell: bash
+        run: bash scripts/test_wheel.sh
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-windows-x64
@@ -184,11 +194,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
+      - name: Validate source distribution
+        run: |
+          python -m pip install twine
+          python -m twine check dist/*.tar.gz
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist

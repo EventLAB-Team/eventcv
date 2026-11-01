@@ -24,9 +24,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 REFERENCE_PYTHON = os.environ.get("EVENTCV_REFERENCE_PYTHON")
 
@@ -118,9 +117,9 @@ class ByteParityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.expected = _reference_events()
         cls.directory = Path(tempfile.mkdtemp())
-        columns = np.stack(
-            [cls.expected[name] for name in ("x", "y", "t", "p")], axis=1
-        ).astype(np.int64)
+        columns = np.stack([cls.expected[name] for name in ("x", "y", "t", "p")], axis=1).astype(
+            np.int64
+        )
         cls.stream = eventcv.from_numpy(columns, sensor_size=SENSOR, time_unit="us")
         # `-1` keeps the `.stem`-based encoding lookup above honest for `evt2.raw`/`evt3.raw`.
         cls.script = cls.directory / "decode.py"
@@ -133,7 +132,9 @@ class ByteParityTests(unittest.TestCase):
             text=True,
             check=False,
         )
-        self.assertEqual(result.returncode, 0, f"{reference} failed to decode {path}:\n{result.stderr}")
+        self.assertEqual(
+            result.returncode, 0, f"{reference} failed to decode {path}:\n{result.stderr}"
+        )
         # evlib prints a PyTorch notice on import, so take the last line rather than all of stdout.
         return json.loads(result.stdout.strip().splitlines()[-1])
 

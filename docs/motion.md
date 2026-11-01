@@ -15,8 +15,8 @@ import eventcv as ecv
 events = ecv.load("recording.h5").time_window(0, 50_000)
 result = events.contrast_maximise()
 
-print(result["params"])        # [vx, vy] in pixels per second
-print(result["improvement"])   # how much sharper than assuming no motion
+print(result["params"])  # [vx, vy] in pixels per second
+print(result["improvement"])  # how much sharper than assuming no motion
 ```
 
 **Check `improvement` before trusting `params`.** At or below 1.0 the optimiser found no motion and
@@ -31,7 +31,7 @@ so the sharpest image is the unwarped one and contrast maximisation confidently 
 motion** on a camera that is visibly turning.
 
 ```python
-events = reader.slice(...).hot_pixel_filter(3.0)     # then contrast_maximise
+events = reader.slice(...).hot_pixel_filter(3.0)  # then contrast_maximise
 ```
 
 Measured on a DAVIS346 recording: filtering removed 7.6% of events and dropped the busiest pixel
@@ -72,7 +72,7 @@ a field of isolated spikes with no gradient between them and the optimiser has n
 ### Looking at the result
 
 ```python
-iwe = ecv.iwe(events, result["params"])   # the image the objective actually scored
+iwe = ecv.iwe(events, result["params"])  # the image the objective actually scored
 iwe.save("sharp.png")
 ```
 
@@ -143,8 +143,8 @@ import numpy as np
 
 frames = np.zeros((24, 64, 96), dtype=np.uint8)
 for i in range(24):
-    bar = 12 + int(200.0 * i / 500.0)          # 200 px/s at 500 fps
-    frames[i, :, bar:bar + 4] = 230
+    bar = 12 + int(200.0 * i / 500.0)  # 200 px/s at 500 fps
+    frames[i, :, bar : bar + 4] = 230
 
 events = ecv.simulate(frames, fps=500)
 print(events.contrast_maximise()["params"][0])  # ≈ 200

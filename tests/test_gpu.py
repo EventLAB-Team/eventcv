@@ -13,9 +13,8 @@ one cannot quietly stop testing it.
 import os
 import unittest
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 #: Kernels whose arithmetic is integer, so the GPU's answer is not close to the CPU's — it is the
 #: same numbers. Order cannot matter to an integer sum or a minimum.

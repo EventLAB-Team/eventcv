@@ -61,8 +61,8 @@ identically again in a different worker process.
 ```python
 reader = ecv.open("recording.h5", dt_ms=30).event_drop(0.1, seed=0).with_repr("voxel", bins=5)
 
-reader[7]                    # always the same array
-reader.batch([3, 7, 1])[1]   # ... including here
+reader[7]  # always the same array
+reader.batch([3, 7, 1])[1]  # ... including here
 ```
 
 This is what makes a shuffled, multi-worker `DataLoader` reproducible:
@@ -84,10 +84,10 @@ Augmentations chain with every other deferred op, and the order is the order you
 ```python
 reader = (
     ecv.open("recording.h5", dt_ms=30)
-    .hot_pixel_filter()            # clean first
-    .random_flip_x(0.5, seed=0)    # then augment
+    .hot_pixel_filter()  # clean first
+    .random_flip_x(0.5, seed=0)  # then augment
     .event_drop(0.1, seed=0)
-    .with_repr("voxel", bins=5)    # then render
+    .with_repr("voxel", bins=5)  # then render
 )
 ```
 

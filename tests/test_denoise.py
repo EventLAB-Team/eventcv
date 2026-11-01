@@ -8,8 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
 
 SENSOR = (128, 96)
@@ -94,7 +92,9 @@ class DenoiseTests(unittest.TestCase):
 
         # The surface is seeded by every event regardless of what is kept, so each event's fate is
         # independent of the others' — the cross result is a strict subset, not merely smaller.
-        as_set = lambda s: {tuple(row) for row in s.numpy().tolist()}
+        def as_set(s):
+            return {tuple(row) for row in s.numpy().tolist()}
+
         self.assertTrue(as_set(cross).issubset(as_set(block)))
         self.assertEqual(
             len(block),
@@ -106,9 +106,7 @@ class DenoiseTests(unittest.TestCase):
         # (6,6) follows (5,5) with nothing else nearby.
         diagonal = _load([(0, 5, 5, 1), (10, 6, 6, 1)])
         self.assertEqual(len(diagonal.background_activity_filter(1_000)), 1)
-        self.assertEqual(
-            len(diagonal.background_activity_filter(1_000, neighbourhood="cross")), 0
-        )
+        self.assertEqual(len(diagonal.background_activity_filter(1_000, neighbourhood="cross")), 0)
 
         with self.assertRaises(ValueError):
             self.stream.background_activity_filter(1_000, neighbourhood="diamond")
@@ -117,7 +115,9 @@ class DenoiseTests(unittest.TestCase):
         # One pixel firing every 50 µs. Under "kept" the clock runs from the last *emitted* event,
         # so t=100 gets through; under "all" every arrival pushes it out and only t=0 survives.
         burst = _load([(t, 5, 5, 1) for t in (0, 50, 100, 150)])
-        times = lambda s: s.numpy()[:, 2].tolist()
+
+        def times(s):
+            return s.numpy()[:, 2].tolist()
 
         self.assertEqual(times(burst.refractory_filter(100)), [0, 100])
         self.assertEqual(times(burst.refractory_filter(100, refresh="kept")), [0, 100])

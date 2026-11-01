@@ -4,9 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 _MVSEC_BAG = "data/development/outdoor_day1_data.bag"
 # Whichever DAVIS346 recording is on this machine; the names differ between checkouts.
@@ -36,9 +35,7 @@ class TextLoadTests(unittest.TestCase):
         return str(path)
 
     def test_loads_txyp_seconds_and_drops_out_of_bounds(self):
-        path = self._write(
-            "0.0 1 2 1\n0.000002 3 0 0\n\n# comment\n0.00001 0 4 1\n0.00002 4 0 1\n"
-        )
+        path = self._write("0.0 1 2 1\n0.000002 3 0 0\n\n# comment\n0.00001 0 4 1\n0.00002 4 0 1\n")
         stream = eventcv.load(path, sensor_size=(4, 5))
 
         self.assertIsInstance(stream, eventcv.EventStream)
@@ -141,9 +138,7 @@ class TextLoadTests(unittest.TestCase):
             for unit in (None, "us"):
                 with self.subTest(text=text, time_unit=unit):
                     with self.assertRaisesRegex(ValueError, "invalid x"):
-                        eventcv.load(
-                            path, sensor_size=(120, 100), order="xytp", time_unit=unit
-                        )
+                        eventcv.load(path, sensor_size=(120, 100), order="xytp", time_unit=unit)
 
     def test_reader_slices_scientific_notation(self):
         # `open()` indexes with one parser and slices with another; scientific notation used
@@ -376,16 +371,23 @@ class HotPixelReaderTests(unittest.TestCase):
 
     def test_composes_with_repr(self):
         reader = eventcv.open(
-            self._recording(), dt_ms=0.01, sensor_size=(8, 8), time_unit="us",
-            hot_pixel_filter=True, repr="count",
+            self._recording(),
+            dt_ms=0.01,
+            sensor_size=(8, 8),
+            time_unit="us",
+            hot_pixel_filter=True,
+            repr="count",
         )
         self.assertEqual(sum(int(reader[n][:, 1, 1].sum()) for n in range(len(reader))), 0)
 
     def test_std_controls_aggressiveness(self):
         # A high threshold flags nothing, so even the stuck pixel survives.
         reader = eventcv.open(
-            self._recording(), sensor_size=(8, 8), time_unit="us",
-            hot_pixel_filter=True, hot_pixel_std=100.0,
+            self._recording(),
+            sensor_size=(8, 8),
+            time_unit="us",
+            hot_pixel_filter=True,
+            hot_pixel_std=100.0,
         )
         self.assertTrue(self._has_hot_pixel(reader.slice()))
 

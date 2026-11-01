@@ -9,9 +9,8 @@ import threading
 import time
 import unittest
 
-import numpy as np
-
 import eventcv
+import numpy as np
 
 IDEAL = dict(sigma_thres=0.0, leak_rate_hz=0.0, shot_noise_rate_hz=0.0, cutoff_hz=0.0)
 
