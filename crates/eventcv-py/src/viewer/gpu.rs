@@ -544,9 +544,10 @@ pub(super) fn validate_surface_size(
 pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
     // `all()` (not just `PRIMARY`) so machines with no native Vulkan/Metal/DX12 GPU — headless
     // boxes, VMs, remote desktops — can still reach an OpenGL or software adapter.
+    // The window doubles as the display handle, which GLES needs to present (notably on Wayland).
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
     });
     let surface = instance
         .create_surface(window.clone())
@@ -559,15 +560,13 @@ pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
             adapter.get_info().name
         );
     }
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("eventcv-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: viewer_limits(adapter.limits()),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("eventcv-device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: viewer_limits(adapter.limits()),
+        memory_hints: wgpu::MemoryHints::Performance,
+        ..Default::default()
+    }))
     .map_err(|error| error.to_string())?;
 
     let size = window.inner_size();
@@ -587,6 +586,7 @@ pub(super) fn create_gpu(window: Arc<Window>) -> Result<GpuContext, String> {
         alpha_mode: caps.alpha_modes[0],
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
+        color_space: wgpu::SurfaceColorSpace::Auto,
     };
     validate_surface_size(
         PhysicalSize::new(config.width, config.height),
@@ -659,7 +659,9 @@ fn request_adapter(
                 power_preference,
                 compatible_surface: Some(surface),
                 force_fallback_adapter,
+                apply_limit_buckets: false,
             }))
+            .ok()
         })
 }
 
@@ -716,14 +718,14 @@ impl Render {
             return;
         }
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &rgb_to_rgba(&image.pixels),
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(*width * 4),
                 rows_per_image: Some(*height),
@@ -738,9 +740,10 @@ impl Render {
 
     fn draw(&mut self, pitch: f32, yaw: f32, distance: f32) -> Result<(), String> {
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             // Reconfigure and skip this frame on a lost/outdated surface.
-            Err(_) => {
+            _ => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
@@ -781,6 +784,7 @@ impl Render {
                     label: Some("cloud"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(BACKGROUND),
@@ -797,6 +801,7 @@ impl Render {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.set_pipeline(axes_pipeline);
@@ -820,6 +825,7 @@ impl Render {
                     label: Some("image"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -829,6 +835,7 @@ impl Render {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
@@ -837,7 +844,7 @@ impl Render {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         Ok(())
     }
 }
@@ -908,8 +915,8 @@ fn build_cloud(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cloud"),
-        bind_group_layouts: &[&bind_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_layout)],
+        immediate_size: 0,
     });
 
     let points_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -918,7 +925,7 @@ fn build_cloud(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_points"),
-            buffers: &[QUAD_LAYOUT, INSTANCE_LAYOUT],
+            buffers: &[Some(QUAD_LAYOUT), Some(INSTANCE_LAYOUT)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -930,7 +937,7 @@ fn build_cloud(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: Some(depth_state()),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     let axes_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -939,7 +946,7 @@ fn build_cloud(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_axes"),
-            buffers: &[AXIS_LAYOUT],
+            buffers: &[Some(AXIS_LAYOUT)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -954,7 +961,7 @@ fn build_cloud(
         },
         depth_stencil: Some(depth_state()),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     // Labels are billboarded (screen-facing) and drawn without depth testing so they stay
@@ -965,7 +972,7 @@ fn build_cloud(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_labels"),
-            buffers: &[LABEL_LAYOUT],
+            buffers: &[Some(LABEL_LAYOUT)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -980,7 +987,7 @@ fn build_cloud(
         },
         depth_stencil: Some(depth_state_overlay()),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -1022,14 +1029,14 @@ fn build_image(
         view_formats: &[],
     });
     queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         &rgb_to_rgba(&image.pixels),
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(image.width as u32 * 4),
             rows_per_image: Some(image.height as u32),
@@ -1086,8 +1093,8 @@ fn build_image(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("image"),
-        bind_group_layouts: &[&bind_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("image"),
@@ -1107,7 +1114,7 @@ fn build_image(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -1271,8 +1278,8 @@ fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
 fn depth_state() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
-        depth_write_enabled: true,
-        depth_compare: wgpu::CompareFunction::Less,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::Less),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     }
@@ -1282,8 +1289,8 @@ fn depth_state() -> wgpu::DepthStencilState {
 fn depth_state_overlay() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
-        depth_write_enabled: false,
-        depth_compare: wgpu::CompareFunction::Always,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     }
