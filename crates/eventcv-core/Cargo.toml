@@ -110,7 +110,7 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 [dev-dependencies]
 # Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
 # carries the numbers, and the plots need gnuplot or a heavier plotting stack.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # The ROS 2 example turns this on with RUST_LOG=…; hiroz and zenoh both log through `tracing`.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
