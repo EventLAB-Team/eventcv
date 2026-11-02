@@ -16,7 +16,7 @@ numpy = "0.29"
 # so wheels still build without system graphics SDKs. Replaces the old minifb CPU rasteriser.
 wgpu = "23"
 winit = "0.30"
-pollster = "0.4"   # block on wgpu's async device/adapter requests
+pollster = "1.0"   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", features = ["derive"] }
 # Immediate-mode controls drawn into the viewer's existing winit/wgpu event loop. Keep the egui
 # crates on one release and wgpu on the version used by egui-wgpu, so Cargo links one graphics
