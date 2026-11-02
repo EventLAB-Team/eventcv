@@ -91,7 +91,7 @@ pub(crate) fn shutdown() {
     if let Some(Some(context)) = guard.take() {
         // Everything queued must land before the device goes away, or the driver is left tearing
         // down work that is still in flight.
-        context.device.poll(wgpu::Maintain::Wait);
+        let _ = context.device.poll(wgpu::PollType::wait_indefinitely());
         drop(context);
     }
 }
@@ -102,24 +102,24 @@ fn open() -> Option<Context> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
-    }))?;
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("eventcv"),
-            required_features: wgpu::Features::empty(),
-            // The kernels use only storage buffers and integer atomics, so the downlevel defaults
-            // are enough — which keeps software rasterisers and older drivers usable.
-            // The downlevel defaults allow four storage buffers per compute stage; the simulator
-            // kernel needs five, and asking for six rather than the adapter's maximum keeps the
-            // widest set of devices able to open this.
-            required_limits: wgpu::Limits {
-                max_storage_buffers_per_shader_stage: 6,
-                ..wgpu::Limits::downlevel_defaults()
-            },
-            memory_hints: wgpu::MemoryHints::Performance,
+        apply_limit_buckets: false,
+    }))
+    .ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("eventcv"),
+        required_features: wgpu::Features::empty(),
+        // The kernels use only storage buffers and integer atomics, so the downlevel defaults
+        // are enough — which keeps software rasterisers and older drivers usable.
+        // The downlevel defaults allow four storage buffers per compute stage; the simulator
+        // kernel needs five, and asking for six rather than the adapter's maximum keeps the
+        // widest set of devices able to open this.
+        required_limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 6,
+            ..wgpu::Limits::downlevel_defaults()
         },
-        None,
-    ))
+        memory_hints: wgpu::MemoryHints::Performance,
+        ..Default::default()
+    }))
     .ok()?;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("eventcv representations"),
@@ -137,8 +137,8 @@ fn open() -> Option<Context> {
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("eventcv kernels"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     Some(Context {
         device,
@@ -348,13 +348,17 @@ pub(crate) fn run(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| GpuError::Driver(error.to_string()))?;
     receiver
         .recv()
         .map_err(|error| GpuError::Driver(error.to_string()))?
         .map_err(|error| GpuError::Driver(error.to_string()))?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|error| GpuError::Driver(error.to_string()))?;
     let values: Vec<i32> = bytemuck::cast_slice::<u8, i32>(&mapped[..dispatch.cells * 4]).to_vec();
     let saturated = mapped[dispatch.cells * 4..].iter().any(|byte| *byte != 0);
     drop(mapped);
