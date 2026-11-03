@@ -147,8 +147,8 @@ fn build(context: &super::gpu::Context) -> SimPipeline {
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("eventcv simulator"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("simulate"),
@@ -530,15 +530,15 @@ fn run_dispatch(
 }
 
 /// Blocks until `buffer` is mapped, returning its bytes.
-fn map_read<'a>(device: &wgpu::Device, buffer: &'a wgpu::Buffer) -> Option<wgpu::BufferView<'a>> {
+fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Option<wgpu::BufferView> {
     let slice = buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
     receiver.recv().ok()?.ok()?;
-    Some(slice.get_mapped_range())
+    slice.get_mapped_range().ok()
 }
 
 /// Reads a single `u32` back, unmapping before returning so the buffer can be dropped.
