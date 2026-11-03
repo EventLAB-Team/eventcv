@@ -21,9 +21,9 @@ bytemuck = { version = "1", features = ["derive"] }
 # Immediate-mode controls drawn into the viewer's existing winit/wgpu event loop. Keep the egui
 # crates on one release and wgpu on the version used by egui-wgpu, so Cargo links one graphics
 # stack rather than multiple incompatible versions.
-egui = "=0.36.2"
-egui-winit = { version = "=0.36.2", features = ["accesskit"] }
-egui-wgpu = "=0.36.2"
+egui = "=0.37.0"
+egui-winit = { version = "=0.37.0", features = ["accesskit"] }
+egui-wgpu = "=0.37.0"
 # Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and
 # the CLI path remain available when a desktop portal is absent.
 rfd = "=0.17.2"

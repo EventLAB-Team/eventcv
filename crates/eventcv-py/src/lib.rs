@@ -6850,7 +6850,8 @@ fn parse_bias_limits(value: &Bound<'_, PyAny>) -> PyResult<eventcv_core::bias::B
 }
 
 /// Lists every connected, supported event camera as a list of dicts (`kind`, `name`, `serial`,
-/// `bus`, `address`, `speed`). A `serial` can be passed to `eventcv.stream(serial=…)`.
+/// `bus`, `address`, `speed`; `bus`/`address` are `None` for an Ethernet camera). A `serial` can be
+/// passed to `eventcv.stream(serial=…)`.
 #[cfg(feature = "camera")]
 #[pyfunction]
 fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {

@@ -13,7 +13,7 @@
 //! `self.clone()`, which is a real deep copy of the column arrays; callers that augment large slices
 //! should prefer chaining over calling an augmentation they expect to be a no-op.
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
 use crate::EventStream;
@@ -72,8 +72,8 @@ impl EventStream {
             return self.clone();
         }
         let mut rng = slice_rng(seed, 0);
-        let x0 = rng.gen_range(0..=sensor_w.saturating_sub(width)) as i64;
-        let y0 = rng.gen_range(0..=sensor_h.saturating_sub(height)) as i64;
+        let x0 = rng.random_range(0..=sensor_w.saturating_sub(width)) as i64;
+        let y0 = rng.random_range(0..=sensor_h.saturating_sub(height)) as i64;
         self.crop(x0, y0, width, height)
     }
 
@@ -86,7 +86,7 @@ impl EventStream {
         let mut rng = slice_rng(seed, 0);
         let (width, height) = self.sensor_size();
         self.remap(width, height, move |x, y, t, polarity| {
-            (rng.gen::<f64>() >= p).then_some((x, y, t, polarity))
+            (rng.random::<f64>() >= p).then_some((x, y, t, polarity))
         })
     }
 
@@ -103,7 +103,9 @@ impl EventStream {
         let mut rng = slice_rng(seed, 0);
         // `drop_masked_pixels` reads `true` as *drop* — the opposite of `EventStream::mask`, where
         // `true` keeps. So this is the set to silence, and `p` is the fraction marked `true`.
-        let drop: Vec<bool> = (0..width * height).map(|_| rng.gen::<f64>() < p).collect();
+        let drop: Vec<bool> = (0..width * height)
+            .map(|_| rng.random::<f64>() < p)
+            .collect();
         self.drop_masked_pixels(&drop)
     }
 
@@ -179,7 +181,7 @@ fn fires(p: f64, seed: u64) -> bool {
     if p >= 1.0 {
         return true;
     }
-    slice_rng(seed, 0).gen::<f64>() < p
+    slice_rng(seed, 0).random::<f64>() < p
 }
 
 #[cfg(test)]
@@ -231,11 +233,11 @@ mod tests {
 
     #[test]
     fn slice_rng_decorrelates_adjacent_indices() {
-        use rand::Rng;
+        use rand::RngExt;
         // Adjacent slice indices must not produce correlated draws — that is the whole point of
         // running the seed through the finalizer rather than adding the index to it.
         let draws: Vec<f64> = (0..8)
-            .map(|index| super::slice_rng(0, index).gen::<f64>())
+            .map(|index| super::slice_rng(0, index).random::<f64>())
             .collect();
         for window in draws.windows(2) {
             assert!((window[0] - window[1]).abs() > 1e-6);

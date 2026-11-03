@@ -48,11 +48,11 @@ pub struct CameraInfo {
     pub name: String,
     /// Device serial, when it could be read.
     pub serial: Option<String>,
-    /// USB bus the device is on.
-    pub bus_number: u8,
-    /// USB address on the bus.
-    pub address: u8,
-    /// Negotiated USB speed (`"super+"`, `"super"`, `"high"`, …).
+    /// USB bus the device is on; `None` for an Ethernet camera.
+    pub bus_number: Option<u8>,
+    /// USB address on the bus; `None` for an Ethernet camera.
+    pub address: Option<u8>,
+    /// Negotiated USB speed (`"super+"`, `"super"`, `"high"`, …), or `"ethernet"`.
     pub speed: String,
 }
 
@@ -91,13 +91,22 @@ pub fn list_cameras() -> CameraListing {
     CameraListing {
         cameras: listed
             .into_iter()
-            .map(|device| CameraInfo {
-                kind: device.device_type.to_string(),
-                name: device.device_type.name().to_owned(),
-                serial: device.serial.ok(),
-                bus_number: device.bus_number,
-                address: device.address,
-                speed: speed_name(device.speed).to_owned(),
+            .map(|device| {
+                let (bus_number, address) = match device.location {
+                    nd::Location::BusNumberAndAddress {
+                        bus_number,
+                        address,
+                    } => (Some(bus_number), Some(address)),
+                    nd::Location::Address(_) => (None, None),
+                };
+                CameraInfo {
+                    kind: device.device_type.to_string(),
+                    name: device.device_type.name().to_owned(),
+                    serial: device.serial.ok(),
+                    bus_number,
+                    address,
+                    speed: connection_name(device.connection).to_owned(),
+                }
             })
             .collect(),
         warning: None,
@@ -152,14 +161,16 @@ fn open_error(serial: Option<&str>, error: impl std::fmt::Display) -> String {
     }
 }
 
-fn speed_name(speed: nd::usb::Speed) -> &'static str {
-    match speed {
-        nd::usb::Speed::Unknown => "unknown",
-        nd::usb::Speed::Low => "low",
-        nd::usb::Speed::Full => "full",
-        nd::usb::Speed::High => "high",
-        nd::usb::Speed::Super => "super",
-        nd::usb::Speed::SuperPlus => "super+",
+fn connection_name(connection: nd::devices::Connection) -> &'static str {
+    use nd::devices::Connection;
+    match connection {
+        Connection::UsbUnknown => "unknown",
+        Connection::UsbLow => "low",
+        Connection::UsbFull => "full",
+        Connection::UsbHigh => "high",
+        Connection::UsbSuper => "super",
+        Connection::UsbSuperPlus => "super+",
+        Connection::Ethernet => "ethernet",
     }
 }
 
@@ -463,9 +474,10 @@ impl AdaptiveBias {
             nd::Configuration::InivationDavis346(configuration) => {
                 (BiasConfig::davis346(), davis346_biases(&configuration)?)
             }
-            nd::Configuration::PropheseeEvk4(configuration) => {
-                (BiasConfig::prophesee_evk4(), evk4_biases(&configuration))
-            }
+            nd::Configuration::PropheseeEvk4(configuration) => (
+                BiasConfig::prophesee_evk4(),
+                evk4_biases(&configuration, evk4_firmware_biases(device)?),
+            ),
             _ => {
                 return Err(format!(
                     "adaptive_bias is not supported on the {} — it is implemented for the \
@@ -527,23 +539,19 @@ impl Capture {
     ) -> Result<Self, String> {
         let (flag, event_loop) = nd::flag_and_event_loop().map_err(|error| error.to_string())?;
         // A limits request is device-specific, so the sensor has to be identified before it is
-        // opened. Having enumerated it, open *that* device by bus address rather than "the first
+        // opened. Having enumerated it, open *that* device by its location rather than "the first
         // one": with two cameras attached, the driver's own choice of first need not be ours, and a
         // configuration written for one sensor must never land on another.
         let (selector, plan) = if limits.is_empty() {
             let selector = match serial {
-                Some(serial) => nd::SerialOrBusNumberAndAddress::Serial(serial),
-                None => nd::SerialOrBusNumberAndAddress::None,
+                Some(serial) => nd::Identifier::Serial(serial),
+                None => nd::Identifier::None,
             };
             (selector, LimitsPlan::default())
         } else {
             let listed = select_device(serial)?;
             let plan = plan_limits(&listed, limits)?;
-            let address = (listed.bus_number, listed.address);
-            (
-                nd::SerialOrBusNumberAndAddress::BusNumberAndAddress(address),
-                plan,
-            )
+            (nd::Identifier::Location(listed.location), plan)
         };
         // Applied as part of the opening handshake: the driver writes the rate controller and the
         // region masks while configuring the sensor, and only re-writes the masks afterwards, so a
@@ -658,7 +666,8 @@ impl Capture {
                 nd::Configuration::InivationDavis346(davis346_with_biases(&configuration, values)?)
             }
             nd::Configuration::PropheseeEvk4(configuration) => {
-                nd::Configuration::PropheseeEvk4(evk4_with_biases(&configuration, values))
+                let firmware = evk4_firmware_biases(&self.device)?;
+                nd::Configuration::PropheseeEvk4(evk4_with_biases(&configuration, values, firmware))
             }
             // Unreachable: the device type was checked when the controller was built.
             _ => return Err("adaptive biasing is not implemented for this camera".to_owned()),
@@ -1148,35 +1157,62 @@ fn davis346_with_biases(
 /// refractory period. `hpf` is left alone — its high-pass cutoff removes slow signal rather than
 /// scaling sensitivity, so it is not a lever the rate controller should be pulling.
 ///
-/// Unlike the DAVIS346's these fields are public, so this is plain field access. Values are `u8`
-/// registers widened into the controller's `u16` ladder space.
-fn evk4_biases(configuration: &nd::devices::prophesee_evk4::Configuration) -> BiasValues {
+/// The driver stores each EVK4 bias as a signed offset from the value the chip's firmware set at
+/// power-up, but the controller and `BiasConfig::prophesee_evk4`'s limits work in absolute `u8`
+/// registers. So the conversion happens here: absolute = `firmware` + offset, widened into the
+/// controller's `u16` ladder space.
+fn evk4_biases(
+    configuration: &nd::devices::prophesee_evk4::Configuration,
+    firmware: BiasValues,
+) -> BiasValues {
     let biases = &configuration.biases;
+    let absolute =
+        |firmware: u16, offset: i16| (firmware as i16 + offset).clamp(0, i16::from(u8::MAX)) as u16;
     BiasValues {
-        refractory: biases.refr.into(),
-        photoreceptor: biases.pr.into(),
-        follower: biases.fo.into(),
-        on_threshold: biases.diff_on.into(),
-        off_threshold: biases.diff_off.into(),
+        refractory: absolute(firmware.refractory, biases.refr),
+        photoreceptor: absolute(firmware.photoreceptor, biases.pr),
+        follower: absolute(firmware.follower, biases.fo),
+        on_threshold: absolute(firmware.on_threshold, biases.diff_on),
+        off_threshold: absolute(firmware.off_threshold, biases.diff_off),
     }
 }
 
-/// Returns `configuration` with the controlled biases replaced by `values`, everything else — the
-/// other biases, the masks, the rate limiter, the clock — left exactly as it was.
+/// Returns `configuration` with the controlled biases replaced by the absolute `values`, written
+/// back as offsets from `firmware`, and everything else (the other biases, the masks, the rate
+/// limiter, the clock) left exactly as it was.
 fn evk4_with_biases(
     configuration: &nd::devices::prophesee_evk4::Configuration,
     values: BiasValues,
+    firmware: BiasValues,
 ) -> nd::devices::prophesee_evk4::Configuration {
     let mut configuration = configuration.clone();
     // Saturating: the controller's ladder is `u16`, these registers are `u8`. `BiasConfig::limits`
     // already holds the values in range, so this only guards a caller that widened them.
-    let byte = |value: u16| value.min(u16::from(u8::MAX)) as u8;
-    configuration.biases.refr = byte(values.refractory);
-    configuration.biases.pr = byte(values.photoreceptor);
-    configuration.biases.fo = byte(values.follower);
-    configuration.biases.diff_on = byte(values.on_threshold);
-    configuration.biases.diff_off = byte(values.off_threshold);
+    let offset = |value: u16, firmware: u16| value.min(u16::from(u8::MAX)) as i16 - firmware as i16;
+    configuration.biases.refr = offset(values.refractory, firmware.refractory);
+    configuration.biases.pr = offset(values.photoreceptor, firmware.photoreceptor);
+    configuration.biases.fo = offset(values.follower, firmware.follower);
+    configuration.biases.diff_on = offset(values.on_threshold, firmware.on_threshold);
+    configuration.biases.diff_off = offset(values.off_threshold, firmware.off_threshold);
     configuration
+}
+
+/// The open EVK4's firmware bias values, recovered from the driver's per-bias bounds: each is
+/// `offsets_from(firmware)`, i.e. `-firmware ..= 255 - firmware`.
+fn evk4_firmware_biases(device: &nd::Device) -> Result<BiasValues, String> {
+    match device.biases_bounds() {
+        nd::devices::BiasesBounds::PropheseeEvk4(bounds) => {
+            let firmware = |bounds: nd::properties::Bounds<i16>| (-bounds.minimum) as u16;
+            Ok(BiasValues {
+                refractory: firmware(bounds.refr),
+                photoreceptor: firmware(bounds.pr),
+                follower: firmware(bounds.fo),
+                on_threshold: firmware(bounds.diff_on),
+                off_threshold: firmware(bounds.diff_off),
+            })
+        }
+        _ => Err(format!("{} is not a Prophesee EVK4", device.name())),
+    }
 }
 
 /// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity
@@ -1281,6 +1317,7 @@ fn device_dimensions(device: &nd::Device) -> (usize, usize) {
         Properties::PropheseeEvk3Hd(properties) => (properties.width, properties.height),
         Properties::PropheseeEvk4(properties) => (properties.width, properties.height),
         Properties::CenturyarksVga(properties) => (properties.width, properties.height),
+        Properties::LucidTriton(properties) => (properties.width, properties.height),
     };
     (width as usize, height as usize)
 }
@@ -1629,5 +1666,35 @@ mod tests {
         ));
         assert!(apply_clock_override(Some(serial), davis).is_err());
         std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn evk4_biases_convert_between_firmware_offsets_and_absolute_registers() {
+        use super::nd::devices::prophesee_evk4::DEFAULT_CONFIGURATION;
+        use super::{evk4_biases, evk4_with_biases, BiasValues};
+        let firmware = BiasValues {
+            refractory: 20,
+            photoreceptor: 100,
+            follower: 80,
+            on_threshold: 110,
+            off_threshold: 50,
+        };
+        // The driver's default configuration is all-zero offsets: the firmware values themselves.
+        assert_eq!(evk4_biases(&DEFAULT_CONFIGURATION, firmware), firmware);
+
+        let target = BiasValues {
+            refractory: 25,
+            photoreceptor: 90,
+            follower: 120,
+            on_threshold: 110,
+            off_threshold: 40,
+        };
+        let written = evk4_with_biases(&DEFAULT_CONFIGURATION, target, firmware);
+        assert_eq!(written.biases.refr, 5);
+        assert_eq!(written.biases.pr, -10);
+        assert_eq!(written.biases.diff_on, 0);
+        assert_eq!(evk4_biases(&written, firmware), target);
+        // Biases the controller doesn't drive are left as they were.
+        assert_eq!(written.biases.hpf, DEFAULT_CONFIGURATION.biases.hpf);
     }
 }
