@@ -869,7 +869,10 @@ fn decode_png(path: &Path, unsupported: &str) -> Result<DecodedPng, IoError> {
     // Expands palette and sub-byte images and strips 16-bit samples, so everything below is 8-bit.
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(png_decoding_error)?;
-    let mut buffer = vec![0; reader.output_buffer_size()];
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| IoError::Format("PNG image is too large to decode".to_owned()))?;
+    let mut buffer = vec![0; size];
     let info = reader.next_frame(&mut buffer).map_err(png_decoding_error)?;
     Ok(DecodedPng {
         width: info.width as usize,
