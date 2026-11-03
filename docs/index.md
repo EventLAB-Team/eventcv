@@ -68,6 +68,22 @@ that expects something on your system — `ffmpeg` on your `PATH`; `.gif` and `.
 Run `eventcv --version` to see which optional features a build has, and which ONNX Runtime it
 found ([where that comes from](models.md)).
 
+### Python 3.8 / ROS 1 Noetic
+
+EventCV supports Python 3.8, so it installs into the system Python of Ubuntu 20.04 and ROS
+Noetic. Upgrade pip first: the pip 20.0.2 that Ubuntu 20.04 ships predates the `manylinux_2_28`
+wheel tag, so it skips the prebuilt wheel and tries to compile EventCV from source, which needs a
+Rust toolchain and cmake.
+
+```console
+python3 -m pip install --upgrade pip    # add --user outside a virtualenv
+python3 -m pip install eventcv
+```
+
+Use `python3 -m pip` rather than `pip` for the second command, so the upgraded pip runs and not
+the old one still on your `PATH`. EventCV reads `.bag` files itself, so no ROS Python packages
+are needed.
+
 The Rust core's API is documented separately on [docs.rs](https://docs.rs/eventcv-core).
 
 ## What EventCV is not

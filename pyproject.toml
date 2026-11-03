@@ -9,7 +9,7 @@ name = "eventcv"
 dynamic = ["version"]
 description = "Open source event-based computer vision library."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 license = { file = "LICENSE" }
 authors = [{ name = "Adam Hines"}]
 maintainers = [{ name = "EventLAB Team", email="eventlab.localization@gmail.com"}]
@@ -26,6 +26,7 @@ classifiers = [
         'Programming Language :: Rust',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
@@ -114,7 +115,7 @@ pip = ">=26.2.1,<27"
 rust = ">=1.97.1,<1.98"
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py38"
 line-length = 100
 
 [tool.ruff.lint]
