@@ -26,7 +26,7 @@ rosbag = "0.6.3"
 zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # Pure-Rust PNG encoder for colormapped frame export (`.png`) — no system deps, keeps wheels easy.
 # Also writes animated PNG (`acTL`/`fcTL`), so `.apng` export costs no extra dependency.
-png = "0.17"
+png = "0.18"
 # AEDAT 4 packet decompression. iniVation's DV compresses every packet, choosing per file between
 # LZ4 in its *frame* format (the C library's `LZ4F_decompress`, not raw blocks) and Zstd. `lz4` is
 # named here rather than a pure-Rust decoder because `rosbag` already pulls it in and builds it —
@@ -93,8 +93,8 @@ libloading = { version = "0.9", optional = true }
 # covers every platform and nothing needs a vendor toolkit at build time — the reason this is not
 # a CUDA path plus a Metal path. The versions match the ones `eventcv-py` already pins for the
 # viewer, so a wheel links one wgpu rather than two. Enable with `--features gpu`.
-wgpu = { version = "23", optional = true }
-pollster = { version = "0.4", optional = true }   # block on wgpu's async device/adapter requests
+wgpu = { version = "30", optional = true }
+pollster = { version = "1.0", optional = true }   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 # Optional: ROS 2 publish/subscribe over Zenoh. `hiroz` is a ROS 2 stack in pure Rust, so this
@@ -110,7 +110,7 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 [dev-dependencies]
 # Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
 # carries the numbers, and the plots need gnuplot or a heavier plotting stack.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # The ROS 2 example turns this on with RUST_LOG=…; hiroz and zenoh both log through `tracing`.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

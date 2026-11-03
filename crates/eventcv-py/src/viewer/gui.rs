@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Pos2, Stroke, TextureHandle, TextureOptions, Vec2};
-use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
+use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use eventcv_core::io::{self, LoadOptions, MemorySliceSource, Reader};
 use eventcv_core::viz::{Colormap, RawSurface, Rgb8Image, Scale};
 use eventcv_core::EventStream;
@@ -1143,11 +1143,12 @@ impl Model {
         }
     }
 
-    fn ui(&mut self, context: &egui::Context) {
+    fn ui(&mut self, root: &mut egui::Ui) {
+        let context = &root.ctx().clone();
         self.upload_image(context);
         self.shortcuts(context);
 
-        egui::TopBottomPanel::top("menu").show(context, |ui| {
+        egui::Panel::top("menu").show(root, |ui| {
             ui.horizontal(|ui| {
                 let live = self.metadata.as_ref().is_some_and(|metadata| metadata.live);
                 if ui
@@ -1179,18 +1180,19 @@ impl Model {
             }
         });
 
-        egui::SidePanel::right("inspector")
-            .default_width(300.0)
-            .show(context, |ui| self.inspector(ui));
-        egui::TopBottomPanel::bottom("transport").show(context, |ui| self.transport(ui));
-        egui::CentralPanel::default().show(context, |ui| self.image_panel(ui));
+        egui::Panel::right("inspector")
+            .default_size(300.0)
+            .show(root, |ui| self.inspector(ui));
+        egui::Panel::bottom("transport").show(root, |ui| self.transport(ui));
+        egui::CentralPanel::default().show(root, |ui| self.image_panel(ui));
 
         if let Some(path) = context.input(|input| {
             input
                 .raw
                 .dropped_files
                 .iter()
-                .find_map(|file| file.path.clone())
+                .map(|file| file.path().to_path_buf())
+                .next()
         }) {
             if !self.metadata.as_ref().is_some_and(|metadata| metadata.live) {
                 self.open(path);
@@ -1208,7 +1210,7 @@ impl Model {
         if open && !self.metadata.as_ref().is_some_and(|metadata| metadata.live) {
             self.choose_file();
         }
-        if context.wants_keyboard_input() {
+        if context.egui_wants_keyboard_input() {
             return;
         }
         if context.input(|input| input.key_pressed(egui::Key::Space))
@@ -1439,7 +1441,7 @@ impl Model {
                 if ui.button(plugin.name).clicked() {
                     self.processors.push(ProcessorConfig::new(plugin));
                     changed = true;
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -1983,7 +1985,11 @@ impl Drop for GuiRender {
 }
 
 impl GuiRender {
-    fn new(window: Arc<Window>, proxy: EventLoopProxy<UserEvent>) -> Result<Self, String> {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        window: Arc<Window>,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<Self, String> {
         let gpu = gpu::create_gpu(window.clone())?;
         let context = egui::Context::default();
         let mut state = egui_winit::State::new(
@@ -1994,8 +2000,18 @@ impl GuiRender {
             window.theme(),
             Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
-        state.init_accesskit(window.as_ref(), proxy);
-        let renderer = EguiRenderer::new(&gpu.device, gpu.config.format, None, 1, false);
+        state.init_accesskit(event_loop, window.as_ref(), proxy);
+        window.set_visible(true);
+        let renderer = EguiRenderer::new(
+            &gpu.device,
+            gpu.config.format,
+            RendererOptions {
+                msaa_samples: 1,
+                depth_stencil_format: None,
+                dithering: false,
+                ..Default::default()
+            },
+        );
         Ok(Self {
             gpu,
             context,
@@ -2021,7 +2037,7 @@ impl GuiRender {
     /// or `None` if it is idle until the next input event.
     fn draw(&mut self, window: &Window, model: &mut Model) -> Result<Option<Instant>, String> {
         let input = self.state.take_egui_input(window);
-        let output = self.context.run(input, |context| model.ui(context));
+        let mut output = self.context.run_ui(input, |ui| model.ui(ui));
         let repaint_at = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -2030,21 +2046,30 @@ impl GuiRender {
             .handle_platform_output(window, output.platform_output);
         let pixels_per_point = egui_winit::pixels_per_point(&self.context, window);
         let paint_jobs = self.context.tessellate(output.shapes, pixels_per_point);
-        for (id, delta) in &output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.gpu.device, &self.gpu.queue, *id, delta);
+        // egui 0.36 asserts every texture delta is consumed, so drain rather than iterate.
+        for (id, deltas) in output.textures_delta.set.drain() {
+            for delta in &deltas {
+                self.renderer
+                    .update_texture(&self.gpu.device, &self.gpu.queue, id, delta);
+            }
         }
+        let freed = std::mem::take(&mut output.textures_delta.free);
 
         let frame = match self.gpu.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.gpu
                     .surface
                     .configure(&self.gpu.device, &self.gpu.config);
                 return Ok(Some(Instant::now()));
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(Some(Instant::now())),
-            Err(error) => return Err(error.to_string()),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(Some(Instant::now()))
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("surface texture acquisition failed validation".to_owned())
+            }
         };
         let view = frame
             .texture
@@ -2071,6 +2096,7 @@ impl GuiRender {
                 label: Some("eventcv-gui-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2085,14 +2111,15 @@ impl GuiRender {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             self.renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &descriptor);
         }
         command_buffers.push(encoder.finish());
         self.gpu.queue.submit(command_buffers);
-        frame.present();
-        for id in &output.textures_delta.free {
+        self.gpu.queue.present(frame);
+        for id in &freed {
             self.renderer.free_texture(id);
         }
         Ok(repaint_at)
@@ -2173,7 +2200,9 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         }
         let attributes = Window::default_attributes()
             .with_title("eventcv - playback")
-            .with_inner_size(LogicalSize::new(1_100, 720));
+            .with_inner_size(LogicalSize::new(1_100, 720))
+            // AccessKit must attach before the window is first shown; `GuiRender::new` reveals it.
+            .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => return self.fail(event_loop, error.to_string()),
@@ -2184,7 +2213,7 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 "event loop proxy was not initialised".to_owned(),
             );
         };
-        match GuiRender::new(window.clone(), proxy) {
+        match GuiRender::new(event_loop, window.clone(), proxy) {
             Ok(render) => {
                 self.render = Some(render);
                 self.window = Some(window.clone());

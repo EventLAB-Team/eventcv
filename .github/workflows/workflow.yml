@@ -12,7 +12,7 @@ permissions:
 
 # Wheels bundle libhdf5 (built from source via cmake) + the LZF filter and Microsoft's own
 # libonnxruntime, so installed packages get `.h5`/`.hdf5` reading and ONNX inference with no
-# extra user installs. abi3 means one wheel per platform covers every CPython >= 3.9.
+# extra user installs. abi3 means one wheel per platform covers every CPython >= 3.8.
 jobs:
   linux:
     if: >-
