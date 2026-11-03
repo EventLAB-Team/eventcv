@@ -59,7 +59,7 @@ jobs:
         run: cargo fmt --all --check
 
   python:
-    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    name: pytest (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -70,19 +70,11 @@ jobs:
         # import time, and — on Windows — in the whole USB and filesystem story underneath the
         # camera feature.
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
-        python: ["3.12"]
-        include:
-          # The `requires-python` floor (ROS 1 Noetic's interpreter). Ruff's py38 target only
-          # catches syntax 3.8 cannot parse; an `int | None` annotation without
-          # `from __future__ import annotations`, or a 3.9-only stdlib call, only fails here.
-          # Pinned rather than `ubuntu-latest`: setup-python has no 3.8 build for newer images.
-          - os: ubuntu-24.04
-            python: "3.8"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # cmake is what builds the bundled libhdf5; without it the `hdf5` feature cannot compile.
