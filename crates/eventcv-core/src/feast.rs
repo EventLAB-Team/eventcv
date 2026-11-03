@@ -19,7 +19,7 @@
 
 use std::{error::Error, fmt};
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use rand_distr::StandardNormal;
 
 use crate::EventStream;
@@ -102,7 +102,7 @@ impl Feast {
             let inv = 1.0 / norm.sqrt();
             feature.iter_mut().for_each(|value| *value *= inv);
         }
-        let thresholds = (0..total).map(|_| rng.gen::<f32>()).collect();
+        let thresholds = (0..total).map(|_| rng.random::<f32>()).collect();
 
         Ok(Self {
             config,

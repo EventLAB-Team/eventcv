@@ -1693,7 +1693,7 @@ dependencies = [
  "ort",
  "png",
  "pollster 1.0.1",
- "rand 0.8.7",
+ "rand 0.10.2",
  "rand_distr",
  "rayon",
  "rosbag",

@@ -14,11 +14,11 @@ memmap2 = "0.9"
 # `npz` feature off: it pins zip 0.6. The archive side goes through `zip` below (`io/npz.rs`).
 npyz = { version = "0.9", features = ["derive"] }
 # Seeded RNG for FEAST's random on-hypersphere feature initialisation (reproducible via `seed`).
-# `small_rng` is the simulator's per-block noise generator: its parallel pixel loop needs one cheap,
-# independently seeded RNG per block, and `StdRng` (ChaCha12) costs far more than the arithmetic it
-# feeds. Reproducibility comes from how the seeds are derived, not from the algorithm — see
+# `SmallRng` (always built since rand 0.10) is the simulator's per-block noise generator: its
+# parallel pixel loop needs one cheap, independently seeded RNG per block, and `StdRng` (ChaCha12)
+# costs far more than the arithmetic it feeds. Reproducibility comes from how the seeds are derived, not from the algorithm — see
 # `simulate::block_seed`.
-rand = { version = "0.8", features = ["small_rng"] }
+rand = "0.10"
 rand_distr = "0.6"
 rayon = "1.10"
 rosbag = "0.6.3"
