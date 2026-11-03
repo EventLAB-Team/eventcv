@@ -19,7 +19,7 @@ npyz = { version = "0.9", features = ["derive"] }
 # feeds. Reproducibility comes from how the seeds are derived, not from the algorithm — see
 # `simulate::block_seed`.
 rand = { version = "0.8", features = ["small_rng"] }
-rand_distr = "0.4"
+rand_distr = "0.6"
 rayon = "1.10"
 rosbag = "0.6.3"
 # Bundle per-column `.npy` arrays into an `.npz` (STORED) when saving streams/frames.
@@ -59,7 +59,7 @@ hdf5-sys = { package = "hdf5-metno-sys", version = "0.11", optional = true, defa
 # feature, so libusb is compiled from bundled C source and statically linked — no system libusb
 # at runtime, keeping the pure-Rust wheel story intact (a C compiler is already required for the
 # libhdf5 build). MIT-licensed. Needs udev rules on Linux for non-root USB access. `--features camera`.
-neuromorphic-drivers = { version = "0.17", optional = true }
+neuromorphic-drivers = { version = "0.18", optional = true }
 # Adaptive biasing has to rewrite individual fields of the driver's `Biases`, whose fields are
 # private with no setters. The struct derives Serialize/Deserialize, so a JSON round trip is the
 # supported way in; it runs a few times a second at most. (`serde` is already in the tree via the
