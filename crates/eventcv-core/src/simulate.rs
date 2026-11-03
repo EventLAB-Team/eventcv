@@ -34,7 +34,7 @@ use std::sync::OnceLock;
 
 use rand::{
     rngs::{SmallRng, StdRng},
-    Rng, SeedableRng,
+    RngExt, SeedableRng,
 };
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
@@ -697,8 +697,8 @@ fn integrate_pixel(
     if noise.enabled {
         let probability = noise.probability(luma);
         for polarity in [true, false] {
-            if rng.gen::<f32>() < probability {
-                let t = t_start + (rng.gen::<f64>() * (t_end - t_start) as f64) as i64;
+            if rng.random::<f32>() < probability {
+                let t = t_start + (rng.random::<f64>() * (t_end - t_start) as f64) as i64;
                 if t - pixel.last_t >= config.refractory_us {
                     pixel.last_t = t;
                     events.push(SimEvent {

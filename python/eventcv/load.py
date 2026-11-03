@@ -353,10 +353,11 @@ _NO_CAMERA = (
 
 
 def list_cameras() -> list[dict]:
-    """List every connected, supported USB event camera.
+    """List every connected, supported event camera (USB, or Ethernet for the Lucid Triton).
 
     Returns one dict per device with keys ``kind`` (machine name, e.g. ``"prophesee_evk4"``),
-    ``name`` (model), ``serial``, ``bus``, ``address``, and ``speed``. A device's ``serial`` can
+    ``name`` (model), ``serial``, ``bus``, ``address``, and ``speed``. ``bus`` and ``address`` are
+    ``None`` for an Ethernet camera, whose ``speed`` is ``"ethernet"``. A device's ``serial`` can
     be passed to :func:`stream` to select it when several are attached; an empty list means no
     supported camera was found.
 
