@@ -514,10 +514,11 @@ impl Capture {
     /// on closed-loop [adaptive biasing](crate::bias), which holds the event rate steady across
     /// changing light by retuning the sensor's biases as it runs.
     ///
-    /// Apart from `limits` the device is opened with its default configuration (biases, clock, …),
-    /// and adaptive biasing starts from those stock biases. Errors — no camera found, permission
-    /// denied (missing udev rules on Linux), an unreadable serial, or limits the device can't
-    /// honour — are returned as a human-readable string.
+    /// Apart from `limits` and an optional `EVENTCV_CLOCK_<serial>` clock override (see
+    /// `apply_clock_override`), the device is opened with its default configuration (biases,
+    /// clock, …), and adaptive biasing starts from those stock biases. Errors — no camera found,
+    /// permission denied (missing udev rules on Linux), an unreadable serial, an invalid clock
+    /// override, or limits the device can't honour — are returned as a human-readable string.
     pub fn open(
         serial: Option<&str>,
         window: Window,
@@ -549,7 +550,7 @@ impl Capture {
         // rate cap set after open would be silently ignored.
         let device = nd::open(
             selector,
-            plan.configuration,
+            apply_clock_override(serial, plan.configuration)?,
             None,
             event_loop.clone(),
             flag.clone(),
@@ -1284,6 +1285,38 @@ fn device_dimensions(device: &nd::Device) -> (usize, usize) {
     (width as usize, height as usize)
 }
 
+/// Hardware sync: `EVENTCV_CLOCK_<serial>=internal|master|slave` selects the sensor clock.
+/// Applies to devices on the EVK4 interface (Prophesee EVK4, IDS UE-39B0XCP-E).
+fn apply_clock_override(
+    serial: Option<&str>,
+    configuration: Option<nd::Configuration>,
+) -> Result<Option<nd::Configuration>, String> {
+    use nd::devices::prophesee_evk4::{Clock, DEFAULT_CONFIGURATION};
+    let Some(serial) = serial else {
+        return Ok(configuration);
+    };
+    let Ok(mode) = std::env::var(format!("EVENTCV_CLOCK_{serial}")) else {
+        return Ok(configuration);
+    };
+    let clock = match mode.as_str() {
+        "internal" => Clock::Internal,
+        "master" => Clock::InternalWithOutputEnabled,
+        "slave" => Clock::External,
+        other => {
+            return Err(format!(
+                "EVENTCV_CLOCK_{serial}={other}: use internal, master or slave"
+            ))
+        }
+    };
+    let mut evk4 = match configuration {
+        Some(nd::Configuration::PropheseeEvk4(evk4)) => evk4,
+        None => DEFAULT_CONFIGURATION,
+        Some(_) => return Err("the clock override only supports the EVK4 interface (Prophesee EVK4, IDS UE-39B0XCP-E)".to_owned()),
+    };
+    evk4.clock = clock;
+    Ok(Some(nd::Configuration::PropheseeEvk4(evk4)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{rate_limiter, region_masks, ImuSample, Window, Windower};
@@ -1552,5 +1585,49 @@ mod tests {
         if listing.warning.is_some() {
             assert!(listing.cameras.is_empty());
         }
+    }
+
+    #[test]
+    fn clock_override_follows_the_env_var() {
+        use super::{apply_clock_override, nd};
+        use nd::devices::prophesee_evk4::{Clock, DEFAULT_CONFIGURATION};
+        let clock = |configuration| match configuration {
+            Some(nd::Configuration::PropheseeEvk4(evk4)) => evk4.clock,
+            other => panic!("expected an EVK4 configuration, got {other:?}"),
+        };
+        // A serial no other test touches, since env vars are shared across test threads.
+        let serial = "CLOCKTEST";
+        let var = format!("EVENTCV_CLOCK_{serial}");
+
+        std::env::remove_var(&var);
+        assert!(apply_clock_override(Some(serial), None).unwrap().is_none());
+        assert!(apply_clock_override(None, None).unwrap().is_none());
+
+        for (mode, expected) in [
+            ("internal", Clock::Internal),
+            ("master", Clock::InternalWithOutputEnabled),
+            ("slave", Clock::External),
+        ] {
+            std::env::set_var(&var, mode);
+            assert_eq!(
+                clock(apply_clock_override(Some(serial), None).unwrap()),
+                expected
+            );
+            let existing = Some(nd::Configuration::PropheseeEvk4(DEFAULT_CONFIGURATION));
+            assert_eq!(
+                clock(apply_clock_override(Some(serial), existing).unwrap()),
+                expected
+            );
+        }
+
+        std::env::set_var(&var, "bogus");
+        assert!(apply_clock_override(Some(serial), None).is_err());
+
+        std::env::set_var(&var, "master");
+        let davis = Some(nd::Configuration::InivationDavis346(
+            nd::devices::inivation_davis346::DEFAULT_CONFIGURATION,
+        ));
+        assert!(apply_clock_override(Some(serial), davis).is_err());
+        std::env::remove_var(&var);
     }
 }
