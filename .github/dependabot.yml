@@ -1,38 +1,31 @@
 version: 2
 
+multi-ecosystem-groups:
+  weekly-dependencies:
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+
 updates:
   # Rust workspace and member crates
   - package-ecosystem: "cargo"
     directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    groups:
-      rust-patches:
-        patterns: ["*"]
-        update-types: ["patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
 
   # Python package and documentation dependencies
   - package-ecosystem: "pip"
     directories:
       - "/"
       - "/docs"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    versioning-strategy: "increase-if-necessary"
-    groups:
-      python-minor-and-patch:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
+    versioning-strategy: "auto"
 
   # GitHub Actions workflows
   - package-ecosystem: "github-actions"
     directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    groups:
-      actions-minor-and-patch:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: "weekly-dependencies"
