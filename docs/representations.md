@@ -365,6 +365,7 @@ it once, generates Rust source, and compiles a CPU kernel on its first call:
 import numpy as np
 import eventcv as ecv
 
+
 @ecv.representation(channels=2, channel_names=["negative", "positive"])
 def weighted_counts(events):
     out = np.zeros((2, events.height, events.width), dtype=np.float32, like=events)
@@ -372,10 +373,11 @@ def weighted_counts(events):
     np.add.at(out, (events.p.astype(np.int64), events.y, events.x), weights)
     return out
 
-frame = weighted_counts(stream)             # EventFrame, shape [2, H, W]
+
+frame = weighted_counts(stream)  # EventFrame, shape [2, H, W]
 reader = ecv.open("recording.npz", dt_ms=30).with_repr(weighted_counts)
-array = reader[0]                            # NumPy array
-weighted_counts.compile()                   # optional explicit preparation
+array = reader[0]  # NumPy array
+weighted_counts.compile()  # optional explicit preparation
 print(weighted_counts.rust_source)
 ```
 

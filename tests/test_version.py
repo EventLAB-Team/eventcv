@@ -41,7 +41,7 @@ class VersionTests(unittest.TestCase):
         pyproject = (ROOT / "pyproject.toml").read_text()
         self.assertRegex(pyproject, r'(?m)^dynamic\s*=\s*\[[^\]]*"version"')
         self.assertNotRegex(pyproject, r"(?m)^version\s*=")
-        self.assertIn(f"eventcv {expected} (", (ROOT / "docs" / "cli.md").read_text())
+        self.assertIn(f"eventcv {expected} (", (ROOT / "docs" / "cli.md").read_text("utf-8"))
 
     def test_features_list_what_was_built_in(self):
         # Published wheels carry all four; a plain `cargo build` of the bindings carries none.
