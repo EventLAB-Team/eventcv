@@ -35,7 +35,8 @@ import eventcv
 assert "onnx" in eventcv._rust.__features__, \
     "Wheel was built without ONNX support"
 
-runtime = eventcv._ort.find_runtime()
+# Import already sets ORT_DYLIB_PATH; use the recorded origin rather than rediscovering it.
+runtime = eventcv._ort._resolved
 assert runtime is not None, "ONNX Runtime not found"
 assert runtime[1] == "bundled", \
     f"Expected bundled ONNX Runtime, got {runtime[1]}"

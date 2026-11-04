@@ -8,7 +8,7 @@ resolver = "2"
 # The single source of the release version: both crates inherit it and maturin reads it for the
 # wheel (`dynamic = ["version"]`). Bump with `python scripts/bump_version.py X.Y.Z`.
 [workspace.package]
-version = "1.0.11"
+version = "1.0.12"
 
 # One codegen unit and fat LTO for the release artefacts (the wheel included): the decode and
 # accumulation loops are small and hot, and cross-crate inlining is what lets the sink-based
