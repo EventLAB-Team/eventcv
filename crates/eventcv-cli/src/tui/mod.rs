@@ -6,7 +6,10 @@
 //! driver backlog, overflows, decode drops and the adaptive-bias state.
 
 mod draw;
+mod home;
 mod source;
+mod theme;
+mod ui;
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -18,27 +21,24 @@ use eventcv_core::representation::ReprSpec;
 use eventcv_core::viz::{Colormap, RawSurface, RenderView, Rgb8Image, Scale};
 use eventcv_core::EventStream;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Style, Stylize};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Sparkline};
-use ratatui::Frame;
 
 use crate::camera::CameraOptions;
-use crate::commands::{duration_us, format_count, parse_colormap, Source};
+use crate::commands::{duration_us, parse_colormap, Source};
 use crate::Failure;
-use draw::HalfBlock;
+use home::{Action, Home, Target};
 use source::{FileFeed, Step};
+use theme::Theme;
 
 /// Window lengths `[` and `]` stay within, as in the GUI player.
 const DT_RANGE_US: (i64, i64) = (100, 1_000_000);
 /// Rate samples kept for the sparkline — more than any terminal is wide.
 const HISTORY: usize = 512;
 
-#[derive(Args, Debug)]
-#[command(group(ArgGroup::new("input").required(true).args(["path", "camera"])))]
+// Neither a path nor `--camera` opens the home screen to pick one from.
+#[derive(Args, Clone, Debug)]
+#[command(group(ArgGroup::new("input").args(["path", "camera"])))]
 pub(crate) struct TuiArgs {
-    /// recording to play
+    /// recording to play (default: the home screen, to pick a recording or camera)
     pub path: Option<String>,
     /// watch a live USB camera instead (optionally the one with this serial)
     #[arg(long, value_name = "SERIAL", num_args = 0..=1)]
@@ -106,7 +106,12 @@ where
 pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
     // Everything that can be wrong with the arguments or the source is found before the terminal
     // is taken over, so the message lands in a normal shell even when output is piped.
-    let mut app = App::new(&args)?;
+    let mut home =
+        (args.path.is_none() && args.camera.is_none()).then(|| Home::new(Theme::detect()));
+    let mut viewer = match home {
+        Some(_) => None,
+        None => Some(App::new(&args)?),
+    };
     if !std::io::stdout().is_terminal() {
         return Err("eventcv tui needs an interactive terminal".into());
     }
@@ -129,18 +134,59 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
     let mut last = Instant::now();
     loop {
         let now = Instant::now();
-        app.step(now - last)?;
+        if let Some(app) = &mut viewer {
+            app.step(now - last)?;
+        }
         last = now;
-        terminal.draw(|frame| app.draw(frame))?;
+        terminal.draw(|frame| match (&viewer, &home) {
+            (Some(app), _) => app.draw(frame),
+            (None, Some(home)) => home.draw(frame),
+            (None, None) => unreachable!("there is always a viewer or the home screen"),
+        })?;
         let deadline = now + tick;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             if !event::poll(remaining)? {
                 break;
             }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
             // Windows reports releases too; acting on those would fire every key twice.
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && !app.key(key.code, key.modifiers) {
-                    return Ok(());
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // Ctrl+C leaves from anywhere; `q` only closes the screen it is pressed on.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
+            }
+            if let Some(app) = &mut viewer {
+                if !app.key(key.code, key.modifiers) {
+                    // Closing the viewer releases its camera, so the home screen lists it again.
+                    viewer = None;
+                    match &mut home {
+                        Some(home) => home.refresh(),
+                        None => return Ok(()),
+                    }
+                }
+            } else if let Some(home) = &mut home {
+                match home.key(key.code) {
+                    Action::Stay => {}
+                    Action::Quit => return Ok(()),
+                    Action::Open(target) => {
+                        let mut chosen = args.clone();
+                        match target {
+                            Target::File(path) => chosen.path = Some(path.display().to_string()),
+                            Target::Camera(serial) => chosen.camera = Some(serial),
+                        }
+                        match App::new(&chosen) {
+                            Ok(mut app) => {
+                                app.back = true;
+                                home.status = None;
+                                viewer = Some(app);
+                            }
+                            Err(failure) => home.status = Some(failure.message),
+                        }
+                    }
                 }
             }
         }
@@ -195,7 +241,9 @@ struct App {
     problem: Option<String>,
     stats: Stats,
     history: VecDeque<u64>,
-    truecolor: bool,
+    theme: Theme,
+    /// Opened from the home screen, which `q` returns to.
+    back: bool,
 }
 
 impl App {
@@ -247,10 +295,8 @@ impl App {
             problem: None,
             stats: Stats::default(),
             history: VecDeque::with_capacity(HISTORY),
-            truecolor: matches!(
-                std::env::var("COLORTERM").as_deref(),
-                Ok("truecolor") | Ok("24bit")
-            ) || cfg!(windows),
+            theme: Theme::detect(),
+            back: false,
         };
         app.rebuild_view()?;
         Ok(app)
@@ -414,176 +460,6 @@ impl App {
         }
         true
     }
-
-    fn draw(&self, frame: &mut Frame) {
-        let [body, footer] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-        let [picture, panel] =
-            Layout::horizontal([Constraint::Min(10), Constraint::Length(36)]).areas(body);
-
-        match (&self.image, &self.problem) {
-            (Some(image), _) => frame.render_widget(
-                HalfBlock {
-                    image,
-                    truecolor: self.truecolor,
-                },
-                picture,
-            ),
-            (None, Some(problem)) => {
-                frame.render_widget(Paragraph::new(problem.as_str()).red(), picture)
-            }
-            (None, None) => {}
-        }
-        self.draw_panel(frame, panel);
-        frame.render_widget(
-            Line::from(" q quit · space pause · ←/→ seek · +/- speed · [/] window · r view").dim(),
-            footer,
-        );
-    }
-
-    fn draw_panel(&self, frame: &mut Frame, area: Rect) {
-        let row = |key: &str, value: String| Line::from(format!("{key:>10}  {value}"));
-        let (width, height) = self.sensor;
-        let mut lines = vec![row("sensor", format!("{width} x {height}"))];
-        match &self.feed {
-            Feed::File(feed) => {
-                let playback = &feed.playback;
-                lines.push(row("events", format_count(feed.reader.n_events() as u64)));
-                lines.push(row(
-                    "position",
-                    format!(
-                        "{} / {}",
-                        format_time(playback.cursor_us),
-                        format_time(playback.duration_us)
-                    ),
-                ));
-                lines.push(row(
-                    "state",
-                    if playback.playing {
-                        format!("playing ×{}", format_speed(playback.speed))
-                    } else {
-                        "paused".to_owned()
-                    },
-                ));
-            }
-            #[cfg(feature = "camera")]
-            Feed::Live(feed) => {
-                let capture = &feed.capture;
-                let state = if self.paused { "paused" } else { "live" };
-                lines.push(row("state", state.to_owned()));
-                lines.push(row("backlog", format!("{} buffers", capture.backlog())));
-                lines.push(row("overflows", format_count(feed.overflows as u64)));
-                lines.push(row(
-                    "dropped",
-                    format!(
-                        "{} buffers",
-                        format_count(capture.n_budget_dropped() as u64)
-                    ),
-                ));
-                if let Some(bias) = capture.bias_state() {
-                    lines.push(row("bias rate", format_rate(bias.event_rate)));
-                    lines.push(row(
-                        "target",
-                        format!(
-                            "{} – {}",
-                            format_rate(bias.target_rate.0),
-                            format_rate(bias.target_rate.1)
-                        ),
-                    ));
-                    lines.push(row(
-                        "control",
-                        if bias.calibrating {
-                            "calibrating".to_owned()
-                        } else {
-                            format!("{:?}, {} slow steps", bias.authority, bias.slow_steps)
-                        },
-                    ));
-                }
-            }
-        }
-        lines.push(row("window", format!("{} ms", self.dt_ms())));
-        lines.push(row("view", self.view_name().to_owned()));
-        lines.push(Line::default());
-
-        let Stats {
-            total,
-            positive,
-            rate,
-        } = self.stats;
-        let share = |count: usize| {
-            if total == 0 {
-                String::new()
-            } else {
-                format!(" ({:.0}%)", 100.0 * count as f64 / total as f64)
-            }
-        };
-        lines.push(row("events", format_count(total as u64)));
-        lines.push(row(
-            "ON",
-            format!("{}{}", format_count(positive as u64), share(positive)),
-        ));
-        let negative = total - positive;
-        lines.push(row(
-            "OFF",
-            format!("{}{}", format_count(negative as u64), share(negative)),
-        ));
-        // Live rates count what was decoded; past the budget some buffers never were.
-        let label = if matches!(self.feed, Feed::File(_)) {
-            "rate"
-        } else {
-            "decoded"
-        };
-        lines.push(row(label, format_rate(rate)));
-
-        let block = Block::bordered().title(format!(" {} ", self.name));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let text_height = (lines.len() as u16).min(inner.height);
-        let [text, chart] =
-            Layout::vertical([Constraint::Length(text_height), Constraint::Min(0)]).areas(inner);
-        frame.render_widget(Paragraph::new(lines), text);
-        let shown = usize::from(chart.width).min(self.history.len());
-        let recent: Vec<u64> = self
-            .history
-            .iter()
-            .skip(self.history.len() - shown)
-            .copied()
-            .collect();
-        frame.render_widget(
-            Sparkline::default()
-                .data(&recent)
-                .style(Style::new().cyan()),
-            chart,
-        );
-    }
-}
-
-/// `1.234 s`, or `m:ss.ss` past a minute — as the GUI player shows it.
-fn format_time(microseconds: i64) -> String {
-    let seconds = microseconds.max(0) as f64 / 1_000_000.0;
-    if seconds >= 60.0 {
-        format!("{}:{:05.2}", (seconds / 60.0) as u64, seconds % 60.0)
-    } else {
-        format!("{seconds:.3} s")
-    }
-}
-
-fn format_rate(rate: f64) -> String {
-    if rate >= 1_000_000.0 {
-        format!("{:.2} Mev/s", rate / 1_000_000.0)
-    } else if rate >= 1_000.0 {
-        format!("{:.1} kev/s", rate / 1_000.0)
-    } else {
-        format!("{rate:.0} ev/s")
-    }
-}
-
-fn format_speed(speed: f64) -> String {
-    if speed >= 1.0 {
-        format!("{speed}")
-    } else {
-        format!("1/{}", (1.0 / speed).round())
-    }
 }
 
 #[cfg(test)]
@@ -596,8 +472,9 @@ mod tests {
     }
 
     #[test]
-    fn a_path_or_a_camera_is_required() {
-        assert!(parse(&[]).is_err());
+    fn a_path_and_a_camera_conflict() {
+        let home = parse(&[]).unwrap();
+        assert!(home.path.is_none() && home.camera.is_none());
         assert!(parse(&["rec.h5", "--camera"]).is_err());
         assert_eq!(parse(&["rec.h5"]).unwrap().path.as_deref(), Some("rec.h5"));
         assert_eq!(parse(&["--camera"]).unwrap().camera, Some(None));
@@ -636,7 +513,14 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        for text in ["example.npz", "640 x 480", "106,295", "playing", "▀"] {
+        for text in [
+            "EventCV",
+            "example.npz",
+            "640×480",
+            "106,295",
+            "stream",
+            "▀",
+        ] {
             assert!(screen.contains(text), "{text:?} not on screen");
         }
     }
@@ -666,16 +550,5 @@ mod tests {
         assert!(matches!(&app.feed, Feed::File(feed) if feed.playback.speed == 0.5));
         assert!(!app.key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    }
-
-    #[test]
-    fn rates_and_times_read_like_the_gui() {
-        assert_eq!(format_rate(512.0), "512 ev/s");
-        assert_eq!(format_rate(2_500.0), "2.5 kev/s");
-        assert_eq!(format_rate(3_210_000.0), "3.21 Mev/s");
-        assert_eq!(format_time(1_234_000), "1.234 s");
-        assert_eq!(format_time(83_500_000), "1:23.50");
-        assert_eq!(format_speed(2.0), "2");
-        assert_eq!(format_speed(0.25), "1/4");
     }
 }

@@ -668,6 +668,11 @@ def main(argv: list[str] | None = None) -> int:
         print(version_text())
         return 0
     if not getattr(args, "func", None):
+        # At a terminal, a bare `eventcv` opens the terminal viewer's home screen, as the standalone
+        # binary does; anywhere else (a pipe, a script) it prints help.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            sys.stdout.flush()
+            return _rust.tui([])
         parser.print_help()
         return 0
     try:

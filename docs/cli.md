@@ -140,9 +140,16 @@ Beyond the model parameters (`--threshold`, `--sigma-thres`, `--cutoff-hz`, `--l
 ## `eventcv tui`
 
 ```console
+$ eventcv                              # the home screen (also `eventcv tui`)
 $ eventcv tui recording.h5
 $ eventcv tui --camera                 # the first camera found; --camera SERIAL picks one
 ```
+
+Run in a terminal with nothing else, `eventcv` opens a home screen. It lists the cameras plugged
+in and the recordings in the current folder. Pick one with the arrow keys and `enter`. `tab`
+switches between the two lists, `⌫` goes up a folder, and `r` looks for cameras again. A viewer
+opened from here returns to it on `q`, which also releases the camera. When `eventcv` runs in a
+script or a pipe, it prints its help instead.
 
 The events in the terminal, next to the numbers that matter when something looks wrong — for a
 quick look over SSH, on a headless capture box, or anywhere a GPU window is more than the job needs.

@@ -149,12 +149,15 @@ impl LiveFeed {
             return Ok(None);
         }
         let fresh = builder.build();
-        let window = match (self.window.take(), fresh.ts().last()) {
-            (Some(window), Some(&last)) => window
-                .concat(&[&fresh])
-                .time_window(last + 1 - dt_us, last + 1),
-            (Some(window), None) => window,
-            (None, _) => fresh.clone(),
+        let joined = match self.window.take() {
+            Some(window) => window.concat(&[&fresh]),
+            None => fresh.clone(),
+        };
+        // Trimmed to `dt` even on the first drain, which holds everything buffered since the camera
+        // opened — untrimmed, its rate spikes the graph and squashes everything after it.
+        let window = match fresh.ts().last() {
+            Some(&last) => joined.time_window(last + 1 - dt_us, last + 1),
+            None => joined,
         };
         self.window = Some(window.clone());
         Ok(Some(Step { fresh, window }))

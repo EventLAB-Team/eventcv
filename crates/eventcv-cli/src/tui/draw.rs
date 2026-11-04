@@ -1,17 +1,20 @@
-//! Drawing an image into terminal cells: each cell is an upper half block `▀` whose foreground is
-//! one pixel and background the pixel below it, so a cell carries two square-ish pixels.
+//! The dashboard's widgets: the event image in half blocks, a braille rate graph, and the bars.
 
 use eventcv_core::viz::Rgb8Image;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
 use ratatui::widgets::Widget;
 
-/// An [`Rgb8Image`] scaled to fit its area (aspect kept, centred), drawn in half blocks.
+use super::theme::Theme;
+
+/// An [`Rgb8Image`] scaled to fit its area (aspect kept, centred). Each cell is an upper half block
+/// `▀` whose foreground is one pixel and background the pixel below it, so a cell carries two
+/// square-ish pixels.
 pub(super) struct HalfBlock<'a> {
     pub image: &'a Rgb8Image,
-    /// 24-bit colour; otherwise the nearest xterm-256 colour, for terminals without it.
-    pub truecolor: bool,
+    pub theme: &'a Theme,
 }
 
 impl Widget for HalfBlock<'_> {
@@ -27,13 +30,7 @@ impl Widget for HalfBlock<'_> {
         let rows = height.div_ceil(2);
         let left = area.x + (area.width - width as u16) / 2;
         let top = area.y + (area.height - rows as u16) / 2;
-        let color = |rgb: [u8; 3]| {
-            if self.truecolor {
-                Color::Rgb(rgb[0], rgb[1], rgb[2])
-            } else {
-                Color::Indexed(xterm256(rgb))
-            }
-        };
+        let color = |rgb| self.theme.color(rgb);
         for row in 0..rows {
             for column in 0..width {
                 let upper = pixels[2 * row * width + column];
@@ -98,15 +95,78 @@ fn downsample(image: &Rgb8Image, width: usize, height: usize) -> Vec<[u8; 3]> {
     pixels
 }
 
-/// The nearest colour in the xterm-256 6×6×6 cube.
-fn xterm256([r, g, b]: [u8; 3]) -> u8 {
-    // The cube's levels are 0, 95, 135, 175, 215, 255; these are the midpoints between them.
-    let level = |value: u8| match value {
-        0..48 => 0,
-        48..115 => 1,
-        _ => (value - 35) / 40,
-    };
-    16 + 36 * level(r) + 6 * level(g) + level(b)
+/// A filled braille area graph with the newest sample at the right edge, as btop draws them: two
+/// samples per cell across, four dots per cell up, shaded from OFF blue at the floor to ON red at
+/// the top so a burst reads as heat.
+pub(super) struct RateGraph<'a> {
+    pub samples: &'a [u64],
+    pub theme: &'a Theme,
+}
+
+/// Braille dot bits for the left and right halves of a cell, bottom dot first.
+const LEFT_DOTS: [u32; 4] = [0x40, 0x04, 0x02, 0x01];
+const RIGHT_DOTS: [u32; 4] = [0x80, 0x20, 0x10, 0x08];
+
+impl Widget for RateGraph<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let (columns, rows) = (usize::from(area.width), usize::from(area.height));
+        if columns == 0 || rows == 0 {
+            return;
+        }
+        let shown = &self.samples[self.samples.len().saturating_sub(2 * columns)..];
+        let peak = shown.iter().copied().max().unwrap_or(0).max(1) as f64;
+        // Dots lit under each sample. Anything above zero shows at least one, so a quiet stretch
+        // is told apart from a dead one.
+        let levels: Vec<usize> = shown
+            .iter()
+            .map(|&sample| match sample {
+                0 => 0,
+                _ => ((sample as f64 / peak) * (4 * rows) as f64)
+                    .round()
+                    .max(1.0) as usize,
+            })
+            .collect();
+        let offset = 2 * columns - levels.len();
+        for row in 0..rows {
+            let style = Style::new().fg(self.theme.heat((row as f64 + 0.5) / rows as f64));
+            for column in 0..columns {
+                let mut bits = 0;
+                for (side, dots) in [LEFT_DOTS, RIGHT_DOTS].iter().enumerate() {
+                    let level = (2 * column + side)
+                        .checked_sub(offset)
+                        .map_or(0, |index| levels[index]);
+                    let lit = level.saturating_sub(4 * row).min(4);
+                    bits |= dots[..lit].iter().fold(0, |acc, dot| acc | dot);
+                }
+                if bits != 0 {
+                    let symbol = char::from_u32(0x2800 + bits).expect("braille block");
+                    buf[(area.x + column as u16, area.bottom() - 1 - row as u16)]
+                        .set_char(symbol)
+                        .set_style(style);
+                }
+            }
+        }
+    }
+}
+
+/// `███░░░░` — `share` of `width` cells filled in `color`, the rest a faint track.
+pub(super) fn meter(share: f64, width: usize, color: Color, theme: &Theme) -> [Span<'static>; 2] {
+    let filled = ((share.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    [
+        Span::styled("█".repeat(filled), Style::new().fg(color)),
+        Span::styled("░".repeat(width - filled), Style::new().fg(theme.border)),
+    ]
+}
+
+/// `━━━━●─────` — a playhead `share` of the way along `width` cells.
+pub(super) fn scrub(share: f64, width: usize, theme: &Theme) -> [Span<'static>; 3] {
+    let width = width.max(1);
+    let head = (share.clamp(0.0, 1.0) * (width - 1) as f64).round() as usize;
+    [
+        Span::styled("━".repeat(head), Style::new().fg(theme.on)),
+        Span::styled("●", theme.value()),
+        Span::styled("─".repeat(width - 1 - head), Style::new().fg(theme.border)),
+    ]
 }
 
 #[cfg(test)]
@@ -156,7 +216,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 2));
         HalfBlock {
             image: &image,
-            truecolor: true,
+            theme: &Theme::new(true),
         }
         .render(buf.area, &mut buf);
         assert_eq!(buf[(0, 0)].bg, Color::Rgb(200, 200, 200));
@@ -164,11 +224,42 @@ mod tests {
         assert_eq!(buf[(0, 1)].bg, Color::Rgb(0, 0, 0));
     }
 
+    fn graph(samples: &[u64], width: u16, height: u16) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        RateGraph {
+            samples,
+            theme: &Theme::new(true),
+        }
+        .render(buf.area, &mut buf);
+        buf
+    }
+
     #[test]
-    fn xterm256_hits_the_cube_corners() {
-        assert_eq!(xterm256([0, 0, 0]), 16);
-        assert_eq!(xterm256([255, 255, 255]), 231);
-        assert_eq!(xterm256([255, 0, 0]), 196);
-        assert_eq!(xterm256([0x27, 0xc2, 0xff]), 16 + 6 * 3 + 5);
+    fn the_peak_fills_its_column_and_the_newest_sits_right() {
+        let buf = graph(&[0, 0, 0, 8], 2, 2);
+        // The peak is the right half of the last cell, full height: dots 4, 5, 6 and 8.
+        assert_eq!(buf[(1, 0)].symbol(), "⢸");
+        assert_eq!(buf[(1, 1)].symbol(), "⢸");
+        assert_eq!(buf[(0, 1)].symbol(), " ");
+    }
+
+    #[test]
+    fn a_small_sample_still_shows() {
+        let buf = graph(&[1, 1000], 1, 2);
+        // The left half's one bottom dot, beside a full right half.
+        assert_eq!(buf[(0, 1)].symbol(), "⣸");
+    }
+
+    #[test]
+    fn bars_fill_their_share() {
+        let theme = Theme::new(true);
+        let [on, track] = meter(0.25, 8, theme.on, &theme);
+        assert_eq!(
+            (on.content.as_ref(), track.content.as_ref()),
+            ("██", "░░░░░░")
+        );
+        let [done, head, rest] = scrub(0.5, 5, &theme);
+        let bar = format!("{}{}{}", done.content, head.content, rest.content);
+        assert_eq!(bar, "━━●──");
     }
 }
