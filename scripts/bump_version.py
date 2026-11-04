@@ -40,7 +40,17 @@ def main() -> int:
     cli_doc.write_text(cli_doc.read_text().replace(f"eventcv {old} (", f"eventcv {new} ("))
 
     subprocess.run(
-        ["cargo", "update", "--offline", "-p", "eventcv-core", "-p", "eventcv-py"],
+        [
+            "cargo",
+            "update",
+            "--offline",
+            "-p",
+            "eventcv-core",
+            "-p",
+            "eventcv-py",
+            "-p",
+            "eventcv-cli",
+        ],
         cwd=ROOT,
         check=True,
     )

@@ -1,4 +1,5 @@
 use super::*;
+use eventcv_core::representation::CustomKernel;
 use libloading::Library;
 
 type Kernel = unsafe extern "C" fn(
@@ -21,8 +22,8 @@ pub(crate) struct Compiled {
     names: Vec<String>,
 }
 
-impl Compiled {
-    pub(crate) fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
+impl CustomKernel for Compiled {
+    fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
         let (width, height) = stream.sensor_size();
         let len = width
             .checked_mul(height)

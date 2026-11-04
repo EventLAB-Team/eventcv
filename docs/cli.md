@@ -4,8 +4,18 @@ Installing EventCV puts an `eventcv` command on your `PATH`. It is a thin wrappe
 for the jobs where opening a REPL is the annoying part — checking what is in a recording,
 converting a folder of them, producing a video to attach to an issue.
 
-Everything below works equally as `python -m eventcv …`, which is useful when several environments
-are in play and you want to be sure which interpreter is answering.
+The command comes two ways:
+
+- **With the Python package** (`pip install eventcv`), it has every command below except `cameras`
+  and `record`, whose library forms are {func}`eventcv.list_cameras` and {func}`eventcv.record`.
+  It also works as `python -m eventcv …`, which is useful when several environments are in play
+  and you want to be sure which interpreter is answering.
+- **As a standalone binary** that needs no Python ([installing it](index.md)), it has `info`,
+  `convert`, `render`, `simulate`, `tui`, `cameras` and `record`. `play`, `reconstruct` and the
+  `ros2-*` commands need the GPU viewer, an ONNX Runtime or ROS, so they stay with the package.
+
+The commands both have take the same flags and print the same output. With both installed,
+whichever comes first on your `PATH` answers — `eventcv --version` says which one that is.
 
 ## `eventcv --version`
 
@@ -18,6 +28,14 @@ Python 3.12.10 on macOS-14.8.3-arm64-arm-64bit
 The first line is the two things a bug report needs: the version, and which optional features were
 compiled in. If `hdf5` is absent, `.h5` files will not open; if `onnx` is absent,
 {class}`~eventcv.Model` is unavailable.
+
+The standalone binary names itself on the second line instead of an interpreter:
+
+```console
+$ eventcv --version
+eventcv 1.0.12 (hdf5, camera)
+standalone binary on linux-x86_64
+```
 
 ## `eventcv info`
 
@@ -44,12 +62,12 @@ peak rate  2,751,400 ev/s
 
 ```console
 $ eventcv convert recording.raw recording.h5
-wrote recording.h5 (14,203,881 events, streamed)
+wrote recording.h5 (14,203,881 events, loaded)
 ```
 
 The output format comes from the extension. The trailing word says how it was done: `streamed`
-means the recording never had to fit in memory (HDF5 and E2VID support appending); `loaded` means
-it was read whole first, which is the case for the other formats.
+means the recording never had to fit in memory, which is the case for E2VID's `.zip`; `loaded`
+means it was read whole first, which is the case for the other formats.
 
 Converting to E2VID's input format for
 [rpg_e2vid](https://github.com/uzh-rpg/rpg_e2vid) is a `.zip` away:
@@ -119,10 +137,89 @@ Beyond the model parameters (`--threshold`, `--sigma-thres`, `--cutoff-hz`, `--l
   it. Each sub-step is a full pass over every pixel.
 - `--compression` — HDF5 gzip level `0..9`, `0` for uncompressed (default `1`).
 
+## `eventcv tui`
+
+```console
+$ eventcv tui recording.h5
+$ eventcv tui --camera                 # the first camera found; --camera SERIAL picks one
+```
+
+The events in the terminal, next to the numbers that matter when something looks wrong — for a
+quick look over SSH, on a headless capture box, or anywhere a GPU window is more than the job needs.
+Each character cell draws two pixels (a `▀` half block in two colours). The sensor is scaled to fit,
+keeping the brightest pixel of each block it shrinks, so a lone event does not vanish into the
+average.
+
+| Key | |
+|---|---|
+| `space` | pause / resume — at the end of a recording, play it again |
+| `←` `→` | seek a second back / forward (recordings) |
+| `+` `-` | double / halve the playback speed (recordings) |
+| `[` `]` | halve / double the window on screen, between 0.1 ms and 1 s |
+| `r` | next view: raw, then each representation in turn |
+| `q`, `Esc`, `Ctrl-C` | quit |
+
+The panel shows the sensor and either the playhead (position, duration, speed) or, for a camera,
+its health:
+
+- **backlog** — buffers waiting in the driver's ring. A number that keeps rising means the machine
+  is not keeping up.
+- **overflows** — times the ring filled and the driver dropped data.
+- **dropped** — buffers skipped undecoded so the screen stays live at rates no terminal could show.
+  Once that happens the rate is labelled `decoded`, because it no longer counts everything.
+- with `--adaptive-bias`, the controller's measured rate, target band and state.
+
+Below that, for the window on screen: the event count, the ON/OFF split, the rate, and a sparkline
+of the rate over time.
+
+Flags: `--dt-ms` (window, default 30), `--repr`, `--decay-ms`, `--colormap` and `--speed` as for
+`play`, and `--refresh-hz` (default 30 — a full-colour screen is a lot of bytes, so lower it over a
+slow SSH link). A camera also takes `--max-event-rate`, `--roi` and `--adaptive-bias`, as `record`
+does.
+
+Colour is 24-bit when the terminal says it supports it (`COLORTERM=truecolor`, and always on
+Windows) and the nearest xterm-256 colour otherwise. On Windows, use Windows Terminal; the legacy
+console draws slowly.
+
+## `eventcv cameras`
+
+Standalone binary only.
+
+```console
+$ eventcv cameras
+name            kind            serial    speed  usb
+Prophesee EVK4  prophesee_evk4  00051234  super  2:5
+```
+
+Lists the connected USB event cameras. An empty list with a camera plugged in usually means another
+program has it open or, on Linux, that udev rules are missing — when enumeration was blocked by
+permissions the command says so.
+
+## `eventcv record`
+
+Standalone binary only.
+
+```console
+$ eventcv record session.h5 --seconds 10
+recorded 31,402,118 events in 10.0 s -> session.h5
+```
+
+Records a camera straight to disk. Every event format works, and the extension picks it; `.h5` is
+the one for long sessions. Without `--seconds` it records until `Ctrl-C`, which ends the recording
+cleanly and keeps everything captured (a second `Ctrl-C` quits at once).
+
+- `--serial` — which camera, from `eventcv cameras` (default: the first found).
+- `--compression` — HDF5 gzip level `0..9`. The default is uncompressed, so the disk keeps up with
+  the sensor.
+- `--max-event-rate`, `--roi X0 Y0 W H` — limit what the sensor emits, as in
+  [Live camera streaming](streaming.md).
+- `--adaptive-bias` — retune the biases as it runs to hold the event rate steady across changing
+  light.
+
 ## Reading text and rosbag sources
 
 Text formats carry no timestamp unit or column order, and a rosbag has no single obvious
-connection, so `info`, `convert`, `render` and `play` all accept:
+connection, so `info`, `convert`, `render`, `play` and `tui` all accept:
 
 - `--time-unit {s,ms,us,ns}` — without this, a `.txt` recording can report a duration off by a
   factor of a thousand.

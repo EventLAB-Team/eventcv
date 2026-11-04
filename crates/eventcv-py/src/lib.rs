@@ -6,6 +6,8 @@ mod custom;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "camera")]
+use eventcv_core::device::LIVE_DRAIN_BUDGET_MS;
 use eventcv_core::representation::PolarityAccumulator;
 use eventcv_core::{
     camera::Camera,
@@ -20,10 +22,11 @@ use eventcv_core::{
     },
     representation::{
         AveragedTimeSurface, Binary, CountMask, EventCount, EventFrame, EventFrameData,
-        EventPointSet, Mcts, PointSet, Polarity, RedBlue, Representation, RepresentationError,
-        Tencode, TimeSurface, VoxelGrid,
+        EventPointSet, Mcts, PointSet, Polarity, RedBlue, ReprSpec, Representation,
+        RepresentationError, Tencode, TimeSurface, VoxelGrid, DEFAULT_SPAN_MS,
     },
-    viz::Colormap,
+    simulate::ProgressReporter,
+    viz::{Colormap, RenderView, CLIM_CALIBRATION_FRAMES},
     EventStream, EventStreamBuilder,
 };
 use numpy::ndarray::Array2;
@@ -39,11 +42,6 @@ use pyo3::types::{PyAny, PyBool, PyDict, PyTuple};
 // as the code that uses it — otherwise a default build warns about it being unused.
 #[cfg(feature = "onnx")]
 use pyo3::types::PyList;
-
-/// Default time span for the representations that have one (`window_ms`, `tau_ms`,
-/// `max_window_ms`) when none of its unit forms is given and no slice/capture window applies
-/// (an unset span on a windowed stream follows the window — see `PyEventStream::span_ms`).
-const DEFAULT_SPAN_MS: f64 = 30.0;
 
 /// The optional features compiled into this extension, in a fixed order so the string is stable.
 /// Empty when neither is on — a plain `cargo build` of the bindings.
@@ -62,11 +60,6 @@ const FEATURES: &[&str] = &[
 /// that the per-chunk overhead disappears, small enough that the decoded columns stay well under
 /// a gigabyte on any sensor.
 const EXPORT_CHUNK: usize = 4_000_000;
-
-/// Slices sampled to pick one display scale for an exported animation. A robust percentile over a
-/// few frames tracks the recording closely enough, and bounding it keeps `save_video` from reading
-/// a long file twice just to decide how bright to draw it.
-const CLIM_CALIBRATION_FRAMES: usize = 8;
 
 /// Resolves the GUI's recording-time speed while preserving explicitly requested legacy FPS.
 fn gui_playback_speed(py: Python<'_>, fps: Option<f64>, dt_ms: f64, speed: f64) -> PyResult<f64> {
@@ -147,7 +140,7 @@ fn play_gui(
     }
     let repr = match repr {
         None | Some("raw") => None,
-        Some(name) => Some(ReprSpec::named(name, None)?),
+        Some(name) => Some(ReprSpec::named(name, None).map_err(PyValueError::new_err)?),
     };
     let options = viewer::gui::Options {
         dt_ms,
@@ -957,7 +950,7 @@ impl PyEventStream {
 
         let spec = match repr {
             Some("raw") => None,
-            Some(name) => Some(ReprSpec::named(name, None)?),
+            Some(name) => Some(ReprSpec::named(name, None).map_err(PyValueError::new_err)?),
             None => self.repr.clone(),
         };
         let mut view = match spec {
@@ -970,26 +963,16 @@ impl PyEventStream {
                 let colormap = parse_colormap(colormap)?;
                 // The whole stream is in hand, so the display scale is calibrated from the frames
                 // themselves rather than sampled — no second read to avoid.
-                let scale = match clim {
-                    Some(value) if value > 0.0 => Scale::Fixed(value),
-                    Some(_) => Scale::Auto,
-                    None => {
-                        let mut extent = 0.0_f64;
-                        for index in 0..frames.min(CLIM_CALIBRATION_FRAMES) {
-                            let window = walk.window(&self.inner, index);
-                            let frame = py
-                                .detach(|| spec.generate(&window))
-                                .map_err(map_representation_error)?;
-                            extent =
-                                extent.max(py.detach(|| eventcv_core::viz::frame_extent(&frame)));
-                        }
-                        if extent > 0.0 {
-                            Scale::Fixed(extent)
-                        } else {
-                            Scale::Auto
-                        }
-                    }
-                };
+                let scale = Scale::for_sequence(
+                    clim,
+                    (0..frames.min(CLIM_CALIBRATION_FRAMES)).map(|index| {
+                        let window = walk.window(&self.inner, index);
+                        let frame = py
+                            .detach(|| spec.generate(&window))
+                            .map_err(map_representation_error)?;
+                        Ok::<_, PyErr>(py.detach(|| eventcv_core::viz::frame_extent(&frame)))
+                    }),
+                )?;
                 RenderView::Repr {
                     spec,
                     colormap,
@@ -1119,7 +1102,8 @@ impl PyEventStream {
         // defaults — so `stream.view("flow")` / `stream.flatten("count")` read naturally.
         if let Ok(name) = representation.extract::<String>() {
             let spec =
-                ReprSpec::named_with_span_downsample(&name, normalize, self.span_ms, downsample)?;
+                ReprSpec::named_with_span_downsample(&name, normalize, self.span_ms, downsample)
+                    .map_err(PyValueError::new_err)?;
             return py
                 .detach(|| spec.generate(&self.inner))
                 .map(|inner| PyEventFrame { inner })
@@ -1871,7 +1855,8 @@ fn open(
     };
     let repr = repr
         .map(|name| ReprSpec::named_with_span_downsample(name, None, span_ms, downsample))
-        .transpose()?;
+        .transpose()
+        .map_err(PyValueError::new_err)?;
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
         time_unit: parse_time_unit(time_unit)?,
@@ -2034,45 +2019,6 @@ impl StreamWindows {
     fn window(&self, stream: &EventStream, index: usize) -> EventStream {
         let t0 = self.start + index as i64 * self.step;
         stream.time_window(t0, t0 + self.step)
-    }
-}
-
-/// How a sequence of slices is turned into displayable frames, shared by `save_video` and `play`.
-///
-/// The two differ only in where the frames go, so the rendering — including the awkward parts, the
-/// held display scale and the decay that has to survive a window boundary — lives here once.
-enum RenderView {
-    /// The raw event stream: each event lights its pixel in its polarity colour and fades. The
-    /// surface is **stateful on purpose** — decay carries across window boundaries, which is what
-    /// makes a moving edge leave a trail rather than blink once per frame.
-    Raw(eventcv_core::viz::RawSurface),
-    /// A representation, colour-mapped at a scale fixed for the whole sequence so the brightness
-    /// does not pump from frame to frame.
-    Repr {
-        spec: ReprSpec,
-        colormap: Colormap,
-        scale: eventcv_core::viz::Scale,
-    },
-}
-
-impl RenderView {
-    fn render(
-        &mut self,
-        stream: &EventStream,
-    ) -> Result<eventcv_core::viz::Rgb8Image, RepresentationError> {
-        match self {
-            Self::Raw(surface) => {
-                surface.update(stream);
-                Ok(surface.render())
-            }
-            Self::Repr {
-                spec,
-                colormap,
-                scale,
-            } => spec
-                .generate(stream)
-                .map(|frame| eventcv_core::viz::render_frame_scaled(&frame, *colormap, *scale)),
-        }
     }
 }
 
@@ -2459,7 +2405,7 @@ impl PyEventReader {
             let kernel = native.extract::<PyRef<'_, custom::PyCustomKernel>>()?;
             return Ok(PyEventReader {
                 inner: Arc::clone(&self.inner), mode: self.mode,
-                repr: Some(ReprSpec::Custom(Arc::clone(&kernel.inner))),
+                repr: Some(ReprSpec::Custom(kernel.inner.clone())),
                 slice_ops: self.slice_ops.clone(), offset_us: self.offset_us,
                 base_index: self.base_index, hot_pixel_mask: self.hot_pixel_mask.clone(),
             });
@@ -2499,7 +2445,8 @@ impl PyEventReader {
             pct,
             white_frame,
             downsample,
-        )?;
+        )
+        .map_err(PyValueError::new_err)?;
         Ok(PyEventReader {
             inner: Arc::clone(&self.inner),
             mode: self.mode,
@@ -2761,7 +2708,7 @@ impl PyEventReader {
         }
         let repr = match repr {
             Some("raw") => None,
-            Some(name) => Some(ReprSpec::named(name, None)?),
+            Some(name) => Some(ReprSpec::named(name, None).map_err(PyValueError::new_err)?),
             None => self.repr.clone(),
         };
         let options = viewer::gui::Options {
@@ -3223,7 +3170,7 @@ impl PyEventReader {
 
         let spec = match repr {
             Some("raw") => None,
-            Some(name) => Some(ReprSpec::named(name, None)?),
+            Some(name) => Some(ReprSpec::named(name, None).map_err(PyValueError::new_err)?),
             // No explicit choice: the reader's own representation if it has one, else raw. A
             // reader opened without `repr=` used to be an error here; showing the events
             // themselves is a better answer than refusing to show anything.
@@ -3248,32 +3195,23 @@ impl PyEventReader {
         // Calibrate one display scale for the whole sequence. Bounded to a handful of slices so a
         // multi-GB recording doesn't get read twice; the extent is a robust percentile, so a short
         // sample is representative unless the scene changes completely.
-        let scale = match clim {
-            Some(value) if value > 0.0 => Scale::Fixed(value),
-            Some(_) => Scale::Auto, // clim=0 opts back in to per-frame auto-contrast
-            None => {
-                let mut extent = 0.0_f64;
-                for index in 0..frames.min(CLIM_CALIBRATION_FRAMES) {
-                    let stream = fetch_window(
-                        py,
-                        &self.inner,
-                        self.window_for_index_in(mode, index as i64)?,
-                        index,
-                        self.slice_ops.clone(),
-                        self.hot_pixel_mask.clone(),
-                    )?;
-                    let frame = py
-                        .detach(|| spec.generate(&stream))
-                        .map_err(map_representation_error)?;
-                    extent = extent.max(py.detach(|| frame_extent(&frame)));
-                }
-                if extent > 0.0 {
-                    Scale::Fixed(extent)
-                } else {
-                    Scale::Auto
-                }
-            }
-        };
+        let scale = Scale::for_sequence(
+            clim,
+            (0..frames.min(CLIM_CALIBRATION_FRAMES)).map(|index| {
+                let stream = fetch_window(
+                    py,
+                    &self.inner,
+                    self.window_for_index_in(mode, index as i64)?,
+                    index,
+                    self.slice_ops.clone(),
+                    self.hot_pixel_mask.clone(),
+                )?;
+                let frame = py
+                    .detach(|| spec.generate(&stream))
+                    .map_err(map_representation_error)?;
+                Ok::<_, PyErr>(py.detach(|| frame_extent(&frame)))
+            }),
+        )?;
         Ok(RenderView::Repr {
             spec,
             colormap: parse_colormap(colormap)?,
@@ -3904,60 +3842,6 @@ impl SimulationSink {
                 EventStreamBuilder::build,
             ),
             Self::Streaming { .. } => unreachable!("a streaming sink is only built for out="),
-        }
-    }
-}
-
-/// Prints a simulation's progress to stderr, rate-limited so a fast clip does not spend its time
-/// on terminal writes.
-///
-/// Writes with Rust's `eprint!` rather than through `sys.stderr`, because the whole simulation runs
-/// with the GIL released and reacquiring it every frame purely to print would serialise the run
-/// against any other Python thread.
-struct ProgressReporter {
-    enabled: bool,
-    last: std::time::Instant,
-    printed: bool,
-}
-
-impl ProgressReporter {
-    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            // Back-dated so the first frame reports immediately: on a slow clip the first frame is
-            // exactly when the user most needs to see that something is happening.
-            last: std::time::Instant::now() - Self::INTERVAL,
-            printed: false,
-        }
-    }
-
-    fn report(&mut self, progress: eventcv_core::simulate::SimulateProgress) {
-        if !self.enabled {
-            return;
-        }
-        let done = progress.total_frames == Some(progress.frames);
-        if !done && self.last.elapsed() < Self::INTERVAL {
-            return;
-        }
-        self.last = std::time::Instant::now();
-        self.printed = true;
-        let of = match progress.total_frames {
-            Some(total) => format!("/{total}"),
-            None => String::new(),
-        };
-        eprint!(
-            "\rsimulating: {}{of} frames, {:.1}M events",
-            progress.frames,
-            progress.events as f64 / 1e6
-        );
-    }
-
-    /// Closes the progress line, so whatever is printed next starts on its own row.
-    fn finish(&mut self) {
-        if self.enabled && self.printed {
-            eprintln!();
         }
     }
 }
@@ -4821,229 +4705,6 @@ fn stack_frames<'py>(
     })
 }
 
-/// A representation choice + its parameters, attached to an [`PyEventReader`] so each slice
-/// renders to a dense frame (the `DataLoader`-friendly mode). One place that maps a repr name
-/// to the core generator, shared by `open(repr=…)`, `with_repr`, `__getitem__`, and `batch`.
-#[derive(Clone, Debug)]
-enum ReprSpec {
-    Custom(Arc<custom::Compiled>),
-    Binary,
-    Count {
-        normalize: bool,
-    },
-    Polarity {
-        normalize: bool,
-        downsample: usize,
-    },
-    Voxel {
-        bins: usize,
-        window_ms: f64,
-    },
-    TimeSurface {
-        tau_ms: f64,
-    },
-    AveragedTimeSurface {
-        tau_ms: f64,
-    },
-    Tencode {
-        window_ms: f64,
-    },
-    CountMask {
-        pct: f64,
-        white_frame: bool,
-    },
-    RedBlue {
-        pct: f64,
-    },
-    Mcts {
-        max_window_ms: f64,
-        windows: Option<Vec<f64>>,
-    },
-    Flow {
-        window: usize,
-    },
-}
-
-impl ReprSpec {
-    /// Builds a spec from a repr name and the optional overrides (unset ones take the
-    /// same defaults as the `EventStream` methods: count raw `u64`, polarity normalized).
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        name: &str,
-        bins: Option<i64>,
-        window_ms: Option<f64>,
-        tau_ms: Option<f64>,
-        max_window_ms: Option<f64>,
-        windows: Option<Vec<f64>>,
-        window: Option<i64>,
-        normalize: Option<bool>,
-        pct: Option<f64>,
-        white_frame: Option<bool>,
-        downsample: Option<i64>,
-    ) -> PyResult<Self> {
-        let downsample = match downsample {
-            Some(factor) if factor >= 1 => factor as usize,
-            Some(_) => return Err(PyValueError::new_err("downsample must be at least 1")),
-            None => 1,
-        };
-        Ok(match name {
-            "binary" => Self::Binary,
-            "count" => Self::Count {
-                normalize: normalize.unwrap_or(false),
-            },
-            "polarity" => Self::Polarity {
-                normalize: normalize.unwrap_or(true),
-                downsample,
-            },
-            "voxel" => Self::Voxel {
-                bins: bins
-                    .map(|value| {
-                        usize::try_from(value)
-                            .map_err(|_| PyValueError::new_err("bins must be at least 1"))
-                    })
-                    .transpose()?
-                    .unwrap_or(9),
-                window_ms: window_ms.unwrap_or(DEFAULT_SPAN_MS),
-            },
-            "tsurf" => Self::TimeSurface {
-                tau_ms: tau_ms.unwrap_or(DEFAULT_SPAN_MS),
-            },
-            "atsurf" => Self::AveragedTimeSurface {
-                tau_ms: tau_ms.unwrap_or(DEFAULT_SPAN_MS),
-            },
-            "tencode" => Self::Tencode {
-                window_ms: window_ms.unwrap_or(DEFAULT_SPAN_MS),
-            },
-            "redblue" => Self::RedBlue {
-                pct: pct.unwrap_or(99.0),
-            },
-            "countmask" => Self::CountMask {
-                pct: pct.unwrap_or(99.0),
-                white_frame: white_frame.unwrap_or(false),
-            },
-            "mcts" => Self::Mcts {
-                max_window_ms: max_window_ms.unwrap_or(DEFAULT_SPAN_MS),
-                windows,
-            },
-            "flow" => Self::Flow {
-                window: window
-                    .map(|value| {
-                        usize::try_from(value)
-                            .ok()
-                            .filter(|&w| w >= 1)
-                            .ok_or_else(|| PyValueError::new_err("window must be at least 1"))
-                    })
-                    .transpose()?
-                    .unwrap_or(3),
-            },
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown representation: {other}"
-                )))
-            }
-        })
-    }
-
-    /// A spec from a name alone, for the callers that don't accept per-representation options —
-    /// `open(repr=…)`, `flatten`/`view`, `camera.show` — which take at most `normalize`.
-    fn named(name: &str, normalize: Option<bool>) -> PyResult<Self> {
-        Self::named_with_span(name, normalize, None)
-    }
-
-    /// [`ReprSpec::named_with_span`] plus the polarity `downsample` factor (ignored by the others).
-    fn named_with_span_downsample(
-        name: &str,
-        normalize: Option<bool>,
-        span_ms: Option<f64>,
-        downsample: Option<i64>,
-    ) -> PyResult<Self> {
-        Self::new(
-            name, None, span_ms, span_ms, span_ms, None, None, normalize, None, None, downsample,
-        )
-    }
-
-    /// [`ReprSpec::named`], with unset time spans defaulting to `span_ms` — the slice window a
-    /// reader or stream was fetched as — instead of the fixed 30 ms, mirroring `stream()`'s
-    /// live-camera rule so the representation covers exactly the events it is handed.
-    fn named_with_span(
-        name: &str,
-        normalize: Option<bool>,
-        span_ms: Option<f64>,
-    ) -> PyResult<Self> {
-        Self::new(
-            name, None, span_ms, span_ms, span_ms, None, None, normalize, None, None, None,
-        )
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Custom(_) => "custom",
-            Self::Binary => "binary",
-            Self::Count { .. } => "count",
-            Self::Polarity { .. } => "polarity",
-            Self::Voxel { .. } => "voxel",
-            Self::TimeSurface { .. } => "tsurf",
-            Self::AveragedTimeSurface { .. } => "atsurf",
-            Self::Tencode { .. } => "tencode",
-            Self::CountMask { .. } => "countmask",
-            Self::RedBlue { .. } => "redblue",
-            Self::Mcts { .. } => "mcts",
-            Self::Flow { .. } => "flow",
-        }
-    }
-
-    /// Renders on the session's device (see `eventcv.set_device`).
-    ///
-    /// The default lives here rather than in the core, where `generate` stays the CPU reference
-    /// implementation: a Rust caller asking for `generate` should get exactly that, while a
-    /// `reader = ecv.open(..., repr="voxel")` that never names a device should follow whatever the
-    /// session was set to. Representations with no kernel fall back to the CPU on their own.
-    fn generate(&self, stream: &EventStream) -> Result<EventFrame, RepresentationError> {
-        self.generate_on(stream, eventcv_core::accel::default_device())
-    }
-
-    fn generate_on(
-        &self,
-        stream: &EventStream,
-        device: eventcv_core::accel::Device,
-    ) -> Result<EventFrame, RepresentationError> {
-        match self {
-            Self::Custom(kernel) => kernel.generate(stream),
-            Self::Binary => Binary.generate_on(stream, device),
-            Self::Count { normalize } => EventCount::new(*normalize).generate_on(stream, device),
-            Self::Polarity {
-                normalize,
-                downsample,
-            } => Polarity::new(*normalize)
-                .with_downsample(*downsample)
-                .generate_on(stream, device),
-            Self::Voxel { bins, window_ms } => {
-                VoxelGrid::new(*bins, *window_ms).generate_on(stream, device)
-            }
-            Self::TimeSurface { tau_ms } => TimeSurface::new(*tau_ms).generate_on(stream, device),
-            Self::AveragedTimeSurface { tau_ms } => {
-                AveragedTimeSurface::new(*tau_ms).generate_on(stream, device)
-            }
-            Self::Tencode { window_ms } => Tencode::new(*window_ms).generate_on(stream, device),
-            Self::RedBlue { pct } => RedBlue::new(*pct).generate_on(stream, device),
-            Self::CountMask { pct, white_frame } => {
-                CountMask::new(*pct, *white_frame).generate_on(stream, device)
-            }
-            Self::Mcts {
-                max_window_ms,
-                windows,
-            } => match windows {
-                Some(list) => Mcts::with_windows(list.clone()).generate_on(stream, device),
-                None => Mcts::new(*max_window_ms).generate_on(stream, device),
-            },
-            Self::Flow { window } => stream.optical_flow(*window).map_err(|error| match error {
-                FlowError::SizeOverflow => RepresentationError::SizeOverflow,
-                FlowError::InvalidParameter(name) => RepresentationError::InvalidParameter(name),
-            }),
-        }
-    }
-}
-
 /// The device a call should run on: the named one, or the session default.
 ///
 /// A name that is not `"cpu"` or `"gpu"` is an error rather than a silent fall back to the CPU —
@@ -5448,15 +5109,6 @@ impl PyFeast {
 #[cfg(feature = "camera")]
 const LIVE_REPR_WINDOW_MS: u64 = 33;
 
-/// Wall-clock budget the live viewer spends **decoding** events per display frame. At very high
-/// event rates (a 1280×720 Prophesee sensor can emit hundreds of millions of events per second)
-/// decoding a whole frame's worth of events takes far longer than a display frame, so the viewer
-/// decodes only this much of the freshest data each frame and drops the surplus — keeping the
-/// display at ~60 FPS instead of stalling to a couple of frames per second. The dropped events are
-/// invisible at that rate anyway. Iteration/`record` are unaffected (they process every event).
-#[cfg(feature = "camera")]
-const LIVE_DRAIN_BUDGET_MS: u64 = 10;
-
 /// How often the capture thread renders a fresh frame for the display (~60 FPS). This paces only
 /// the *rendering*; the thread keeps draining the driver ring continuously between renders, so the
 /// USB pipeline stays fed even while the GPU thread is blocked on vsync.
@@ -5794,7 +5446,10 @@ const READ_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Where the open camera currently lives. Reading runs it on the pump thread; `show`, `record`, and
 /// `close` need it back on this thread, so they park the pump first.
+// There is one of these per open camera, so the size gap between `Idle` and the rest costs nothing
+// worth boxing the capture for.
 #[cfg(feature = "camera")]
+#[allow(clippy::large_enum_variant)]
 enum CameraState {
     /// Held here, decoding nothing until a window is read.
     Idle {
@@ -6143,7 +5798,9 @@ impl PyEventCamera {
         let repr = match representation.as_deref() {
             None => self.repr.clone(),
             Some("raw") => None,
-            Some(name) => Some(ReprSpec::named(name, Some(normalize))?),
+            Some(name) => {
+                Some(ReprSpec::named(name, Some(normalize)).map_err(PyValueError::new_err)?)
+            }
         };
         let options = viewer::gui::Options {
             dt_ms,
@@ -6556,7 +6213,9 @@ impl PyEventCamera {
                 normalize,
                 latest: None,
             },
-            Some(name) => repr(ReprSpec::named(name, Some(normalize))?),
+            Some(name) => {
+                repr(ReprSpec::named(name, Some(normalize)).map_err(PyValueError::new_err)?)
+            }
             None => match stored_repr {
                 Some(spec) => repr(spec),
                 None => raw(decay_ms),
@@ -6969,26 +6628,29 @@ fn stream(
                 eventcv_core::device::Window::Duration(dt) => Some(dt),
                 eventcv_core::device::Window::Count(_) => None,
             };
-            Some(ReprSpec::new(
-                name,
-                bins,
-                resolve_ms("window", window_s, window_ms, window_us, window_ns)?.or(span),
-                resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.or(span),
-                resolve_ms(
-                    "max_window",
-                    max_window_s,
-                    max_window_ms,
-                    max_window_us,
-                    max_window_ns,
-                )?
-                .or(span),
-                None,
-                window,
-                normalize,
-                pct,
-                white_frame,
-                None,
-            )?)
+            Some(
+                ReprSpec::new(
+                    name,
+                    bins,
+                    resolve_ms("window", window_s, window_ms, window_us, window_ns)?.or(span),
+                    resolve_ms("tau", tau_s, tau_ms, tau_us, tau_ns)?.or(span),
+                    resolve_ms(
+                        "max_window",
+                        max_window_s,
+                        max_window_ms,
+                        max_window_us,
+                        max_window_ns,
+                    )?
+                    .or(span),
+                    None,
+                    window,
+                    normalize,
+                    pct,
+                    white_frame,
+                    None,
+                )
+                .map_err(PyValueError::new_err)?,
+            )
         }
     };
     // Before the device is opened, so a typo is rejected the same way with or without hardware.
@@ -7154,6 +6816,13 @@ fn record(
     Ok(count)
 }
 
+/// `eventcv tui …` for the Python package's command line: the standalone binary's terminal viewer,
+/// with its flags. `argv` is everything after `tui`; returns the exit status.
+#[pyfunction]
+fn tui(py: Python<'_>, argv: Vec<String>) -> i32 {
+    py.detach(|| eventcv_cli::tui::main(std::iter::once("eventcv tui".to_owned()).chain(argv)))
+}
+
 #[pymodule]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Baked in from this crate's Cargo.toml, so it describes the extension actually loaded rather
@@ -7186,6 +6855,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(play_gui, m)?)?;
+    m.add_function(wrap_pyfunction!(tui, m)?)?;
     m.add_function(wrap_pyfunction!(save, m)?)?;
     m.add_function(wrap_pyfunction!(load_frame, m)?)?;
     m.add_function(wrap_pyfunction!(bag_topics, m)?)?;

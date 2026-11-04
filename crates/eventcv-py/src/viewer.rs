@@ -273,8 +273,8 @@ mod tests {
         // Mirrors `view` without opening a window: image vs cloud dispatch.
         use eventcv_core::representation::RepresentationKind::*;
         match frame.kind() {
-            Polarity | Binary | Count | CountMask | RedBlue | Flow | Intensity | Labels
-            | Tencode => Scene::Image(eventcv_core::viz::render_frame(
+            Custom | Polarity | Binary | Count | CountMask | RedBlue | Flow | Intensity
+            | Labels | Tencode => Scene::Image(eventcv_core::viz::render_frame(
                 frame,
                 Colormap::Viridis,
                 true,
