@@ -10,6 +10,7 @@ const MUTED: [u8; 3] = [0x7b, 0x83, 0x94];
 const BORDER: [u8; 3] = [0x3b, 0x42, 0x52];
 const GOOD: [u8; 3] = [0x8b, 0xd5, 0xa0];
 const WARN: [u8; 3] = [0xf5, 0xc2, 0x6b];
+const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// Colours resolved once for the terminal: 24-bit where it is supported, the nearest xterm-256
 /// colour otherwise (macOS Terminal.app, most tmux setups).
@@ -51,9 +52,17 @@ impl Theme {
 
     /// A blend from OFF blue (`t = 0`) to ON red (`t = 1`), for graphs that heat up as they rise.
     pub fn heat(&self, t: f64) -> Color {
-        let t = t.clamp(0.0, 1.0);
-        let mix = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u8;
-        self.color([mix(OFF[0], ON[0]), mix(OFF[1], ON[1]), mix(OFF[2], ON[2])])
+        self.color(mix(OFF, ON, t))
+    }
+
+    /// A polarity's colour at `strength`, fading into the chrome as it goes to 0 — an event dying.
+    pub fn polarity(&self, on: bool, strength: f64) -> Color {
+        self.color(mix(BORDER, if on { ON } else { OFF }, strength))
+    }
+
+    /// A polarity's colour lit up towards white, for a flash.
+    pub fn flash(&self, on: bool) -> Color {
+        self.color(mix(if on { ON } else { OFF }, WHITE, 0.45))
     }
 
     pub fn label(&self) -> Style {
@@ -73,6 +82,14 @@ impl Theme {
     pub fn alarm(&self, count: usize) -> Style {
         Style::new().fg(if count == 0 { self.good } else { self.warn })
     }
+}
+
+/// `a` blended `t` of the way to `b`.
+fn mix(a: [u8; 3], b: [u8; 3], t: f64) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|i| {
+        (f64::from(a[i]) + (f64::from(b[i]) - f64::from(a[i])) * t).round() as u8
+    })
 }
 
 fn paint([r, g, b]: [u8; 3], truecolor: bool) -> Color {

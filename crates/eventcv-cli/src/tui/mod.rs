@@ -134,8 +134,10 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
     let mut last = Instant::now();
     loop {
         let now = Instant::now();
-        if let Some(app) = &mut viewer {
-            app.step(now - last)?;
+        match (&mut viewer, &mut home) {
+            (Some(app), _) => app.step(now - last)?,
+            (None, Some(home)) => home.tick(),
+            (None, None) => {}
         }
         last = now;
         terminal.draw(|frame| match (&viewer, &home) {
