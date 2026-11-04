@@ -502,6 +502,7 @@ packages:
   - libzlib >=1.3.2,<2.0a0
   - openssl >=3.5.9,<4.0a0
   license: MIT
+  license_family: MIT
   purls: []
   run_exports:
     weak:
@@ -1071,6 +1072,7 @@ packages:
   - c-ares >=1.34.9,<2.0a0
   - openssl >=3.5.9,<4.0a0
   license: MIT
+  license_family: MIT
   purls: []
   run_exports:
     weak:
@@ -1748,6 +1750,7 @@ packages:
   - openssl >=3.5.9,<4.0a0
   - libzlib >=1.3.2,<2.0a0
   license: MIT
+  license_family: MIT
   purls: []
   run_exports:
     weak:
@@ -1839,7 +1842,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/maturin?source=compressed-mapping
+  - pkg:pypi/maturin?source=hash-mapping
   run_exports: {}
   size: 8496221
   timestamp: 1793289048809
@@ -2198,7 +2201,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/maturin?source=compressed-mapping
+  - pkg:pypi/maturin?source=hash-mapping
   run_exports: {}
   size: 8756287
   timestamp: 1793289006761

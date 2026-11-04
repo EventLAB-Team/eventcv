@@ -9,7 +9,7 @@
 //! │  ╭─ cameras ───────────────────╮╭─ recordings · ~/data ───────╮  │
 //! │  │ ▶ iniVation DAVIS 346       ││   ..                        │  │
 //! │  │   00000286 · super · 2:5    ││   test/                     │  │
-//! ╰─ ↑↓ select · tab switch · enter open · ⌫ up · r refresh · q quit ─╯
+//! ╰─ ↑↓ select · tab switch · enter open · bksp up · r refresh · q quit ─╯
 //! ```
 //!
 //! The title moves a little, the way an event camera would see it: every few seconds an edge sweeps
@@ -17,6 +17,8 @@
 //! bursts of events keep glinting off the letters' edges, as if light were catching them.
 
 use std::path::PathBuf;
+#[cfg(feature = "camera")]
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Instant;
 
 use ratatui::crossterm::event::KeyCode;
@@ -59,6 +61,11 @@ const RIPPLE_SPEED: f64 = 45.0;
 const SPARKLE_LIFE: f64 = 0.9;
 const BURST_GAP: (f64, f64) = (0.4, 0.8);
 const BURST_SIZE: (usize, usize) = (6, 8);
+
+/// Seconds between the end of one camera scan and the start of the next, so cameras plugged in or
+/// pulled out show up on their own.
+#[cfg(feature = "camera")]
+const CAMERA_SCAN_GAP: f64 = 1.0;
 
 /// Where the ripple is over `column` at `clock` seconds: `Some(true)` just as the edge arrives (an
 /// ON event), `Some(false)` just after it has passed (OFF), `None` otherwise.
@@ -164,6 +171,15 @@ pub(super) struct Home {
     cameras: Vec<Camera>,
     /// Why the camera list may be empty when it should not be — or that this build has no cameras.
     camera_note: Option<String>,
+    /// Whether a scan has finished, so "no cameras found" is not said before anyone has looked.
+    scanned: bool,
+    /// The scan under way. One takes about a second, most of it waiting on network cameras to
+    /// answer, so scans run off the UI thread.
+    #[cfg(feature = "camera")]
+    scan: Option<Receiver<eventcv_core::device::CameraListing>>,
+    /// When the next scan is due, on the animation clock.
+    #[cfg(feature = "camera")]
+    next_scan: f64,
     focus: Pane,
     selected_camera: usize,
     selected_file: usize,
@@ -184,7 +200,13 @@ impl Home {
             dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             entries: Vec::new(),
             cameras: Vec::new(),
-            camera_note: None,
+            camera_note: (!cfg!(feature = "camera"))
+                .then(|| "this build of eventcv has no camera support".to_owned()),
+            scanned: !cfg!(feature = "camera"),
+            #[cfg(feature = "camera")]
+            scan: None,
+            #[cfg(feature = "camera")]
+            next_scan: 0.0,
             focus: Pane::Files,
             selected_camera: 0,
             selected_file: 0,
@@ -198,16 +220,15 @@ impl Home {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(1, |since| since.as_nanos() as u64 | 1)),
         };
-        home.refresh();
-        if !home.cameras.is_empty() {
-            home.focus = Pane::Cameras;
-        }
+        home.read_dir();
         home
     }
 
-    /// Moves the animation on to now.
+    /// Moves the animation on to now, and picks up or starts a camera scan.
     pub fn tick(&mut self) {
         self.advance(self.started.elapsed().as_secs_f64());
+        #[cfg(feature = "camera")]
+        self.scan_cameras();
     }
 
     /// Moves the animation to `clock` seconds: retires faded sparkles and, when one is due, starts
@@ -236,16 +257,44 @@ impl Home {
         self.next_burst = clock + BURST_GAP.0 + self.rng.unit() * BURST_GAP.1;
     }
 
-    /// Lists the cameras and the current folder again — after a camera is plugged in, or when the
-    /// viewer hands one back.
+    /// Looks for cameras now rather than when the next scan is due, and lists the current folder
+    /// again — on `r`, or when the viewer hands a camera back.
     pub fn refresh(&mut self) {
-        self.scan_cameras();
+        #[cfg(feature = "camera")]
+        {
+            self.next_scan = self.clock;
+        }
         self.read_dir();
     }
 
+    /// Takes in a finished scan, and starts the next once it is due.
     #[cfg(feature = "camera")]
     fn scan_cameras(&mut self) {
-        let listing = eventcv_core::device::list_cameras();
+        if let Some(scan) = &self.scan {
+            match scan.try_recv() {
+                Ok(listing) => self.list_cameras(listing),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {}
+            }
+            self.scan = None;
+            self.next_scan = self.clock + CAMERA_SCAN_GAP;
+        }
+        if self.clock >= self.next_scan {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || sender.send(eventcv_core::device::list_cameras()));
+            self.scan = Some(receiver);
+        }
+    }
+
+    /// Shows a scan's cameras, keeping the same one selected, and moves to them when the first
+    /// is plugged in.
+    #[cfg(feature = "camera")]
+    fn list_cameras(&mut self, listing: eventcv_core::device::CameraListing) {
+        let selected = self
+            .cameras
+            .get(self.selected_camera)
+            .map(|camera| camera.serial.clone());
+        let was_empty = self.cameras.is_empty();
         self.cameras = listing
             .cameras
             .into_iter()
@@ -261,13 +310,17 @@ impl Home {
             .collect();
         self.camera_note = listing.warning;
         self.selected_camera = self
-            .selected_camera
-            .min(self.cameras.len().saturating_sub(1));
-    }
-
-    #[cfg(not(feature = "camera"))]
-    fn scan_cameras(&mut self) {
-        self.camera_note = Some("this build of eventcv has no camera support".to_owned());
+            .cameras
+            .iter()
+            .position(|camera| Some(&camera.serial) == selected.as_ref())
+            .unwrap_or(
+                self.selected_camera
+                    .min(self.cameras.len().saturating_sub(1)),
+            );
+        if was_empty && !self.cameras.is_empty() {
+            self.focus = Pane::Cameras;
+        }
+        self.scanned = true;
     }
 
     fn read_dir(&mut self) {
@@ -379,7 +432,7 @@ impl Home {
             ("↑↓", "select"),
             ("tab", "switch"),
             ("enter", "open"),
-            ("⌫", "up"),
+            ("bksp", "up"),
             ("r", "refresh"),
             ("q", "quit"),
         ];
@@ -553,7 +606,12 @@ impl Home {
     fn draw_cameras(&self, frame: &mut Frame, area: Rect) {
         let theme = &self.theme;
         let items = if self.cameras.is_empty() {
-            let mut lines = vec![Line::styled("  no cameras found", theme.label())];
+            let found = if self.scanned {
+                "  no cameras found"
+            } else {
+                "  looking for cameras…"
+            };
+            let mut lines = vec![Line::styled(found, theme.label())];
             if let Some(note) = &self.camera_note {
                 lines.push(Line::styled(
                     format!("  {note}"),
@@ -692,6 +750,35 @@ mod tests {
             .sparkles
             .iter()
             .all(|sparkle| sparkle.born > 1.0 + 0.35));
+    }
+
+    #[cfg(feature = "camera")]
+    #[test]
+    fn cameras_keep_their_selection_and_take_focus_when_plugged_in() {
+        let listing = |serials: &[&str]| eventcv_core::device::CameraListing {
+            cameras: serials
+                .iter()
+                .map(|serial| eventcv_core::device::CameraInfo {
+                    kind: "inivation_davis346".to_owned(),
+                    name: "iniVation DAVIS 346".to_owned(),
+                    serial: Some((*serial).to_owned()),
+                    bus_number: Some(2),
+                    address: Some(7),
+                    speed: "super".to_owned(),
+                })
+                .collect(),
+            warning: None,
+        };
+        let mut home = Home::new(Theme::new(true));
+        home.list_cameras(listing(&[]));
+        assert!(home.scanned && home.focus == Pane::Files);
+        home.list_cameras(listing(&["b"]));
+        assert!(home.focus == Pane::Cameras);
+        // Another camera plugged in ahead of it in the list: the selection stays on "b".
+        home.list_cameras(listing(&["a", "b"]));
+        assert_eq!(home.selected_camera, 1);
+        home.list_cameras(listing(&["a"]));
+        assert_eq!(home.selected_camera, 0);
     }
 
     #[test]

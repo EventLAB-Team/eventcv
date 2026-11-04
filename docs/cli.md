@@ -147,7 +147,7 @@ $ eventcv tui --camera                 # the first camera found; --camera SERIAL
 
 Run in a terminal with nothing else, `eventcv` opens a home screen. It lists the cameras plugged
 in and the recordings in the current folder. Pick one with the arrow keys and `enter`. `tab`
-switches between the two lists, `⌫` goes up a folder, and `r` looks for cameras again. A viewer
+switches between the two lists, Backspace goes up a folder, and `r` looks for cameras again. A viewer
 opened from here returns to it on `q`, which also releases the camera. When `eventcv` runs in a
 script or a pipe, it prints its help instead.
 
