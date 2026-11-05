@@ -1872,6 +1872,7 @@ dependencies = [
  "pollster 1.0.1",
  "pyo3",
  "rfd",
+ "serde_json",
  "wgpu",
  "winit",
 ]

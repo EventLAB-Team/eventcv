@@ -408,6 +408,7 @@ def stream(
     roi: tuple[int, int, int, int] | None = None,
     mask=None,
     adaptive_bias: bool | dict | None = None,
+    biases: dict | str | None = None,
     decay_ms: float | None = None,
     decay_s: float | None = None,
     decay_us: float | None = None,
@@ -548,6 +549,27 @@ def stream(
     ceiling that *discards* events once you exceed it, while adaptive biasing changes what the pixels
     produce in the first place, so the events you keep stay evenly spread rather than clipped.
 
+    **Manual biases.** ``biases=`` sets biases by name as the camera opens, from a ``{name: value}``
+    dict or a preset saved with :meth:`EventCamera.save_biases`; ``adaptive_bias`` then starts from
+    them. On an open camera, :meth:`EventCamera.list_biases` reports each bias's value, range and
+    opening value, and :meth:`~EventCamera.set_bias` / :meth:`~EventCamera.set_biases` /
+    :meth:`~EventCamera.reset_biases` change them live, without interrupting the stream::
+
+        cam = ecv.stream(biases={"diff_on": 20, "diff_off": -20})   # less sensitive (Prophesee)
+        cam.list_biases()["diff_on"]          # {'value': 20, 'min': -77, 'max': 178, 'default': 0}
+        cam.set_bias("refr", 10)
+        cam.save_biases("indoor.json")        # reload with ecv.stream(biases="indoor.json")
+
+    Names and units are the driver's own and differ by vendor: Prophesee values are signed offsets
+    from the chip's factory value (``0`` = stock), DAVIS346 values are indices into its 2041-step
+    current ladder. A preset refuses to load onto a different camera model. While
+    ``adaptive_bias`` runs, the biases it drives are read-only.
+
+    Vendor-specific settings beyond biases (region masks, the DAVIS346 activity filter, …) are in
+    :attr:`EventCamera.configuration`, a nested dict, and :meth:`EventCamera.update_configuration`
+    merges changes into it. Its shape belongs to the ``neuromorphic-drivers`` crate and may change
+    with it; settings the driver only applies at open (the EVK4 rate limiter) are refused there.
+
     Decoding, and any ``record=`` writing, run on a **background thread** that owns the camera, so
     the driver's ring is drained continuously no matter what your loop is doing — the loop only
     collects windows that are already decoded. On a Prophesee EVK4 at ``dt_ms=50`` this leaves
@@ -672,6 +694,7 @@ def stream(
         roi=roi,
         mask=mask,
         adaptive_bias=adaptive_bias,
+        biases=biases,
         decay_ms=decay_ms,
         decay_s=decay_s,
         decay_us=decay_us,
@@ -696,6 +719,7 @@ def record(
     roi: tuple[int, int, int, int] | None = None,
     mask=None,
     adaptive_bias: bool | dict | None = None,
+    biases: dict | str | None = None,
 ) -> int:
     """Record a camera to ``path`` in one call, and return the number of events saved.
 
@@ -713,7 +737,8 @@ def record(
     only become readable once the recording closes, since both have something to write at the end.
 
     Everything :func:`stream` takes about *what the sensor sends* applies — ``serial``, ``dt_ms`` /
-    ``max_events``, ``roi``, ``mask``, ``max_event_rate``, ``adaptive_bias``. The representation and
+    ``max_events``, ``roi``, ``mask``, ``max_event_rate``, ``adaptive_bias``, ``biases``. The
+    representation and
     viewer options do not, since nothing is displayed. Open a camera with :func:`stream` instead when
     you want to process windows as they arrive.
     """
@@ -733,6 +758,7 @@ def record(
         roi=roi,
         mask=mask,
         adaptive_bias=adaptive_bias,
+        biases=biases,
     )
 
 

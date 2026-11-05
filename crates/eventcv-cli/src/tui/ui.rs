@@ -44,13 +44,17 @@ impl App {
         let [top, bottom] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(graph)]).areas(body);
         let [view, side] =
-            Layout::horizontal([Constraint::Min(16), Constraint::Length(SIDE)]).areas(top);
+            Layout::horizontal([Constraint::Min(16), Constraint::Length(self.side_width())]).areas(top);
         let [stream, detail] =
             Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(side);
 
         self.draw_view(frame, view);
         self.draw_stream(frame, stream);
-        self.draw_detail(frame, detail);
+        match self.bias_panel() {
+            #[cfg(feature = "camera")]
+            Some(panel) => panel.draw(frame, detail, &self.theme),
+            _ => self.draw_detail(frame, detail),
+        }
         if graph > 0 {
             self.draw_graph(frame, bottom);
         }
@@ -89,17 +93,59 @@ impl App {
     /// The key hints for this source, set into the bottom border.
     fn keys(&self) -> Line<'static> {
         let file = matches!(self.feed, Feed::File(_));
+        let quit = ("q", if self.back { "back" } else { "quit" });
+        if self.bias_panel().is_some() {
+            return key_hints(
+                &self.theme,
+                &[
+                    ("↑↓", "pick"),
+                    ("←→", "±1"),
+                    ("PgDn PgUp", "coarse"),
+                    ("enter", "type"),
+                    ("m", "more"),
+                    ("a", "adaptive"),
+                    ("d", "default"),
+                    ("c", "clear all"),
+                    ("s", "save"),
+                    ("l", "load"),
+                    ("b", "close"),
+                    quit,
+                ],
+            );
+        }
         let mut keys = vec![("space", if file { "play" } else { "pause" })];
         if file {
             keys.extend([("←→", "seek"), ("+-", "speed")]);
+        } else {
+            keys.push(("b", "biases"));
         }
         // Opened from the home screen, `q` goes back to it rather than quitting.
         keys.extend([
             ("[]", "window"),
             ("r", "view"),
-            ("q", if self.back { "back" } else { "quit" }),
+            quit,
         ]);
         key_hints(&self.theme, &keys)
+    }
+
+    /// The side column widens while the bias panel is open, to fit its labels and gauges.
+    fn side_width(&self) -> u16 {
+        match self.bias_panel() {
+            #[cfg(feature = "camera")]
+            Some(_) => super::biases::WIDTH,
+            _ => SIDE,
+        }
+    }
+
+    #[cfg(feature = "camera")]
+    fn bias_panel(&self) -> Option<&super::biases::BiasPanel> {
+        self.biases.as_ref()
+    }
+
+    /// Without camera support there is never a bias panel.
+    #[cfg(not(feature = "camera"))]
+    fn bias_panel(&self) -> Option<std::convert::Infallible> {
+        None
     }
 
     fn draw_view(&self, frame: &mut Frame, area: Rect) {
@@ -343,7 +389,7 @@ fn format_time(microseconds: i64) -> String {
     }
 }
 
-fn format_rate(rate: f64) -> String {
+pub(super) fn format_rate(rate: f64) -> String {
     if rate >= 1_000_000.0 {
         format!("{:.2} Mev/s", rate / 1_000_000.0)
     } else if rate >= 1_000.0 {

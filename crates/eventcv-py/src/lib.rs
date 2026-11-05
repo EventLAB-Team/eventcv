@@ -5724,6 +5724,81 @@ impl PyEventCamera {
         Ok(Some(dict.unbind()))
     }
 
+    /// Every bias the camera exposes, as ``{name: {"value", "min", "max", "default", "label",
+    /// "description", "primary", "adaptive"}}``, where ``default`` is the value the camera opened
+    /// with. The few biases worth tuning for a scene (ON/OFF threshold, refractory period,
+    /// photoreceptor, filters) come first with ``primary=True`` and a readable ``label``; the
+    /// rest configure the chip's readout and are rarely touched. Values are in the driver's own units:
+    /// signed offsets from the chip's firmware value on Prophesee sensors (``0`` = stock), ladder
+    /// indices ``0..2040`` on the DAVIS346 — so they differ from the absolute registers
+    /// ``bias_state`` reports for the EVK4. ``adaptive`` marks a bias ``adaptive_bias`` is driving,
+    /// which cannot be set by hand. Works while the stream runs.
+    fn list_biases(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let biases = self.with_capture(py, |capture| capture.biases())?;
+        let dict = PyDict::new(py);
+        for bias in biases {
+            let entry = PyDict::new(py);
+            entry.set_item("value", bias.value)?;
+            entry.set_item("min", bias.minimum)?;
+            entry.set_item("max", bias.maximum)?;
+            entry.set_item("default", bias.default)?;
+            entry.set_item("adaptive", bias.adaptive)?;
+            entry.set_item("label", bias.label)?;
+            entry.set_item("description", bias.description)?;
+            entry.set_item("primary", bias.primary)?;
+            dict.set_item(bias.name, entry)?;
+        }
+        Ok(dict.unbind())
+    }
+
+    /// Sets one bias by name (see ``list_biases``). Raises ``ValueError`` for an unknown name, a
+    /// value outside its range, or a bias ``adaptive_bias`` is driving.
+    fn set_bias(&mut self, py: Python<'_>, name: String, value: i64) -> PyResult<()> {
+        self.with_capture(py, move |capture| capture.set_biases(&[(name, value)]))
+    }
+
+    /// Sets several biases at once from a ``{name: value}`` dict or a preset file written by
+    /// ``save_biases``. Nothing changes if any value is rejected.
+    fn set_biases(&mut self, py: Python<'_>, biases: &Bound<'_, PyAny>) -> PyResult<()> {
+        let preset = bias_preset(biases)?;
+        self.with_capture(py, move |capture| capture.apply_preset(&preset))
+    }
+
+    /// Restores every bias to the value the camera opened with (except those ``adaptive_bias``
+    /// is driving).
+    fn reset_biases(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_capture(py, |capture| capture.reset_biases())
+    }
+
+    /// Writes the current biases to a JSON preset that ``set_biases`` or ``stream(biases=…)``
+    /// can load. The preset remembers the camera model and refuses to load onto another.
+    fn save_biases(&mut self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
+        self.with_capture(py, move |capture| {
+            let biases = capture.biases()?;
+            eventcv_core::device::BiasPreset::write(&path, capture.name(), &biases)
+        })
+    }
+
+    /// The driver's full device configuration as a nested dict — biases plus vendor-specific
+    /// settings such as region masks, filters or the rate limiter. Its shape comes from
+    /// ``neuromorphic-drivers`` and can change between driver versions.
+    #[getter]
+    fn configuration(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let text = self.with_capture(py, |capture| Ok(capture.configuration()?.to_string()))?;
+        Ok(py.import("json")?.call_method1("loads", (text,))?.unbind())
+    }
+
+    /// Merges ``patch`` (a nested dict shaped like ``configuration``) into the device configuration.
+    /// Raises ``ValueError`` for an unknown key, an out-of-range or adaptively driven bias, or a
+    /// setting the driver only applies when the camera opens (e.g. the EVK4's ``rate_limiter``;
+    /// use ``stream(max_event_rate=…)``).
+    fn update_configuration(&mut self, py: Python<'_>, patch: &Bound<'_, PyDict>) -> PyResult<()> {
+        let text: String = py.import("json")?.call_method1("dumps", (patch,))?.extract()?;
+        let patch: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.with_capture(py, move |capture| capture.update_configuration(&patch))
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -6107,6 +6182,24 @@ impl PyEventCamera {
         appended.and(recorder.finish())
     }
 
+    /// Runs `job` on the open camera wherever it currently lives — here, or on the pump thread
+    /// without interrupting the stream. A refusal from `job` is a `ValueError`.
+    fn with_capture<T: Send + 'static>(
+        &mut self,
+        py: Python<'_>,
+        job: impl FnOnce(&mut eventcv_core::device::Capture) -> Result<T, String> + Send + 'static,
+    ) -> PyResult<T> {
+        let outcome = match &mut self.state {
+            CameraState::Idle { capture, .. } => job(capture),
+            CameraState::Pumping(pump) => {
+                let pump = &*pump;
+                py.detach(|| pump.call(job)).map_err(PyRuntimeError::new_err)?
+            }
+            CameraState::Closed => return Err(PyRuntimeError::new_err("camera is closed")),
+        };
+        outcome.map_err(PyValueError::new_err)
+    }
+
     fn open_check(&self) -> PyResult<()> {
         match self.state {
             CameraState::Closed => Err(PyRuntimeError::new_err("camera is closed")),
@@ -6418,6 +6511,23 @@ fn parse_limits(
 }
 
 /// Parses `adaptive_bias=` into a controller configuration: `True` for the reference tuning,
+/// A `{name: value}` dict, or the path of a preset file written by `EventCamera.save_biases`.
+#[cfg(feature = "camera")]
+fn bias_preset(biases: &Bound<'_, PyAny>) -> PyResult<eventcv_core::device::BiasPreset> {
+    if let Ok(values) = biases.cast::<PyDict>() {
+        return Ok(eventcv_core::device::BiasPreset {
+            camera: None,
+            values: values.extract::<HashMap<String, i64>>()?.into_iter().collect(),
+        });
+    }
+    let Ok(path) = biases.extract::<std::path::PathBuf>() else {
+        return Err(PyTypeError::new_err(
+            "biases must be a {name: value} dict or the path of a saved bias preset",
+        ));
+    };
+    eventcv_core::device::BiasPreset::read(&path).map_err(PyValueError::new_err)
+}
+
 /// `False`/`None` for off, or a dict overriding individual fields of that tuning. Validated here so
 /// bad options raise before the device is touched, with or without hardware attached.
 #[cfg(feature = "camera")]
@@ -6565,7 +6675,7 @@ fn list_cameras(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     max_window_ms=None, max_window_s=None, max_window_us=None, max_window_ns=None,
     window=None, normalize=None, pct=None, white_frame=None, record=None,
     compression=None, latest=false, max_event_rate=None, roi=None, mask=None, adaptive_bias=None,
-    decay_ms=None, decay_s=None, decay_us=None, decay_ns=None, frames=false, imu=false
+    biases=None, decay_ms=None, decay_s=None, decay_us=None, decay_ns=None, frames=false, imu=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stream(
@@ -6601,6 +6711,7 @@ fn stream(
     roi: Option<(i64, i64, i64, i64)>,
     mask: Option<&Bound<'_, PyAny>>,
     adaptive_bias: Option<&Bound<'_, PyAny>>,
+    biases: Option<&Bound<'_, PyAny>>,
     decay_ms: Option<f64>,
     decay_s: Option<f64>,
     decay_us: Option<f64>,
@@ -6659,11 +6770,23 @@ fn stream(
     }
     let limits = parse_limits(max_event_rate, roi)?;
     let bias = parse_adaptive_bias(adaptive_bias)?;
+    let preset = biases
+        .filter(|biases| !biases.is_none())
+        .map(bias_preset)
+        .transpose()?;
     // Read the mask before the device is touched, so a bad array raises the same way with or
     // without hardware; it can only be *sized* against the sensor once the camera is open.
     let mask = mask.map(mask_array).transpose()?;
     let mut capture = py
-        .detach(|| eventcv_core::device::Capture::open(serial.as_deref(), windowing, limits, bias))
+        .detach(|| {
+            eventcv_core::device::Capture::open(
+                serial.as_deref(),
+                windowing,
+                limits,
+                bias,
+                preset.as_ref(),
+            )
+        })
         .map_err(PyRuntimeError::new_err)?;
     // A `roi=` this sensor can't block on-chip is honoured as a host-side mask instead — the same
     // events are dropped, but they still cross the cable, so say so rather than let the caller
@@ -6741,13 +6864,14 @@ fn stream(
 /// The one-shot form of `stream(...).record(...)`, and the one to prefer when a script only wants a
 /// file: the camera is closed before this returns, so the recording is complete and the device is
 /// free the moment the next line runs. Everything `stream` takes about *what the sensor sends*
-/// (`dt_ms`, `roi`, `mask`, `max_event_rate`, `adaptive_bias`) applies; the viewer and
+/// (`dt_ms`, `roi`, `mask`, `max_event_rate`, `adaptive_bias`, `biases`) applies; the viewer and
 /// representation options do not, since nothing is displayed.
 #[cfg(feature = "camera")]
 #[pyfunction]
 #[pyo3(signature = (
     path, *, seconds=None, serial=None, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None,
-    max_events=None, compression=None, max_event_rate=None, roi=None, mask=None, adaptive_bias=None
+    max_events=None, compression=None, max_event_rate=None, roi=None, mask=None, adaptive_bias=None,
+    biases=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn record(
@@ -6765,6 +6889,7 @@ fn record(
     roi: Option<(i64, i64, i64, i64)>,
     mask: Option<&Bound<'_, PyAny>>,
     adaptive_bias: Option<&Bound<'_, PyAny>>,
+    biases: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<usize> {
     // Everything passed as `None` here is one of `stream`'s representation, viewer, or own-recorder
     // options — all off, because this call archives raw events and displays nothing.
@@ -6801,6 +6926,7 @@ fn record(
         roi,
         mask,
         adaptive_bias,
+        biases,
         /* decay_* */ None,
         None,
         None,

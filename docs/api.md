@@ -261,6 +261,10 @@ pick. Asking for a rate a scene cannot supply at any bias setting is the one way
 the band chosen, whether it is still `calibrating`, and an `authority` of `"hunting"` if the band
 turns out to be unreachable anyway.
 
+To set biases by hand instead, see {meth}`~eventcv.EventCamera.list_biases`,
+{meth}`~eventcv.EventCamera.set_bias` and `stream(biases=…)` in the
+[streaming guide](streaming.md#tuning-biases).
+
 Supported on the iniVation DAVIS346 and the Prophesee EVK4, each with its own defaults. Measured on
 a DAVIS346 over a static indoor scene, the median rate held within 1.2x across runs where the
 unbiased camera wandered 5.7x; on an EVK4, 1.8x against 4.2x. Other cameras raise rather than

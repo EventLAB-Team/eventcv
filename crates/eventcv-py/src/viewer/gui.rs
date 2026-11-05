@@ -832,6 +832,195 @@ struct RateSample {
     processed: f64,
 }
 
+/// How often the bias panel re-reads the camera, to follow changes made elsewhere (adaptive
+/// biasing, or Python) as well as its own writes.
+#[cfg(feature = "camera")]
+const BIAS_REFRESH: Duration = Duration::from_millis(500);
+
+/// The live camera's bias sliders. Reads and writes go to the pump thread that owns the camera.
+#[cfg(feature = "camera")]
+struct BiasControls {
+    pump: Arc<Mutex<crate::capture::Pump>>,
+    rows: Vec<eventcv_core::device::BiasInfo>,
+    /// The adaptive-bias controller, when it is running.
+    adaptive: Option<eventcv_core::bias::BiasState>,
+    refreshed: Option<Instant>,
+    message: Option<String>,
+}
+
+#[cfg(feature = "camera")]
+impl BiasControls {
+    fn new(pump: Arc<Mutex<crate::capture::Pump>>) -> Self {
+        Self {
+            pump,
+            rows: Vec::new(),
+            adaptive: None,
+            refreshed: None,
+            message: None,
+        }
+    }
+
+    /// Runs `job` on the camera, then re-reads the biases; a failure is shown in the panel.
+    fn run(
+        &mut self,
+        job: impl FnOnce(&mut eventcv_core::device::Capture) -> Result<(), String> + Send + 'static,
+    ) {
+        let outcome = self.call(job);
+        self.message = outcome.err();
+        self.refresh();
+    }
+
+    fn call<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut eventcv_core::device::Capture) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let pump = self
+            .pump
+            .lock()
+            .map_err(|_| "camera pump lock was poisoned".to_owned())?;
+        pump.call(job)?
+    }
+
+    fn refresh(&mut self) {
+        self.refreshed = Some(Instant::now());
+        match self.call(|capture| Ok((capture.biases()?, capture.bias_state()))) {
+            Ok((rows, adaptive)) => (self.rows, self.adaptive) = (rows, adaptive),
+            Err(message) => self.message = Some(message),
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.refreshed.is_none_or(|at| at.elapsed() >= BIAS_REFRESH) {
+            self.refresh();
+        }
+        let mut adaptive = self.adaptive.is_some();
+        let toggle = ui.checkbox(&mut adaptive, "Adaptive biasing").on_hover_text(
+            "Retunes the biases as the camera runs to hold the event rate steady. It measures the \
+             scene for about a second first, then moves the biases it drives (shown greyed out).",
+        );
+        if toggle.changed() {
+            self.run(move |capture| {
+                capture.set_adaptive_bias(adaptive.then(eventcv_core::bias::BiasOverrides::default))
+            });
+        }
+        if let Some(state) = &self.adaptive {
+            let (low, high) = state.target_rate;
+            egui::Grid::new("adaptive-stats").show(ui, |ui| {
+                let control = match state.calibrating {
+                    true => "Measuring the scene".to_owned(),
+                    false => format!("{:?}", state.authority),
+                };
+                stat_row(ui, "State", control);
+                stat_row(ui, "Event rate", format_rate(state.event_rate));
+                stat_row(
+                    ui,
+                    "Target",
+                    format!("{} – {}", format_rate(low), format_rate(high)),
+                );
+                stat_row(ui, "Slow steps", state.slow_steps.to_string());
+            });
+        }
+        let mut changes = Vec::new();
+        let primaries = self.rows.iter().filter(|bias| bias.primary).count();
+        // Primary biases first (see `Capture::biases`); a camera eventcv knows none of lists all.
+        let (primary, advanced) = self.rows.split_at_mut(primaries);
+        let (primary, advanced) = match primaries {
+            0 => (advanced, &mut [][..]),
+            _ => (primary, advanced),
+        };
+        egui::Grid::new("bias-grid").num_columns(3).show(ui, |ui| {
+            for bias in primary {
+                bias_row(ui, bias, &mut changes);
+            }
+        });
+        if !advanced.is_empty() {
+            egui::CollapsingHeader::new(format!("Advanced ({})", advanced.len()))
+                .id_salt("bias-advanced")
+                .show(ui, |ui| {
+                    ui.label("Readout and interface biases. Rarely needed for tuning a scene.");
+                    egui::ScrollArea::vertical()
+                        .id_salt("biases")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("bias-advanced-grid")
+                                .num_columns(3)
+                                .show(ui, |ui| {
+                                    for bias in advanced {
+                                        bias_row(ui, bias, &mut changes);
+                                    }
+                                });
+                        });
+                });
+        }
+        if !changes.is_empty() {
+            self.run(move |capture| capture.set_biases(&changes));
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Reset all").clicked() {
+                self.run(|capture| capture.reset_biases());
+            }
+            if ui.button("Save preset…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Bias preset", &["json"])
+                    .set_file_name("biases.json")
+                    .save_file()
+                {
+                    self.run(move |capture| {
+                        let biases = capture.biases()?;
+                        eventcv_core::device::BiasPreset::write(&path, capture.name(), &biases)
+                    });
+                }
+            }
+            if ui.button("Load preset…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Bias preset", &["json"])
+                    .pick_file()
+                {
+                    self.run(move |capture| {
+                        capture.apply_preset(&eventcv_core::device::BiasPreset::read(&path)?)
+                    });
+                }
+            }
+        });
+        if let Some(message) = &self.message {
+            ui.colored_label(Color32::LIGHT_RED, message);
+        }
+    }
+}
+
+/// One bias: its name (hover for what it does), a slider whose number can be clicked to type a
+/// value, and a reset to the value the camera opened with.
+#[cfg(feature = "camera")]
+fn bias_row(
+    ui: &mut egui::Ui,
+    bias: &mut eventcv_core::device::BiasInfo,
+    changes: &mut Vec<(String, i64)>,
+) {
+    let hint = match bias.description {
+        Some(description) => format!("{description}\n\nDriver name: {}", bias.name),
+        None => format!("Driver name: {}", bias.name),
+    };
+    ui.label(bias.label.unwrap_or(&bias.name)).on_hover_text(hint);
+    let slider = ui.add_enabled(
+        !bias.adaptive,
+        egui::Slider::new(&mut bias.value, bias.minimum..=bias.maximum),
+    );
+    let slider = slider
+        .on_hover_text("Drag, or click the number to type a value")
+        .on_disabled_hover_text("Driven by adaptive_bias");
+    if slider.changed() {
+        changes.push((bias.name.clone(), bias.value));
+    }
+    let reset = ui.add_enabled(
+        !bias.adaptive && bias.value != bias.default,
+        egui::Button::new("Reset").small(),
+    );
+    if reset.on_hover_text(format!("Back to {}", bias.default)).clicked() {
+        changes.push((bias.name.clone(), bias.default));
+    }
+    ui.end_row();
+}
+
 struct Model {
     commands: Sender<Command>,
     results: Receiver<ResultMessage>,
@@ -858,6 +1047,8 @@ struct Model {
     snapshot: Option<Rgb8Image>,
     texture: Option<TextureHandle>,
     image_size: [usize; 2],
+    #[cfg(feature = "camera")]
+    biases: Option<BiasControls>,
 }
 
 impl Model {
@@ -888,6 +1079,8 @@ impl Model {
             snapshot: None,
             texture: None,
             image_size: [0, 0],
+            #[cfg(feature = "camera")]
+            biases: None,
         }
     }
 
@@ -920,6 +1113,7 @@ impl Model {
         self.loading = true;
         self.pending = true;
         self.play_after_load = true;
+        self.biases = Some(BiasControls::new(Arc::clone(&pump)));
         let _ = self.commands.send(Command::SetLive {
             generation,
             pump,
@@ -1324,6 +1518,12 @@ impl Model {
             });
         } else {
             ui.label("No recording open");
+        }
+
+        #[cfg(feature = "camera")]
+        if let Some(biases) = &mut self.biases {
+            ui.separator();
+            egui::CollapsingHeader::new("Camera biases").show(ui, |ui| biases.ui(ui));
         }
 
         ui.separator();

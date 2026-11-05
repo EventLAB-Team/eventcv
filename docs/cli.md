@@ -164,7 +164,33 @@ average.
 | `+` `-` | double / halve the playback speed (recordings) |
 | `[` `]` | halve / double the window on screen, between 0.1 ms and 1 s |
 | `r` | next view: raw, then each representation in turn |
-| `q`, `Esc`, `Ctrl-C` | quit |
+| `b` | open / close the bias panel (cameras) |
+| `q`, `Ctrl-C` | quit |
+
+The bias panel lists the biases worth tuning for a scene by name: ON and OFF threshold,
+refractory period, photoreceptor, and the low- and high-pass filters. Under each it says what the
+bias does and which way to turn it, with the driver's own name and range. The rest of the sensor's
+biases configure its readout and interface, and stay hidden until `a` shows them.
+
+| Key | |
+|---|---|
+| `↑` `↓` | pick a bias |
+| `←` `→` | adjust by 1 |
+| `PgDn` `PgUp` | adjust by a twentieth of the range |
+| `enter` | type a value; `enter` sets it, `esc` cancels |
+| `m` | show / hide the more advanced biases |
+| `a` | turn adaptive biasing on / off |
+| `d` | restore the selected bias to its opening value |
+| `c` | clear every change, back to the opening values |
+| `s` / `l` | save / load `biases-<serial>.json` in the current folder |
+| `b` | close the panel |
+
+No key means two things on the same screen, and none needs `shift`. The arrows adjust a bias here
+because seeking only applies to recordings, and `esc` only cancels typing. With adaptive biasing on, the top of
+the panel shows what the controller is doing: measuring the scene, then its state (`Tracking`,
+`Starved`, `Flooded` or `Hunting`), how many slow steps it has taken, and the event rate against its
+target band. The biases it drives are dimmed and move on their own. A saved
+preset opens with `--biases FILE`.
 
 The panel shows the sensor and either the playhead (position, duration, speed) or, for a camera,
 its health:
@@ -181,8 +207,8 @@ of the rate over time.
 
 Flags: `--dt-ms` (window, default 30), `--repr`, `--decay-ms`, `--colormap` and `--speed` as for
 `play`, and `--refresh-hz` (default 30 — a full-colour screen is a lot of bytes, so lower it over a
-slow SSH link). A camera also takes `--max-event-rate`, `--roi` and `--adaptive-bias`, as `record`
-does.
+slow SSH link). A camera also takes `--max-event-rate`, `--roi`, `--adaptive-bias` and `--biases`, as
+`record` does.
 
 Colour is 24-bit when the terminal says it supports it (`COLORTERM=truecolor`, and always on
 Windows) and the nearest xterm-256 colour otherwise. On Windows, use Windows Terminal; the legacy
@@ -222,6 +248,7 @@ cleanly and keeps everything captured (a second `Ctrl-C` quits at once).
   [Live camera streaming](streaming.md).
 - `--adaptive-bias` — retune the biases as it runs to hold the event rate steady across changing
   light.
+- `--biases FILE` — apply a bias preset saved from the TUI, the GUI or `EventCamera.save_biases`.
 
 ## Reading text and rosbag sources
 

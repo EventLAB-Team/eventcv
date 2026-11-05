@@ -5,6 +5,8 @@
 //! diagnostics that matter when something is off: rates and polarity balance, and for a camera the
 //! driver backlog, overflows, decode drops and the adaptive-bias state.
 
+#[cfg(feature = "camera")]
+mod biases;
 mod draw;
 mod home;
 mod source;
@@ -238,6 +240,9 @@ struct App {
     /// A live view frozen on screen; a recording pauses through its own playback.
     #[cfg(feature = "camera")]
     paused: bool,
+    /// The bias panel, while `b` has it open over the camera box.
+    #[cfg(feature = "camera")]
+    biases: Option<biases::BiasPanel>,
     image: Option<Rgb8Image>,
     /// Why the current view could not be drawn, shown in place of the image.
     problem: Option<String>,
@@ -293,6 +298,8 @@ impl App {
             view: RenderView::Raw(RawSurface::new(0, 0, 1.0)),
             #[cfg(feature = "camera")]
             paused: false,
+            #[cfg(feature = "camera")]
+            biases: None,
             image: None,
             problem: None,
             stats: Stats::default(),
@@ -375,7 +382,12 @@ impl App {
                 feed.step(self.dt_us, lookback)?
             }
             #[cfg(feature = "camera")]
-            Feed::Live(feed) => feed.step(self.dt_us, self.paused)?,
+            Feed::Live(feed) => {
+                if let Some(panel) = &mut self.biases {
+                    panel.refresh(&feed.capture);
+                }
+                feed.step(self.dt_us, self.paused)?
+            }
         };
         let Some(Step { fresh, window }) = step else {
             return Ok(());
@@ -407,9 +419,13 @@ impl App {
     /// Handles one key; `false` means quit.
     #[cfg_attr(not(feature = "camera"), allow(irrefutable_let_patterns))]
     fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        #[cfg(feature = "camera")]
+        if self.bias_key(code) {
+            return true;
+        }
         let mut rebuild = false;
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('q') => return false,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return false,
             KeyCode::Char(' ') => match &mut self.feed {
                 Feed::File(feed) => {
@@ -459,6 +475,30 @@ impl App {
         // Every name in `NAMES` builds, so this cannot fail for a key press.
         if rebuild {
             let _ = self.rebuild_view();
+        }
+        true
+    }
+}
+
+#[cfg(feature = "camera")]
+impl App {
+    /// Handles a key aimed at the bias panel: `b` opens and closes it, and while it is open the
+    /// panel takes the keys it knows. `false` leaves the key to the viewer.
+    fn bias_key(&mut self, code: KeyCode) -> bool {
+        let Feed::Live(feed) = &mut self.feed else {
+            return false;
+        };
+        if let Some(panel) = &mut self.biases {
+            if panel.key(&mut feed.capture, code) {
+                return true;
+            }
+        }
+        match (&self.biases, code) {
+            (Some(_), KeyCode::Char('b')) => self.biases = None,
+            (None, KeyCode::Char('b')) => {
+                self.biases = Some(biases::BiasPanel::open(&feed.capture));
+            }
+            _ => return false,
         }
         true
     }

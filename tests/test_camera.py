@@ -209,6 +209,60 @@ class CameraApiTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 eventcv.stream(adaptive_bias=value)
 
+    def test_bias_control_is_on_the_camera_surface(self):
+        import inspect
+
+        for name in (
+            "list_biases",
+            "set_bias",
+            "set_biases",
+            "reset_biases",
+            "save_biases",
+            "configuration",
+            "update_configuration",
+        ):
+            self.assertTrue(hasattr(eventcv.EventCamera, name), name)
+        for function in (eventcv.stream, eventcv.record):
+            parameter = inspect.signature(function).parameters["biases"]
+            self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIsNone(parameter.default)
+
+    def test_biases_are_validated_before_the_device_is_opened(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            not_json = os.path.join(directory, "broken.json")
+            with open(not_json, "w") as file:
+                file.write("{")
+            no_biases = os.path.join(directory, "empty.json")
+            with open(no_biases, "w") as file:
+                json.dump({"camera": "Prophesee EVK4"}, file)
+            for biases, expected in (
+                (3, TypeError),
+                ({"diff_on": "high"}, TypeError),
+                (os.path.join(directory, "missing.json"), ValueError),
+                (not_json, ValueError),
+                (no_biases, ValueError),
+            ):
+                with self.assertRaises(expected, msg=f"biases={biases!r} must be rejected"):
+                    eventcv.stream(biases=biases)
+
+    def test_a_valid_bias_preset_reaches_the_device(self):
+        import json
+        import tempfile
+
+        if eventcv.list_cameras():
+            self.skipTest("a camera is attached")
+        with tempfile.TemporaryDirectory() as directory:
+            preset = os.path.join(directory, "indoor.json")
+            with open(preset, "w") as file:
+                json.dump({"camera": "Prophesee EVK4", "biases": {"diff_on": 10}}, file)
+            for biases in ({"diff_on": 10}, preset):
+                # Parsed fine, so it fails only at *open* for want of a camera.
+                with self.assertRaises(RuntimeError):
+                    eventcv.stream(biases=biases)
+
     def test_stream_accepts_the_sink_options(self):
         # `record`/`compression`/`latest` are keyword-only and reach the Rust binding — a signature
         # mismatch would raise TypeError here rather than at capture time.

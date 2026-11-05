@@ -20,6 +20,9 @@ pub(crate) struct CameraOptions {
     /// retune the sensor's biases as it runs to hold the event rate steady across changing light
     #[arg(long)]
     pub adaptive_bias: bool,
+    /// bias preset (JSON, as saved by the TUI, GUI or `EventCamera.save_biases`) applied on open
+    #[arg(long, value_name = "FILE")]
+    pub biases: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -64,7 +67,7 @@ mod live {
     use std::time::{Duration, Instant};
 
     use eventcv_core::bias::BiasOverrides;
-    use eventcv_core::device::{list_cameras, Capture, Limits, RoiPlacement, Window};
+    use eventcv_core::device::{list_cameras, BiasPreset, Capture, Limits, RoiPlacement, Window};
     use eventcv_core::io::{self, Compression, SaveOptions};
     use eventcv_core::representation::DEFAULT_SPAN_MS;
 
@@ -114,7 +117,14 @@ mod live {
     pub(crate) fn open(serial: Option<&str>, options: &CameraOptions) -> Result<Capture, Failure> {
         let limits = options.limits()?;
         let bias = options.adaptive_bias.then(BiasOverrides::default);
-        let capture = Capture::open(serial, Window::Duration(DEFAULT_SPAN_MS), limits, bias)?;
+        let preset = options.biases.as_deref().map(BiasPreset::read).transpose()?;
+        let capture = Capture::open(
+            serial,
+            Window::Duration(DEFAULT_SPAN_MS),
+            limits,
+            bias,
+            preset.as_ref(),
+        )?;
         if let Some(((x0, y0, width, height), RoiPlacement::Host)) = capture.roi() {
             eprintln!(
                 "warning: roi=({x0}, {y0}, {width}, {height}) is filtered on the host: the {} has \
