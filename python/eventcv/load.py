@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import atexit as _atexit
+import os
+
+import numpy as np
 
 from . import _ort, _rust
 
