@@ -89,6 +89,72 @@ class LoadTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "numpy array"):
             eventcv.from_numpy([[0, 0, 100, 1]])
 
+    # Tonic's layout: a structured array, fields addressed by name, field order varying per dataset.
+    TONIC_DTYPE = np.dtype([("x", "<i2"), ("y", "<i2"), ("p", "<i2"), ("t", "<i8")])
+
+    def _tonic_events(self, dtype=TONIC_DTYPE):
+        events = np.zeros(4, dtype=dtype)
+        events["x"], events["y"] = [3, 0, 2, 1], [1, 2, 0, 2]
+        events["t"], events["p"] = [100, 250, 400, 900], [1, 0, 0, 1]
+        return events
+
+    def test_from_numpy_reads_structured_arrays_by_field_name(self):
+        expected = [[3, 1, 100, 1], [0, 2, 250, 0], [2, 0, 400, 0], [1, 2, 900, 1]]
+        packed_bool = np.dtype([("t", "<i8"), ("x", "<u2"), ("y", "<u2"), ("p", "?")])  # misaligned
+        for dtype in (self.TONIC_DTYPE, packed_bool):
+            with self.subTest(dtype=dtype):
+                stream = eventcv.from_numpy(self._tonic_events(dtype), time_unit="us")
+                self.assertEqual(stream.sensor_size, (4, 3))
+                np.testing.assert_array_equal(stream.numpy(), expected)
+
+    def test_from_numpy_matches_structured_field_synonyms(self):
+        dtype = np.dtype([("timestamp", "<f8"), ("x", "<i4"), ("y", "<i4"), ("polarity", "<i1")])
+        events = np.zeros(2, dtype=dtype)
+        events["timestamp"], events["x"], events["y"], events["polarity"] = (
+            [0.5, 1.5],
+            [1, 0],
+            [0, 1],
+            [1, -1],
+        )
+
+        stream = eventcv.from_numpy(events)  # fractional t -> seconds
+
+        np.testing.assert_array_equal(stream.numpy(), [[1, 0, 500_000, 1], [0, 1, 1_500_000, 0]])
+
+    def test_from_numpy_keys_name_fields_or_columns(self):
+        reference = eventcv.from_numpy(self._tonic_events(), time_unit="us").numpy()
+        renamed = self._tonic_events().astype(
+            np.dtype([("col", "<i2"), ("row", "<i2"), ("on", "<i2"), ("when", "<i8")])
+        )
+        by_name = eventcv.from_numpy(
+            renamed, keys={"x": "col", "y": "row", "t": "when", "p": "on"}, time_unit="us"
+        )
+        np.testing.assert_array_equal(by_name.numpy(), reference)
+
+        events = self._tonic_events()
+        xypt = np.column_stack([events["x"], events["y"], events["p"], events["t"]])
+        by_index = eventcv.from_numpy(xypt, keys={"x": 0, "y": 1, "p": 2, "t": 3}, time_unit="us")
+        np.testing.assert_array_equal(by_index.numpy(), reference)
+
+    def test_from_numpy_structured_errors_name_the_problem(self):
+        with self.assertRaisesRegex(ValueError, "x/y/t/p"):
+            eventcv.from_numpy(np.zeros(2, dtype=[("a", "i4"), ("b", "i4")]))
+        with self.assertRaisesRegex(ValueError, "nope"):
+            eventcv.from_numpy(
+                self._tonic_events(), keys={"x": "nope", "y": "y", "t": "t", "p": "p"}
+            )
+        with self.assertRaisesRegex(ValueError, "column"):
+            eventcv.from_numpy(np.zeros((2, 4)), keys={"x": 0, "y": 1, "t": 2, "p": 7})
+        with self.assertRaisesRegex(TypeError, "keys"):
+            eventcv.from_numpy(np.zeros((2, 4)), keys={"x": 0.5, "y": 1, "t": 2, "p": 3})
+
+    def test_from_numpy_empty_structured_array(self):
+        stream = eventcv.from_numpy(
+            np.zeros(0, dtype=self.TONIC_DTYPE), sensor_size=(4, 4), time_unit="us"
+        )
+        self.assertEqual(len(stream), 0)
+        self.assertEqual(stream.sensor_size, (4, 4))
+
     def test_generates_polarity_representation(self):
         stream = eventcv.load(str(EXAMPLE_PATH))
 

@@ -335,6 +335,71 @@ class OpenReaderTests(unittest.TestCase):
             self._frames().slice(0, t1_ms=5.0)
 
 
+class InMemoryOpenTests(unittest.TestCase):
+    """`open()` on an EventStream or a NumPy array gives the same reader as a file (issue #71)."""
+
+    def setUp(self):
+        # x y t p, timestamps in us; t_min is deliberately not 0 so frames must be start-relative.
+        self.events = np.array(
+            [
+                [0, 0, 5_000, 1],
+                [1, 1, 5_010, 0],
+                [2, 2, 5_020, 1],
+                [3, 3, 5_030, 0],
+                [1, 2, 5_031, 1],
+            ]
+        )
+        self.stream = eventcv.from_numpy(self.events, sensor_size=(8, 8), time_unit="us")
+
+    def test_stream_frames_are_measured_from_the_start(self):
+        reader = eventcv.open(self.stream, dt_us=10)
+        self.assertEqual(reader.n_events, 5)
+        self.assertEqual(reader.sensor_size, (8, 8))
+        self.assertEqual(reader.n_slices, 4)
+        t0 = int(self.stream.numpy()[:, 2].min())
+        for n in range(reader.n_slices):
+            expected = self.stream.time_window(t0 + 10 * n, t0 + 10 * (n + 1))
+            np.testing.assert_array_equal(reader[n].numpy(), expected.numpy())
+        self.assertEqual(sum(len(w) for w in reader.windows()), reader.n_events)
+
+    def test_plain_and_structured_arrays_match_from_numpy(self):
+        structured = np.zeros(
+            len(self.events), dtype=[("t", "<i8"), ("x", "<i2"), ("y", "<i2"), ("p", "?")]
+        )
+        structured["x"], structured["y"], structured["t"] = (
+            self.events[:, 0],
+            self.events[:, 1],
+            self.events[:, 2],
+        )
+        structured["p"] = self.events[:, 3] > 0
+        for source in (self.events, structured):
+            with self.subTest(structured=source.dtype.names is not None):
+                reader = eventcv.open(source, dt_us=10, sensor_size=(8, 8), time_unit="us")
+                np.testing.assert_array_equal(reader.slice_count(0, 5).numpy(), self.stream.numpy())
+                self.assertEqual(reader.n_slices, 4)
+
+    def test_array_honours_order_and_keys(self):
+        txyp = self.events[:, [2, 0, 1, 3]]
+        by_order = eventcv.open(txyp, order="txyp", time_unit="us")
+        by_keys = eventcv.open(txyp, keys={"t": 0, "x": 1, "y": 2, "p": 3}, time_unit="us")
+        for reader in (by_order, by_keys):
+            np.testing.assert_array_equal(reader.slice().numpy(), self.events)
+
+    def test_empty_and_reader_ops(self):
+        empty = eventcv.open(np.zeros((0, 4)), dt_ms=1, sensor_size=(4, 4), time_unit="us")
+        self.assertEqual(empty.n_events, 0)
+        self.assertEqual(len(empty.slice()), 0)
+        counts = eventcv.open(self.stream, dt_us=10, repr="count")
+        self.assertEqual(counts.batch([0, 1]).shape[0], 2)
+
+    def test_path_like_and_bad_source(self):
+        path = Path(tempfile.mkdtemp()) / "events.txt"
+        path.write_text("0 0 0 1\n10 1 1 0\n")
+        self.assertEqual(eventcv.open(path, time_unit="us").n_events, 2)  # pathlib.Path
+        with self.assertRaisesRegex(TypeError, "path"):
+            eventcv.open(3.5)
+
+
 class HotPixelReaderTests(unittest.TestCase):
     """`open(hot_pixel_filter=True)` strips stuck pixels globally, across every slice."""
 

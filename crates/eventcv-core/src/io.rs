@@ -31,8 +31,8 @@ pub use npz::{read_npz, read_npz_frame, write_npz_frame, write_npz_stream, NpzEv
 pub use prophesee::{read_dat, DatEventSink};
 pub use prophesee_raw::{decode_words, open_raw_slice, read_raw, EvtVersion, RawEventSink};
 pub use text::{
-    load_rows, open_text_slice, read_text, write_text_stream, ColumnOrder, RawRow, TextEventSink,
-    TextOptions, TextReader, TimeUnit,
+    column_map, load_rows, open_text_slice, read_text, write_text_stream, ColumnMap, ColumnOrder,
+    RawRow, TextEventSink, TextOptions, TextReader, TimeUnit,
 };
 
 use crate::representation::{EventFrame, EventFrameData};
@@ -481,21 +481,6 @@ impl MemorySliceSource {
     pub fn new(stream: EventStream) -> Self {
         Self { stream }
     }
-
-    fn rebuild(&self, indices: impl Iterator<Item = usize>) -> EventStream {
-        let (width, height) = self.stream.sensor_size();
-        let mut builder = EventStreamBuilder::new(width, height, self.stream.timestamp_scale_ms());
-        let (xs, ys, ts, ps) = (
-            self.stream.xs(),
-            self.stream.ys(),
-            self.stream.ts(),
-            self.stream.ps(),
-        );
-        for index in indices {
-            builder.push(xs[index], ys[index], ts[index], ps[index]);
-        }
-        builder.build()
-    }
 }
 
 impl SliceSource for MemorySliceSource {
@@ -520,14 +505,25 @@ impl SliceSource for MemorySliceSource {
     }
 
     fn slice_index(&self, i0: usize, i1: usize) -> Result<EventStream, IoError> {
-        let i0 = i0.min(self.stream.len());
-        let i1 = i1.clamp(i0, self.stream.len());
-        Ok(self.rebuild(i0..i1))
+        let stream = &self.stream;
+        let i0 = i0.min(stream.len());
+        let i1 = i1.clamp(i0, stream.len());
+        let (width, height) = stream.sensor_size();
+        let mut builder =
+            EventStreamBuilder::with_capacity(width, height, stream.timestamp_scale_ms(), i1 - i0);
+        builder.extend_from_columns(
+            &stream.xs()[i0..i1],
+            &stream.ys()[i0..i1],
+            &stream.ts()[i0..i1],
+            &stream.ps()[i0..i1],
+        );
+        Ok(builder.build())
     }
 
     fn slice_time(&self, t0: i64, t1: i64) -> Result<EventStream, IoError> {
-        let ts = self.stream.ts();
-        Ok(self.rebuild((0..ts.len()).filter(|&index| ts[index] >= t0 && ts[index] < t1)))
+        // Binary search on a time-ordered stream (every reader's output), so walking n frames of
+        // an in-memory source is O(n log N) rather than a full scan per frame.
+        Ok(self.stream.time_window(t0, t1))
     }
 
     fn pixel_counts(&self) -> Result<Vec<u64>, IoError> {
@@ -1256,6 +1252,27 @@ mod tests {
         assert_eq!(source.slice_index(1, 3).unwrap().ts(), &[10, 20]);
         assert_eq!(source.slice_index(2, 100).unwrap().len(), 2); // hi clamped to len
         assert!(source.slice_time(100, 200).unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_source_slices_unsorted_and_empty_streams() {
+        // An out-of-order stream (e.g. built via `from_numpy`) must not be mis-windowed by the
+        // sorted fast path: every event in [10, 30) is kept, in stream order.
+        let mut builder = EventStreamBuilder::new(4, 4, 0.001);
+        for (t, x) in [(20, 0), (0, 1), (10, 2), (30, 3)] {
+            builder.push(x, 0, t, true);
+        }
+        let source = MemorySliceSource::new(builder.build());
+        let window = source.slice_time(10, 30).unwrap();
+        assert_eq!(window.ts(), &[20, 10]);
+        assert_eq!(window.xs(), &[0, 2]);
+        assert_eq!(source.slice_index(1, 3).unwrap().xs(), &[1, 2]);
+
+        let empty = MemorySliceSource::new(EventStreamBuilder::new(4, 4, 0.001).build());
+        assert_eq!(empty.time_span(), (0, 0));
+        assert!(empty.slice_time(0, 100).unwrap().is_empty());
+        assert!(empty.slice_index(0, 10).unwrap().is_empty());
+        assert_eq!(empty.slice_index(0, 10).unwrap().sensor_size(), (4, 4));
     }
 
     #[test]

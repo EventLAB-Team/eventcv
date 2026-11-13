@@ -14,8 +14,8 @@ use eventcv_core::{
     flow::FlowError,
     image::{PoolingMethod, ResizeError},
     io::{
-        load_rows, open as open_reader, ColumnOrder, Compression, EventKeys, IoError, LoadOptions,
-        RawRow, Reader, SaveOptions, TimeUnit,
+        column_map, load_rows, open as open_reader, ColumnOrder, Compression, EventKeys, IoError,
+        LoadOptions, MemorySliceSource, RawRow, Reader, SaveOptions, TimeUnit,
     },
     representation::{
         AveragedTimeSurface, Binary, CountMask, EventCount, EventFrame, EventFrameData,
@@ -27,7 +27,8 @@ use eventcv_core::{
 };
 use numpy::ndarray::Array2;
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, PyUntypedArray,
 };
 use pyo3::exceptions::{
     PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError, PyValueError,
@@ -1638,14 +1639,24 @@ fn parse_order(order: &str) -> PyResult<ColumnOrder> {
 
 /// Turns a `keys={"x": …, "y": …, "t": …, "p": …}` mapping into [`EventKeys`], requiring all
 /// four fields. Values are format-specific column names (HDF5 dataset paths / `dataset/field`;
-/// text header names or indices) — see `eventcv.load`.
-fn parse_keys(keys: Option<HashMap<String, String>>) -> PyResult<Option<EventKeys>> {
+/// text header names or indices; structured-array field names or 2-D column indices) — see
+/// `eventcv.load` / `from_numpy`. A value may be a `str` or an `int` column index.
+fn parse_keys(keys: Option<HashMap<String, Bound<'_, PyAny>>>) -> PyResult<Option<EventKeys>> {
     let Some(mut keys) = keys else {
         return Ok(None);
     };
     let mut take = |field: &str| -> PyResult<String> {
-        keys.remove(field)
-            .ok_or_else(|| PyValueError::new_err(format!("keys is missing '{field}'")))
+        let value = keys
+            .remove(field)
+            .ok_or_else(|| PyValueError::new_err(format!("keys is missing '{field}'")))?;
+        if let Ok(index) = value.extract::<usize>() {
+            return Ok(index.to_string());
+        }
+        value.extract::<String>().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "keys['{field}'] must be a name (str) or a 0-based column index (int)"
+            ))
+        })
     };
     let parsed = EventKeys {
         x: take("x")?,
@@ -1694,8 +1705,8 @@ fn parse_offset(
 #[pyfunction]
 #[pyo3(signature = (path, *, sensor_size=None, time_unit=None, order="txyp", topic=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, keys=None))]
 #[allow(clippy::too_many_arguments)]
-fn load(
-    py: Python<'_>,
+fn load<'py>(
+    py: Python<'py>,
     path: &str,
     sensor_size: Option<(i64, i64)>,
     time_unit: Option<&str>,
@@ -1707,7 +1718,7 @@ fn load(
     offset_ms: Option<f64>,
     offset_us: Option<f64>,
     offset_ns: Option<f64>,
-    keys: Option<HashMap<String, String>>,
+    keys: Option<HashMap<String, Bound<'py, PyAny>>>,
 ) -> PyResult<PyEventStream> {
     let max_events = max_events
         .map(|count| {
@@ -1733,18 +1744,19 @@ fn load(
         .map_err(map_io_error)
 }
 
-/// Builds an `EventStream` from an in-memory `(N, 4)` numpy array — the constructor
-/// mirror of `EventStream.numpy()`. Columns follow `order` (default `xytp`, matching
-/// `numpy()`'s output); `sensor_size` and `time_unit` are inferred exactly like `load`
-/// when omitted. Any integer or float dtype is accepted.
+/// Builds an `EventStream` from an in-memory numpy array — the constructor mirror of
+/// `EventStream.numpy()`. A plain `(N, ≥4)` array's columns follow `order` (default `xytp`,
+/// matching `numpy()`'s output); a structured array (Tonic's layout) is matched by field name.
+/// `keys` overrides either. `sensor_size` and `time_unit` are inferred exactly like `load`.
 #[pyfunction]
-#[pyo3(signature = (events, *, sensor_size=None, time_unit=None, order="xytp"))]
-fn from_numpy(
-    py: Python<'_>,
-    events: &Bound<'_, PyAny>,
+#[pyo3(signature = (events, *, sensor_size=None, time_unit=None, order="xytp", keys=None))]
+fn from_numpy<'py>(
+    py: Python<'py>,
+    events: &Bound<'py, PyAny>,
     sensor_size: Option<(i64, i64)>,
     time_unit: Option<&str>,
     order: &str,
+    keys: Option<HashMap<String, Bound<'py, PyAny>>>,
 ) -> PyResult<PyEventStream> {
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
@@ -1753,47 +1765,125 @@ fn from_numpy(
         topic: None,
         max_events: None,
         offset: None,
-        keys: None,
+        keys: parse_keys(keys)?,
     };
-    let rows = numpy_rows(events, options.order)?;
-    py.detach(|| load_rows(&rows, &options))
-        .map(|inner| PyEventStream {
-            inner,
-            repr: None,
-            span_ms: None,
-        })
+    stream_from_numpy(py, events, &options).map(|inner| PyEventStream {
+        inner,
+        repr: None,
+        span_ms: None,
+    })
+}
+
+/// `numpy_rows` + `load_rows`: the array → `EventStream` path shared by `from_numpy` and
+/// `open(array)`.
+fn stream_from_numpy(
+    py: Python<'_>,
+    events: &Bound<'_, PyAny>,
+    options: &LoadOptions,
+) -> PyResult<EventStream> {
+    let rows = numpy_rows(events, options.order, options.keys.as_ref())?;
+    py.detach(|| load_rows(&rows, options))
         .map_err(map_io_error)
 }
 
-/// Converts an `(N, ≥4)` numpy array of any int/float dtype into raw event rows laid
-/// out per `order` (extra columns are ignored, like the text loader).
-fn numpy_rows(events: &Bound<'_, PyAny>, order: ColumnOrder) -> PyResult<Vec<RawRow>> {
+/// Converts an in-memory event array into raw rows. A structured array (e.g. Tonic's
+/// `events["x"]`/`["t"]`/…) has its fields matched to x/y/t/p by name, like a text header; a
+/// plain `(N, ≥4)` array of any int/float dtype is positional per `order` (extra columns are
+/// ignored). `keys` overrides either — field names, or 0-based column indices.
+fn numpy_rows(
+    events: &Bound<'_, PyAny>,
+    order: ColumnOrder,
+    keys: Option<&EventKeys>,
+) -> PyResult<Vec<RawRow>> {
+    let names: Option<Vec<String>> = events
+        .getattr("dtype")
+        .and_then(|dtype| dtype.getattr("names"))
+        .ok()
+        .and_then(|names| names.extract().ok());
+    if let Some(names) = names {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let map = column_map(Some(&refs), order, keys).map_err(map_io_error)?;
+        let column = |index: usize| -> PyResult<Vec<f64>> {
+            let name = refs.get(index).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "column index {index} is out of range for fields {names:?}"
+                ))
+            })?;
+            // A field of a packed record is a strided, possibly misaligned view; copy it out
+            // contiguous before handing it to ndarray.
+            field_values(&events.get_item(*name)?.call_method0("copy")?, name)
+        };
+        return rows_from_columns(
+            &column(map.x)?,
+            &column(map.y)?,
+            &column(map.t)?,
+            &column(map.p)?,
+        );
+    }
     macro_rules! try_dtype {
         ($($ty:ty),*) => {$(
             if let Ok(array) = events.extract::<PyReadonlyArray2<$ty>>() {
-                return rows_from_view(&array.as_array().mapv(|value| value as f64), order);
+                return rows_from_view(&array.as_array().mapv(|value| value as f64), order, keys);
             }
         )*};
     }
-    try_dtype!(u64, i64, f64, u32, i32, f32, u16, i16, u8);
+    try_dtype!(u64, i64, f64, u32, i32, f32, u16, i16, u8, i8);
     Err(PyTypeError::new_err(
-        "events must be an (N, 4) numpy array of an integer or float dtype",
+        "events must be an (N, 4) numpy array of an integer or float dtype, or a structured \
+         array with x/y/t/p fields",
     ))
 }
 
-fn rows_from_view(view: &Array2<f64>, order: ColumnOrder) -> PyResult<Vec<RawRow>> {
-    if view.ncols() < 4 {
+/// One structured-array field as `f64`s — any int/float dtype, or `bool` (a polarity flag).
+fn field_values(field: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<f64>> {
+    macro_rules! try_dtype {
+        ($($ty:ty),*) => {$(
+            if let Ok(array) = field.extract::<PyReadonlyArray1<$ty>>() {
+                return Ok(array.as_array().iter().map(|&value| value as f64).collect());
+            }
+        )*};
+    }
+    try_dtype!(u64, i64, f64, u32, i32, f32, u16, i16, u8, i8);
+    if let Ok(array) = field.extract::<PyReadonlyArray1<bool>>() {
+        return Ok(array
+            .as_array()
+            .iter()
+            .map(|&value| f64::from(u8::from(value)))
+            .collect());
+    }
+    Err(PyTypeError::new_err(format!(
+        "field '{name}' must be a 1-D integer, float or bool array"
+    )))
+}
+
+fn rows_from_view(
+    view: &Array2<f64>,
+    order: ColumnOrder,
+    keys: Option<&EventKeys>,
+) -> PyResult<Vec<RawRow>> {
+    let map = column_map(None, order, keys).map_err(map_io_error)?;
+    let needed = [map.x, map.y, map.t, map.p].into_iter().max().unwrap_or(0) + 1;
+    if view.ncols() < needed.max(4) {
         return Err(PyValueError::new_err(format!(
-            "expected an (N, 4) event array, got {} column(s)",
+            "expected an (N, {}) event array, got {} column(s)",
+            needed.max(4),
             view.ncols()
         )));
     }
-    let (tc, xc, yc, pc) = match order {
-        ColumnOrder::Txyp => (0, 1, 2, 3),
-        ColumnOrder::Xytp => (2, 0, 1, 3),
-    };
-    let mut rows = Vec::with_capacity(view.nrows());
-    for (index, row) in view.rows().into_iter().enumerate() {
+    let column = |index: usize| view.column(index).to_vec();
+    rows_from_columns(
+        &column(map.x),
+        &column(map.y),
+        &column(map.t),
+        &column(map.p),
+    )
+}
+
+/// Zips four equal-length x/y/t/p columns into rows, rejecting coordinates that don't fit a
+/// sensor; polarity is positive when greater than zero (`0/1`, `-1/1` and `bool` all work).
+fn rows_from_columns(xs: &[f64], ys: &[f64], ts: &[f64], ps: &[f64]) -> PyResult<Vec<RawRow>> {
+    let mut rows = Vec::with_capacity(xs.len());
+    for (index, (((&x, &y), &t), &p)) in xs.iter().zip(ys).zip(ts).zip(ps).enumerate() {
         let coord = |value: f64, name: &str| -> PyResult<u16> {
             let rounded = value.round();
             if !(0.0..=f64::from(u16::MAX)).contains(&rounded) {
@@ -1804,10 +1894,10 @@ fn rows_from_view(view: &Array2<f64>, order: ColumnOrder) -> PyResult<Vec<RawRow
             Ok(rounded as u16)
         };
         rows.push(RawRow {
-            x: coord(row[xc], "x")?,
-            y: coord(row[yc], "y")?,
-            t: row[tc],
-            p: row[pc] > 0.0,
+            x: coord(x, "x")?,
+            y: coord(y, "y")?,
+            t,
+            p: p > 0.0,
         });
     }
     Ok(rows)
@@ -1823,11 +1913,11 @@ fn parse_dt(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, *, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, repr=None, sensor_size=None, time_unit=None, order="txyp", topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None, downsample=None))]
+#[pyo3(signature = (path, *, dt_ms=None, dt_s=None, dt_us=None, dt_ns=None, max_events=None, offset=None, offset_s=None, offset_ms=None, offset_us=None, offset_ns=None, repr=None, sensor_size=None, time_unit=None, order=None, topic=None, hot_pixel_filter=false, hot_pixel_std=3.0, keys=None, downsample=None))]
 #[allow(clippy::too_many_arguments)]
-fn open(
-    py: Python<'_>,
-    path: &str,
+fn open<'py>(
+    py: Python<'py>,
+    path: &Bound<'py, PyAny>,
     dt_ms: Option<f64>,
     dt_s: Option<f64>,
     dt_us: Option<f64>,
@@ -1841,11 +1931,11 @@ fn open(
     repr: Option<&str>,
     sensor_size: Option<(i64, i64)>,
     time_unit: Option<&str>,
-    order: &str,
+    order: Option<&str>,
     topic: Option<String>,
     hot_pixel_filter: bool,
     hot_pixel_std: f64,
-    keys: Option<HashMap<String, String>>,
+    keys: Option<HashMap<String, Bound<'py, PyAny>>>,
     downsample: Option<i64>,
 ) -> PyResult<PyEventReader> {
     let mode = match (parse_dt(dt_s, dt_ms, dt_us, dt_ns)?, max_events) {
@@ -1871,18 +1961,33 @@ fn open(
     let repr = repr
         .map(|name| ReprSpec::named_with_span_downsample(name, None, span_ms, downsample))
         .transpose()?;
+    // `order` defaults to the file layout (`txyp`) for a path, but to `numpy()`'s `xytp` for an
+    // array, so `open(array)` reads it exactly as `from_numpy(array)` does.
+    let is_array = path.cast::<PyUntypedArray>().is_ok();
     let options = LoadOptions {
         sensor_size: parse_sensor_size(sensor_size)?,
         time_unit: parse_time_unit(time_unit)?,
-        order: parse_order(order)?,
+        order: parse_order(order.unwrap_or(if is_array { "xytp" } else { "txyp" }))?,
         topic,
         max_events: None,
         offset: None,
         keys: parse_keys(keys)?,
     };
-    let reader = py
-        .detach(|| open_reader(path, options))
-        .map_err(map_io_error)?;
+    // In-memory sources (an `EventStream`, or an array as `from_numpy` reads it) get the same
+    // reader as a file, backed by `MemorySliceSource`.
+    let reader: Reader = if let Ok(stream) = path.cast::<PyEventStream>() {
+        Box::new(MemorySliceSource::new(stream.get().inner.clone()))
+    } else if is_array {
+        Box::new(MemorySliceSource::new(stream_from_numpy(
+            py, path, &options,
+        )?))
+    } else {
+        let path: std::path::PathBuf = path.extract().map_err(|_| {
+            PyTypeError::new_err("open() takes a file path, an EventStream or a numpy array")
+        })?;
+        py.detach(|| open_reader(path, options))
+            .map_err(map_io_error)?
+    };
     // Translate the absolute offset timestamp into a base event index for fixed-count framing:
     // the events before it are the prefix `slice(0)` must skip. Duration framing needs no index
     // (its windows start at the origin timestamp), so this read only runs for count mode.
