@@ -341,7 +341,13 @@ class InMemoryOpenTests(unittest.TestCase):
     def setUp(self):
         # x y t p, timestamps in us; t_min is deliberately not 0 so frames must be start-relative.
         self.events = np.array(
-            [[0, 0, 5_000, 1], [1, 1, 5_010, 0], [2, 2, 5_020, 1], [3, 3, 5_030, 0], [1, 2, 5_031, 1]]
+            [
+                [0, 0, 5_000, 1],
+                [1, 1, 5_010, 0],
+                [2, 2, 5_020, 1],
+                [3, 3, 5_030, 0],
+                [1, 2, 5_031, 1],
+            ]
         )
         self.stream = eventcv.from_numpy(self.events, sensor_size=(8, 8), time_unit="us")
 
@@ -357,8 +363,14 @@ class InMemoryOpenTests(unittest.TestCase):
         self.assertEqual(sum(len(w) for w in reader.windows()), reader.n_events)
 
     def test_plain_and_structured_arrays_match_from_numpy(self):
-        structured = np.zeros(len(self.events), dtype=[("t", "<i8"), ("x", "<i2"), ("y", "<i2"), ("p", "?")])
-        structured["x"], structured["y"], structured["t"] = self.events[:, 0], self.events[:, 1], self.events[:, 2]
+        structured = np.zeros(
+            len(self.events), dtype=[("t", "<i8"), ("x", "<i2"), ("y", "<i2"), ("p", "?")]
+        )
+        structured["x"], structured["y"], structured["t"] = (
+            self.events[:, 0],
+            self.events[:, 1],
+            self.events[:, 2],
+        )
         structured["p"] = self.events[:, 3] > 0
         for source in (self.events, structured):
             with self.subTest(structured=source.dtype.names is not None):

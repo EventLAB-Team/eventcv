@@ -110,7 +110,12 @@ class LoadTests(unittest.TestCase):
     def test_from_numpy_matches_structured_field_synonyms(self):
         dtype = np.dtype([("timestamp", "<f8"), ("x", "<i4"), ("y", "<i4"), ("polarity", "<i1")])
         events = np.zeros(2, dtype=dtype)
-        events["timestamp"], events["x"], events["y"], events["polarity"] = [0.5, 1.5], [1, 0], [0, 1], [1, -1]
+        events["timestamp"], events["x"], events["y"], events["polarity"] = (
+            [0.5, 1.5],
+            [1, 0],
+            [0, 1],
+            [1, -1],
+        )
 
         stream = eventcv.from_numpy(events)  # fractional t -> seconds
 
@@ -135,14 +140,18 @@ class LoadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "x/y/t/p"):
             eventcv.from_numpy(np.zeros(2, dtype=[("a", "i4"), ("b", "i4")]))
         with self.assertRaisesRegex(ValueError, "nope"):
-            eventcv.from_numpy(self._tonic_events(), keys={"x": "nope", "y": "y", "t": "t", "p": "p"})
+            eventcv.from_numpy(
+                self._tonic_events(), keys={"x": "nope", "y": "y", "t": "t", "p": "p"}
+            )
         with self.assertRaisesRegex(ValueError, "column"):
             eventcv.from_numpy(np.zeros((2, 4)), keys={"x": 0, "y": 1, "t": 2, "p": 7})
         with self.assertRaisesRegex(TypeError, "keys"):
             eventcv.from_numpy(np.zeros((2, 4)), keys={"x": 0.5, "y": 1, "t": 2, "p": 3})
 
     def test_from_numpy_empty_structured_array(self):
-        stream = eventcv.from_numpy(np.zeros(0, dtype=self.TONIC_DTYPE), sensor_size=(4, 4), time_unit="us")
+        stream = eventcv.from_numpy(
+            np.zeros(0, dtype=self.TONIC_DTYPE), sensor_size=(4, 4), time_unit="us"
+        )
         self.assertEqual(len(stream), 0)
         self.assertEqual(stream.sensor_size, (4, 4))
 
