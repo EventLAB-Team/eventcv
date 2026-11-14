@@ -10,6 +10,7 @@ mod mcts;
 mod point_set;
 mod polarity;
 mod redblue;
+mod spec;
 mod tencode;
 mod time_surface;
 mod voxel;
@@ -22,6 +23,7 @@ pub use mcts::Mcts;
 pub use point_set::{EventPointSet, PointSet};
 pub use polarity::{Polarity, PolarityAccumulator};
 pub use redblue::RedBlue;
+pub use spec::{CustomKernel, ReprSpec, DEFAULT_SPAN_MS};
 pub use tencode::Tencode;
 pub use time_surface::TimeSurface;
 pub use voxel::VoxelGrid;
@@ -87,6 +89,7 @@ pub(crate) fn on_gpu(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepresentationKind {
+    Custom,
     AveragedTimeSurface,
     Binary,
     Count,
@@ -108,6 +111,7 @@ pub enum RepresentationKind {
 impl RepresentationKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Custom => "custom",
             Self::AveragedTimeSurface => "atsurf",
             Self::Binary => "binary",
             Self::Count => "count",
@@ -127,6 +131,7 @@ impl RepresentationKind {
     /// The inverse of [`Self::as_str`] — recovers the kind tag stored by the frame writers.
     pub fn from_tag(tag: &str) -> Option<Self> {
         Some(match tag {
+            "custom" => Self::Custom,
             "atsurf" => Self::AveragedTimeSurface,
             "binary" => Self::Binary,
             "count" => Self::Count,
@@ -164,6 +169,15 @@ pub enum EventFrameData {
 }
 
 impl EventFrame {
+    /// Constructs a dense custom float32 frame with validated dimensions.
+    pub fn custom(data: Vec<f32>, width: usize, height: usize, names: Vec<String>) -> Result<Self, RepresentationError> {
+        let len = width.checked_mul(height).and_then(|n| n.checked_mul(names.len())).ok_or(RepresentationError::SizeOverflow)?;
+        if names.is_empty() || data.len() != len {
+            return Err(RepresentationError::ShapeMismatch { samples: data.len(), width, height });
+        }
+        Ok(Self::from_parts(EventFrameData::F32(data), width, height, RepresentationKind::Custom, names))
+    }
+
     /// Reassembles a frame from its stored parts — used by the IO frame readers. Channels
     /// is `channel_names.len()`, and the data length must equal `channels * width * height`.
     pub(crate) fn from_parts(

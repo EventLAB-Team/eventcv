@@ -5,7 +5,9 @@
 //! and RedBlue (already RGB encodings) and Flow (Middlebury colour coding — direction → hue, speed →
 //! saturation).
 
-use crate::representation::{EventFrame, EventFrameData, RepresentationKind};
+use crate::representation::{
+    EventFrame, EventFrameData, ReprSpec, RepresentationError, RepresentationKind,
+};
 use crate::EventStream;
 
 /// A packed 8-bit RGB image (`pixels.len() == width * height * 3`, row-major).
@@ -73,7 +75,37 @@ impl Scale {
             Self::Natural
         }
     }
+
+    /// The one scale a whole sequence is drawn at: `clim > 0` fixes it, `clim <= 0` opts back in
+    /// to per-frame auto-contrast, and no `clim` calibrates from the largest of `extents` (the
+    /// [`frame_extent`]s of the first [`CLIM_CALIBRATION_FRAMES`] frames). `extents` is only
+    /// pulled when it is needed, so a fixed `clim` never reads a frame.
+    pub fn for_sequence<E>(
+        clim: Option<f64>,
+        extents: impl IntoIterator<Item = Result<f64, E>>,
+    ) -> Result<Self, E> {
+        Ok(match clim {
+            Some(value) if value > 0.0 => Self::Fixed(value),
+            Some(_) => Self::Auto,
+            None => {
+                let mut extent = 0.0_f64;
+                for value in extents {
+                    extent = extent.max(value?);
+                }
+                if extent > 0.0 {
+                    Self::Fixed(extent)
+                } else {
+                    Self::Auto
+                }
+            }
+        })
+    }
 }
+
+/// Slices sampled to pick one display scale for an exported animation. A robust percentile over a
+/// few frames tracks the recording closely enough, and bounding it keeps `save_video` from reading
+/// a long file twice just to decide how bright to draw it.
+pub const CLIM_CALIBRATION_FRAMES: usize = 8;
 
 /// [`render_frame`] with explicit control over the value scaling — see [`Scale`].
 pub fn render_frame_scaled(frame: &EventFrame, colormap: Colormap, scale: Scale) -> Rgb8Image {
@@ -188,7 +220,7 @@ fn scalar_field(frame: &EventFrame, plane_len: usize) -> (Vec<f64>, bool) {
             )
         }
         // Voxel bins are signed contributions — sum them.
-        RepresentationKind::Voxel => (
+        RepresentationKind::Voxel | RepresentationKind::Custom => (
             (0..plane_len)
                 .map(|i| {
                     (0..channels)
@@ -611,9 +643,46 @@ pub fn render_raw(stream: &EventStream, decay_ms: f64) -> Rgb8Image {
     surface.render()
 }
 
+/// How a sequence of slices is turned into displayable frames, shared by `save_video`, `play`, the
+/// command line's `render` and the terminal viewer.
+///
+/// They differ only in where the frames go, so the rendering — including the awkward parts, the
+/// held display scale and the decay that has to survive a window boundary — lives here once.
+pub enum RenderView {
+    /// The raw event stream: each event lights its pixel in its polarity colour and fades. The
+    /// surface is **stateful on purpose** — decay carries across window boundaries, which is what
+    /// makes a moving edge leave a trail rather than blink once per frame.
+    Raw(RawSurface),
+    /// A representation, colour-mapped at a scale fixed for the whole sequence so the brightness
+    /// does not pump from frame to frame.
+    Repr {
+        spec: ReprSpec,
+        colormap: Colormap,
+        scale: Scale,
+    },
+}
+
+impl RenderView {
+    pub fn render(&mut self, stream: &EventStream) -> Result<Rgb8Image, RepresentationError> {
+        match self {
+            Self::Raw(surface) => {
+                surface.update(stream);
+                Ok(surface.render())
+            }
+            Self::Repr {
+                spec,
+                colormap,
+                scale,
+            } => spec
+                .generate(stream)
+                .map(|frame| render_frame_scaled(&frame, *colormap, *scale)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render_frame, render_raw, Colormap, RawSurface, Rgb8Image};
+    use super::{render_frame, render_raw, Colormap, RawSurface, Rgb8Image, Scale};
     use crate::representation::{
         AveragedTimeSurface, Binary, EventCount, EventFrame, EventFrameData, Representation,
         RepresentationKind, Tencode,
@@ -804,5 +873,40 @@ mod tests {
             .0
             .iter()
             .all(|rgb| *rgb == pixel(&image, 0, 0)));
+    }
+
+    #[test]
+    fn sequence_scale_follows_clim() {
+        let never = || -> std::iter::Empty<Result<f64, ()>> { std::iter::empty() };
+        assert_eq!(
+            Scale::for_sequence(Some(4.0), never()),
+            Ok(Scale::Fixed(4.0))
+        );
+        assert_eq!(Scale::for_sequence(Some(0.0), never()), Ok(Scale::Auto));
+        let extents = [Ok::<_, ()>(2.0), Ok(5.0), Ok(3.0)];
+        assert_eq!(Scale::for_sequence(None, extents), Ok(Scale::Fixed(5.0)));
+        assert_eq!(
+            Scale::for_sequence(None, [Ok::<_, ()>(0.0)]),
+            Ok(Scale::Auto)
+        );
+        assert_eq!(
+            Scale::for_sequence(None, [Ok(1.0), Err("boom")]),
+            Err("boom")
+        );
+    }
+
+    #[test]
+    fn explicit_clim_reads_no_frames() {
+        let mut pulled = 0;
+        let extents = std::iter::repeat_with(|| {
+            pulled += 1;
+            Ok::<_, ()>(1.0)
+        })
+        .take(3);
+        assert_eq!(
+            Scale::for_sequence(Some(2.0), extents),
+            Ok(Scale::Fixed(2.0))
+        );
+        assert_eq!(pulled, 0);
     }
 }

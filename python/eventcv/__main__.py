@@ -108,7 +108,7 @@ def _cmd_info(args: argparse.Namespace) -> int:
         ("mean rate", f"{_format_count(int(n / seconds)) if seconds > 0 else 'n/a'} ev/s"),
     ]
     if args.rate_bin_ms:
-        rate = reader.slice(t0_ms=0, t1_ms=duration_ms).event_rate(bin_ms=args.rate_bin_ms)
+        rate = reader.slice().event_rate(bin_ms=args.rate_bin_ms)
         if len(rate["rate"]):
             rows.append(("peak rate", f"{_format_count(int(rate['rate'].max()))} ev/s"))
             rows.append(("bins", f"{len(rate['t'])} x {args.rate_bin_ms} ms"))
@@ -152,7 +152,8 @@ def _cmd_render(args: argparse.Namespace) -> int:
 
     reader = open_reader(args.input, dt_ms=args.dt_ms, **_source_options(args))
     # "raw" is not a representation — it draws the events themselves — so it stays out of
-    # `with_repr`, which only knows about the dense ones.
+    # `with_repr`, which only knows about the dense ones. `save_video` then draws whichever the
+    # reader carries; naming it again there would rebuild it at the default 30 ms span, not dt.
     if args.repr != "raw":
         reader = reader.with_repr(args.repr)
     frames = reader.save_video(
@@ -161,7 +162,6 @@ def _cmd_render(args: argparse.Namespace) -> int:
         colormap=args.colormap,
         clim=args.clim,
         max_frames=args.max_frames,
-        repr=args.repr,
         decay_ms=args.decay_ms,
     )
     if not args.quiet:
@@ -435,6 +435,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     play.set_defaults(func=_cmd_play)
 
+    # Listed for `--help` only: `main` hands `tui` to the Rust command line before argparse runs,
+    # so its flags are the standalone binary's own and cannot drift from them.
+    subparsers.add_parser("tui", help="watch a recording or a live camera in the terminal")
+
     simulate = subparsers.add_parser(
         "simulate", help="turn a video into synthetic events (needs ffmpeg on PATH)"
     )
@@ -653,6 +657,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["tui"]:
+        sys.stdout.flush()  # Rust writes to the same descriptor, past Python's buffer
+        return _rust.tui(argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -660,6 +668,11 @@ def main(argv: list[str] | None = None) -> int:
         print(version_text())
         return 0
     if not getattr(args, "func", None):
+        # At a terminal, a bare `eventcv` opens the terminal viewer's home screen, as the standalone
+        # binary does; anywhere else (a pipe, a script) it prints help.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            sys.stdout.flush()
+            return _rust.tui([])
         parser.print_help()
         return 0
     try:

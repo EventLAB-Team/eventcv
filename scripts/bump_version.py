@@ -37,10 +37,22 @@ def main() -> int:
     cargo.write_text(WORKSPACE_VERSION.sub(rf"\g<1>{new}\g<3>", text, count=1))
 
     cli_doc = ROOT / "docs" / "cli.md"
-    cli_doc.write_text(cli_doc.read_text().replace(f"eventcv {old} (", f"eventcv {new} ("))
+    # UTF-8 explicitly: the page has non-ASCII characters, and Windows defaults to cp1252.
+    doc = cli_doc.read_text("utf-8").replace(f"eventcv {old} (", f"eventcv {new} (")
+    cli_doc.write_text(doc, "utf-8")
 
     subprocess.run(
-        ["cargo", "update", "--offline", "-p", "eventcv-core", "-p", "eventcv-py"],
+        [
+            "cargo",
+            "update",
+            "--offline",
+            "-p",
+            "eventcv-core",
+            "-p",
+            "eventcv-py",
+            "-p",
+            "eventcv-cli",
+        ],
         cwd=ROOT,
         check=True,
     )

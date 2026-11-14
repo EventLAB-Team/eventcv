@@ -68,6 +68,35 @@ that expects something on your system — `ffmpeg` on your `PATH`; `.gif` and `.
 Run `eventcv --version` to see which optional features a build has, and which ONNX Runtime it
 found ([where that comes from](models.md)).
 
+### Standalone command line
+
+On a machine without Python — a capture box, a CI runner, a colleague who only needs to look at
+recordings — the `eventcv` [command](cli.md) also comes as a single binary:
+
+```console
+# Linux and macOS
+curl -LsSf https://github.com/EventLAB-Team/eventcv/releases/latest/download/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/EventLAB-Team/eventcv/releases/latest/download/install.ps1 | iex"
+```
+
+The script checks the download's SHA-256, then installs to `~/.local/bin`, or on Windows to
+`%LOCALAPPDATA%\Programs\eventcv\bin`, which it adds to your user `PATH`. Set
+`EVENTCV_INSTALL_DIR` to install somewhere else, and `EVENTCV_VERSION=X.Y.Z` to pin a release. To
+upgrade, run it again; to uninstall, delete the binary. Builds cover Linux (x86_64 and aarch64,
+glibc 2.28 or newer), macOS (Apple silicon and Intel) and Windows (x64).
+
+The binary reads every format the package does, HDF5 included, and talks to USB cameras. It has
+only the commands that need no Python; [Command line](cli.md) lists them. As with the package,
+`.mp4` and `simulate` need `ffmpeg`, and on Linux a camera needs udev rules for non-root access.
+
+To build it from a checkout instead, you need a Rust toolchain, a C compiler and cmake:
+
+```console
+cargo install --path crates/eventcv-cli --features hdf5,camera
+```
+
 ### Python 3.8 / ROS 1 Noetic
 
 EventCV supports Python 3.8, so it installs into the system Python of Ubuntu 20.04 and ROS

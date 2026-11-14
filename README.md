@@ -27,6 +27,9 @@ conda install eventcv
 
 # pixi
 pixi add eventcv
+
+# system
+curl -LsSf https://github.com/EventLAB-Team/eventcv/releases/latest/download/install.sh | sh
 ```
 
 ## Contributing

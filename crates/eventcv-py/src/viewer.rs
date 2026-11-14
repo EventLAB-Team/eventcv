@@ -77,7 +77,8 @@ where
 /// volumetric kinds become an orbitable point cloud.
 pub(crate) fn view(frame: &EventFrame, colormap: Colormap, normalize: bool) -> Result<(), String> {
     let scene = match frame.kind() {
-        RepresentationKind::Polarity
+        RepresentationKind::Custom
+        | RepresentationKind::Polarity
         | RepresentationKind::Binary
         | RepresentationKind::Count
         | RepresentationKind::CountMask
@@ -272,8 +273,8 @@ mod tests {
         // Mirrors `view` without opening a window: image vs cloud dispatch.
         use eventcv_core::representation::RepresentationKind::*;
         match frame.kind() {
-            Polarity | Binary | Count | CountMask | RedBlue | Flow | Intensity | Labels
-            | Tencode => Scene::Image(eventcv_core::viz::render_frame(
+            Custom | Polarity | Binary | Count | CountMask | RedBlue | Flow | Intensity
+            | Labels | Tencode => Scene::Image(eventcv_core::viz::render_frame(
                 frame,
                 Colormap::Viridis,
                 true,

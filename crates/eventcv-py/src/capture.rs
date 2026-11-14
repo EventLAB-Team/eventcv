@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -49,6 +49,9 @@ const DECODE_TIMEOUT: Duration = Duration::from_millis(5);
 /// core. Also the slice a full-queue wait blocks for before re-checking the stop flag.
 const IDLE_NAP: Duration = Duration::from_millis(1);
 
+/// Work for the pump thread to run on the camera it owns — see [`Pump::call`].
+type Job = Box<dyn FnOnce(&mut Capture) + Send>;
+
 /// State shared between the pump thread and the Python thread.
 struct Shared {
     queue: Mutex<Queue>,
@@ -68,6 +71,8 @@ struct Shared {
     /// window. Counted exactly, because a drop policy nobody can quantify is a bias on everything
     /// downstream of it.
     skimmed: AtomicUsize,
+    /// Calls waiting for the pump thread, run at the top of each pass.
+    jobs: Mutex<Vec<Job>>,
 }
 
 #[derive(Default)]
@@ -99,6 +104,7 @@ impl Pump {
             recorded: AtomicUsize::new(recorder.as_ref().map_or(0, Recorder::n_events)),
             overflows: AtomicUsize::new(0),
             skimmed: AtomicUsize::new(0),
+            jobs: Mutex::new(Vec::new()),
         });
         let worker = Arc::clone(&shared);
         // The camera and the open recording are owned *outside* the unwind boundary so a panic in
@@ -167,6 +173,28 @@ impl Pump {
         self.shared.skimmed.load(Ordering::Relaxed)
     }
 
+    /// Runs `job` on the pump thread against the camera it owns and returns its result — how a
+    /// running camera is reconfigured (biases, driver settings) without stopping the stream. Waits
+    /// at most one decode pass; errors if the thread has stopped.
+    pub(crate) fn call<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut Capture) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let (reply, answer) = mpsc::channel();
+        self.shared.jobs.lock().unwrap().push(Box::new(move |capture| {
+            let _ = reply.send(job(capture));
+        }));
+        self.shared.signal.notify_all();
+        loop {
+            match answer.recv_timeout(DECODE_TIMEOUT) {
+                Ok(value) => return Ok(value),
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if !self.handle.as_ref().is_none_or(JoinHandle::is_finished) => {}
+                Err(_) => return answer.try_recv().map_err(|_| STOPPED.to_owned()),
+            }
+        }
+    }
+
     /// Stops the thread and hands back the camera (and the open recording, if any). A panic inside
     /// the decode loop is caught and republished as an error, so both still come back; `None` means
     /// the thread died in a way even that could not recover from.
@@ -202,6 +230,16 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
     }
 }
 
+const STOPPED: &str = "the camera's capture thread has stopped";
+
+/// Runs the calls queued by [`Pump::call`].
+fn serve(shared: &Shared, capture: &mut Capture) {
+    let jobs = std::mem::take(&mut *shared.jobs.lock().unwrap());
+    for job in jobs {
+        job(capture);
+    }
+}
+
 /// The pump thread: drain the ring into windows, archive them, hand them on — until asked to stop.
 fn run(
     capture: &mut Capture,
@@ -210,6 +248,7 @@ fn run(
     mode: Backpressure,
 ) {
     'pump: while !shared.stop.load(Ordering::Acquire) {
+        serve(shared, capture);
         // In `Latest` mode the consumer has said it only wants the newest window, so anything
         // queued behind the freshest buffer is going to be discarded by `offer` anyway. Skimming
         // those buffers — decoding their words for the stream state, discarding their events —
@@ -246,9 +285,8 @@ fn run(
             }
         };
         shared.backlog.store(capture.backlog(), Ordering::Relaxed);
-        if let Some(state) = capture.bias_state() {
-            *shared.bias.lock().unwrap() = Some(state);
-        }
+        // Republished even when `None`, so a controller switched off mid-stream stops reporting.
+        *shared.bias.lock().unwrap() = capture.bias_state();
         while let Some(window) = capture.take_pending() {
             if window.first_after_overflow {
                 shared.overflows.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +302,7 @@ fn run(
                     .recorded
                     .store(recorder.n_events(), Ordering::Relaxed);
             }
-            if !offer(shared, window, mode) {
+            if !offer(shared, capture, window, mode) {
                 break 'pump;
             }
         }
@@ -275,7 +313,7 @@ fn run(
 }
 
 /// Queues one finished window under the chosen policy. Returns `false` when the pump should stop.
-fn offer(shared: &Shared, window: CaptureWindow, mode: Backpressure) -> bool {
+fn offer(shared: &Shared, capture: &mut Capture, window: CaptureWindow, mode: Backpressure) -> bool {
     let mut queue = shared.queue.lock().unwrap();
     match mode {
         Backpressure::Latest => {
@@ -289,6 +327,10 @@ fn offer(shared: &Shared, window: CaptureWindow, mode: Backpressure) -> bool {
                 if shared.stop.load(Ordering::Acquire) {
                     return false;
                 }
+                // A consumer that stopped reading can still reconfigure the camera.
+                drop(queue);
+                serve(shared, capture);
+                queue = shared.queue.lock().unwrap();
                 queue = shared.signal.wait_timeout(queue, IDLE_NAP).unwrap().0;
             }
         }

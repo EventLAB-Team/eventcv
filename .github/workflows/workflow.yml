@@ -211,6 +211,131 @@ jobs:
           name: wheels-sdist
           path: dist
 
+  # The standalone `eventcv` binary that `scripts/install.sh` / `install.ps1` download: the wheel's
+  # HDF5 reading and camera streaming without Python (no ONNX Runtime or GPU viewer, which stay in
+  # the wheel). Each archive is installed through its own installer before anything is uploaded.
+  cli:
+    if: >-
+      github.event_name != 'pull_request' ||
+      startsWith(github.head_ref, 'release/v')
+    name: cli (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: aarch64 }
+          - { runner: macos-15, target: aarch64-apple-darwin }
+          # Native rather than cross-compiled: libhdf5's cmake configure runs test programs.
+          - { runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build in manylinux_2_28
+        if: runner.os == 'Linux'
+        # In the oldest glibc the binary promises, as the wheels are: built on the runner's own
+        # distro it would need that distro's glibc on every machine it is installed on.
+        run: |
+          docker run --rm -v "$PWD":/io -w /io \
+            quay.io/pypa/manylinux_2_28_${{ matrix.manylinux }} bash -euc '
+              command -v cmake >/dev/null || dnf install -y cmake
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              source "$HOME/.cargo/env"
+              cargo build --locked -p eventcv-cli --profile dist --features hdf5,camera
+              target/dist/eventcv --version
+              target/dist/eventcv info data/test/example.npz
+            '
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Check the binary really is glibc 2.28
+        if: runner.os == 'Linux'
+        # The same guard as the wheels: an unversioned glibc 2.38 symbol passes the link and then
+        # fails on the user's machine.
+        run: |
+          if nm -D --undefined-only target/dist/eventcv | grep '__isoc23_'; then
+            echo "::error::the binary needs glibc 2.38+ symbols and will not run on older systems"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
+      - uses: actions/setup-python@v7
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.12"
+      - run: python -m pip install cmake
+        if: runner.os != 'Linux'
+      - name: Build
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          # A self-contained .exe, needing no Visual C++ runtime on the machine it lands on.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: |
+          cargo build --locked -p eventcv-cli --profile dist --features hdf5,camera
+          target/dist/eventcv --version
+          target/dist/eventcv info data/test/example.npz
+      - name: Package
+        shell: bash
+        # Unversioned names, so `releases/latest/download/<name>` always resolves.
+        run: |
+          mkdir -p stage dist
+          archive="eventcv-${{ matrix.target }}"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/dist/eventcv.exe LICENSE stage/
+            (cd stage && 7z a -tzip "../dist/$archive.zip" eventcv.exe LICENSE >/dev/null)
+            archive="$archive.zip"
+          else
+            cp target/dist/eventcv LICENSE stage/
+            tar -czf "dist/$archive.tar.gz" -C stage eventcv LICENSE
+            archive="$archive.tar.gz"
+          fi
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+      - name: Install through install.sh
+        if: runner.os != 'Windows'
+        run: |
+          EVENTCV_DOWNLOAD_URL="file://$PWD/dist" EVENTCV_INSTALL_DIR="$RUNNER_TEMP/bin" \
+            sh scripts/install.sh
+          "$RUNNER_TEMP/bin/eventcv" --version
+      - name: Install through install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:EVENTCV_DOWNLOAD_URL = "$PWD\dist"
+          $env:EVENTCV_INSTALL_DIR = "$env:RUNNER_TEMP\bin"
+          ./scripts/install.ps1
+          & "$env:RUNNER_TEMP\bin\eventcv.exe" --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist
+
+  # The installers go up beside the archives, so the one-line install always fetches the
+  # installer of the release it then downloads from.
+  cli-upload:
+    name: Attach binaries to the release
+    runs-on: ubuntu-latest
+    needs: [cli]
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: dist
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* scripts/install.sh scripts/install.ps1 --clobber
+
   publish:
     name: Publish to PyPI
     runs-on: ubuntu-latest
@@ -236,7 +361,7 @@ jobs:
     name: Release package checks
     runs-on: ubuntu-latest
     if: always()
-    needs: [linux, macos, windows, sdist, smoke]
+    needs: [linux, macos, windows, sdist, smoke, cli]
 
     steps:
       - name: Verify release builds
@@ -248,13 +373,14 @@ jobs:
           WINDOWS: ${{ needs.windows.result }}
           SDIST: ${{ needs.sdist.result }}
           SMOKE: ${{ needs.smoke.result }}
+          CLI: ${{ needs.cli.result }}
         run: |
           if [[ "$RELEASE_PR" != "true" ]]; then
             echo "Not a release PR. Validation not required."
             exit 0
           fi
 
-          for job in LINUX MACOS WINDOWS SDIST SMOKE; do
+          for job in LINUX MACOS WINDOWS SDIST SMOKE CLI; do
             if [[ "${!job}" != "success" ]]; then
               echo "::error::$job did not pass: ${!job}"
               exit 1

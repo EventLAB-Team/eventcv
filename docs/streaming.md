@@ -270,6 +270,52 @@ a Prophesee sensor, combine the two: `roi=` for the bounding box, `mask=` for th
 See {ref}`ROI masking <roi-masking>` for building masks without a camera and for applying them to
 recordings.
 
+### Tuning biases
+
+A camera opens on its factory biases. {meth}`~eventcv.EventCamera.list_biases` reports every bias
+the sensor exposes, with its current value, range, and the value it opened with, and
+{meth}`~eventcv.EventCamera.set_bias` changes one live, without interrupting the stream:
+
+```python
+with ecv.stream(dt_ms=50) as cam:
+    print(cam.list_biases()["diff_on"])  # {'value': 0, 'min': -77, 'max': 178, 'default': 0, ...}
+    cam.set_biases({"diff_on": 20, "diff_off": -20})  # less sensitive to contrast (Prophesee)
+    cam.save_biases("outdoor.json")
+
+cam = ecv.stream(biases="outdoor.json")  # opens straight onto the preset
+```
+
+`reset_biases()` puts back the values the camera opened with. Each entry carries a readable
+`label` and a `description` of which way to turn it. Entries with `primary=True` are the ones worth
+tuning for a scene, and they come first: ON/OFF threshold, refractory period, photoreceptor, and
+the filters. A DAVIS346 exposes 21 biases, but the other 16 set up its readout, ADC and interface,
+and rarely need changing. The same controls are in the live GUI (**Camera biases** in the
+inspector, with the rest under **Advanced**) and in `eventcv tui --camera` (press `b`; see
+[the CLI page](cli.md) for its keys). Both save and load presets.
+
+Names and units come from the camera's driver and differ by vendor. Prophesee values are signed
+offsets from the chip's factory value (`0` is stock, as in Metavision). DAVIS346 values are indices
+into its 2041-step bias-current ladder. These are *not* the absolute values `bias_state` reports for
+an EVK4. A preset remembers which camera model it came from and will not load onto another. While
+`adaptive_bias` runs, the biases it drives are marked `adaptive` and cannot be set by hand; the rest
+can.
+
+Settings beyond biases are vendor-specific: region masks, the DAVIS346 activity and polarity
+filters, and so on. {attr}`~eventcv.EventCamera.configuration` returns the driver's whole
+configuration as a nested dict, and {meth}`~eventcv.EventCamera.update_configuration` merges a
+change into it:
+
+```python
+cam.update_configuration({"activity_filter": {"refractory_period_enable": True}})  # DAVIS346
+```
+
+Its shape belongs to the `neuromorphic-drivers` crate and can change between driver versions. An
+unknown key is an error. So is a setting the driver only applies when the camera opens, such as
+the EVK4's rate limiter (use `max_event_rate=`). The DVXplorer driver applies no settings after it
+opens, so on a DVXplorer biases are read-only. Live writes have been checked on a DAVIS346. The
+EVK3-HD, DVXplorer and CenturyArks paths go through the same code but have not been tried on
+hardware.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -279,6 +325,7 @@ recordings.
 | `n_overflows` rising | The driver dropped events before EventCV saw them | Same — cap the source; a busy scene on a large sensor can exceed any host |
 | Frames arrive but are stale | In-order delivery behind a slow loop | `latest=True` (and check `n_skipped`) |
 | `n_skipped` rising fast | Per-window work slower than the camera | Expected with `latest=True`; `record=` still archives everything |
+| Too many or too few events for the scene | Factory biases don't suit the lighting | Tune `diff_on`/`diff_off` (or `onbn`/`offbn`) with `set_bias`, or let `adaptive_bias=True` do it |
 | "no event camera found" with a camera attached | Another handle holds the device, or udev rules are missing | Close the other handle (`with ecv.stream() as cam:`), or install udev rules |
 | A panic from `usb.rs` ("callback called for a transfer marked as complete") aborting the process, usually on Windows and usually right after a camera is released | A race in the USB teardown inside `neuromorphic-drivers`, the driver crate underneath EventCV: a cancelled transfer's completion callback can arrive after its slot was retired. It is an abort, not a Python exception, so it cannot be caught | Open the camera **once** and keep it for the session rather than opening and closing one per recording. `ecv.record(...)` and `with ecv.stream(...) as cam:` both close deterministically, which keeps the teardown off unpredictable GC timing |
 

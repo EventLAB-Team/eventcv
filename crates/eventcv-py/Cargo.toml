@@ -8,7 +8,10 @@ name = "_rust"
 crate-type = ["cdylib"]
 
 [dependencies]
+libloading = "0.8"
 eventcv-core = { path = "../eventcv-core" }
+# The terminal viewer behind `eventcv tui`, shared with the standalone binary.
+eventcv-cli = { path = "../eventcv-cli" }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py38"] }
 numpy = "0.29"
 # GPU-accelerated viewer (Metal on macOS, Vulkan on Linux, DX12 on Windows) — all pure-Rust,
@@ -26,14 +29,16 @@ egui-wgpu = "=0.37.0"
 # Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and
 # the CLI path remain available when a desktop portal is absent.
 rfd = "=0.17.2"
+# Bridges `EventCamera.configuration` / `update_configuration` to the driver's serde config.
+serde_json = { version = "1", optional = true }
 
 [features]
 # Build `.h5`/`.hdf5` support into the extension (forwards to eventcv-core, which
 # builds libhdf5 from source — needs cmake). Enable with `maturin develop --features hdf5`.
-hdf5 = ["eventcv-core/hdf5"]
+hdf5 = ["eventcv-core/hdf5", "eventcv-cli/hdf5"]
 # Build USB event-camera streaming into the extension (forwards to eventcv-core, which pulls in
 # the neuromorphic-drivers crate + a vendored libusb). Enable with `maturin develop --features camera`.
-camera = ["eventcv-core/camera"]
+camera = ["eventcv-core/camera", "eventcv-cli/camera", "dep:serde_json"]
 # Build ONNX inference (`Model`) into the extension (forwards to eventcv-core, which downloads a
 # prebuilt ONNX Runtime at build time). Enable with `maturin develop --features onnx`.
 onnx = ["eventcv-core/onnx"]

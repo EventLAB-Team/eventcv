@@ -39,6 +39,15 @@ const TIMESTAMP_SCALE_MS: f64 = 0.001;
 /// events that arrive between polls.
 const POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// Wall-clock budget a live display spends **decoding** events per frame, for
+/// [`Capture::drain_events_budgeted`]. At very high event rates (a 1280×720 Prophesee sensor can
+/// emit hundreds of millions of events per second) decoding a whole frame's worth of events takes
+/// far longer than a display frame, so a viewer decodes only this much of the freshest data each
+/// frame and drops the surplus — keeping the display at ~60 FPS instead of stalling to a couple of
+/// frames per second. The dropped events are invisible at that rate anyway. Iteration/`record` are
+/// unaffected (they process every event).
+pub const LIVE_DRAIN_BUDGET_MS: u64 = 10;
+
 /// A camera discovered by [`list_cameras`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CameraInfo {
@@ -506,6 +515,9 @@ pub struct Capture {
     windower: Windower,
     /// Closed-loop bias control, when `stream(adaptive_bias=…)` asked for it.
     bias: Option<AdaptiveBias>,
+    /// The biases as the camera opened, before any manual change — what [`Capture::reset_biases`]
+    /// restores.
+    stock_biases: serde_json::Value,
     /// Region-of-interest mask (row-major `width·height`, `true` = keep), applied as events are
     /// decoded. `None` keeps everything. See [`set_mask`](Self::set_mask).
     mask: Option<Vec<bool>>,
@@ -513,6 +525,8 @@ pub struct Capture {
     roi: Option<((usize, usize, usize, usize), RoiPlacement)>,
     /// Collects the APS and IMU streams when [`collect_aux`](Self::collect_aux) turned them on.
     aux: Aux,
+    /// Buffers [`drain_events_budgeted`](Self::drain_events_budgeted) skipped undecoded, so far.
+    budget_dropped: usize,
     width: usize,
     height: usize,
     name: String,
@@ -524,7 +538,8 @@ impl Capture {
     /// [`CameraInfo::serial`]); `None` opens the first supported camera found. `window` sets how the
     /// stream is cut into [`CaptureWindow`]s, and `limits` caps what the sensor emits. `bias` turns
     /// on closed-loop [adaptive biasing](crate::bias), which holds the event rate steady across
-    /// changing light by retuning the sensor's biases as it runs.
+    /// changing light by retuning the sensor's biases as it runs; a `biases` preset is applied (see
+    /// [`apply_preset`](Self::apply_preset)) before it starts, so it starts from those.
     ///
     /// Apart from `limits` and an optional `EVENTCV_CLOCK_<serial>` clock override (see
     /// `apply_clock_override`), the device is opened with its default configuration (biases,
@@ -536,6 +551,7 @@ impl Capture {
         window: Window,
         limits: Limits,
         bias: Option<BiasOverrides>,
+        biases: Option<&BiasPreset>,
     ) -> Result<Self, String> {
         let (flag, event_loop) = nd::flag_and_event_loop().map_err(|error| error.to_string())?;
         // A limits request is device-specific, so the sensor has to be identified before it is
@@ -568,16 +584,18 @@ impl Capture {
         let name = device.name().to_owned();
         let serial = device.serial();
         let adapter = device.create_adapter();
-        let bias = bias
-            .map(|overrides| AdaptiveBias::new(overrides, &device))
-            .transpose()?;
+        let stock_biases = serde_json::to_value(device.current_configuration())
+            .map_err(|error| format!("could not read the camera's configuration ({error})"))?
+            ["configuration"]["biases"]
+            .take();
         let mut capture = Self {
             device,
             adapter,
             _event_loop: event_loop,
             flag,
             windower: Windower::new(width, height, window),
-            bias,
+            bias: None,
+            stock_biases,
             mask: None,
             roi: limits.roi.map(|rect| {
                 let placement = match plan.host_roi {
@@ -587,6 +605,7 @@ impl Capture {
                 (rect, placement)
             }),
             aux: Aux::default(),
+            budget_dropped: 0,
             width,
             height,
             name,
@@ -598,6 +617,12 @@ impl Capture {
             let rect = crate::mask::rect(width, height, x0 as f64, y0 as f64, w as f64, h as f64);
             capture.set_mask(Some(rect))?;
         }
+        if let Some(preset) = biases {
+            capture.apply_preset(preset)?;
+        }
+        capture.bias = bias
+            .map(|overrides| AdaptiveBias::new(overrides, &capture.device))
+            .transpose()?;
         Ok(capture)
     }
 
@@ -622,6 +647,16 @@ impl Capture {
     /// windowing entirely.
     pub fn take_aux(&mut self) -> (Vec<(i64, EventFrame)>, Vec<ImuSample>) {
         self.aux.take()
+    }
+
+    /// Turns adaptive biasing on (starting from the biases the camera is running now, and measuring
+    /// the scene first as [`BiasConfig::calibrate`] asks) or off (leaving the biases where the
+    /// controller put them). Errors on a camera the controller cannot drive.
+    pub fn set_adaptive_bias(&mut self, overrides: Option<BiasOverrides>) -> Result<(), String> {
+        self.bias = overrides
+            .map(|overrides| AdaptiveBias::new(overrides, &self.device))
+            .transpose()?;
+        Ok(())
     }
 
     /// A snapshot of the adaptive-bias controller, or `None` when the camera was opened without it.
@@ -677,6 +712,98 @@ impl Capture {
             .map_err(|error| error.to_string())
     }
 
+    /// The driver's configuration, split into its device tag (e.g. `"prophesee_evk4"`) and body.
+    fn tagged_configuration(&self) -> Result<(String, serde_json::Value), String> {
+        let mut value = serde_json::to_value(self.device.current_configuration())
+            .map_err(|error| format!("could not read the camera's configuration ({error})"))?;
+        let kind = value["type"].as_str().unwrap_or_default().to_owned();
+        Ok((kind, value["configuration"].take()))
+    }
+
+    fn bias_bounds(&self) -> Result<serde_json::Value, String> {
+        let mut value = serde_json::to_value(self.device.biases_bounds())
+            .map_err(|error| format!("could not read the camera's bias bounds ({error})"))?;
+        Ok(value["biases_bounds"].take())
+    }
+
+    /// The biases adaptive biasing is driving, which manual writes must leave alone.
+    fn controlled_biases(&self, kind: &str) -> &'static [&'static str] {
+        match (self.bias.is_some(), kind) {
+            (true, "inivation_davis346") => &DAVIS346_BIASES,
+            (true, "prophesee_evk4") => &EVK4_BIASES,
+            _ => &[],
+        }
+    }
+
+    /// Every bias the camera exposes, with its current value, bounds, and the value it opened with.
+    pub fn biases(&self) -> Result<Vec<BiasInfo>, String> {
+        let (kind, configuration) = self.tagged_configuration()?;
+        Ok(bias_table(
+            &configuration["biases"],
+            &self.bias_bounds()?,
+            &self.stock_biases,
+            self.controlled_biases(&kind),
+        ))
+    }
+
+    /// Sets biases by name, in one driver update. Fails — changing nothing — on an unknown name, a
+    /// value outside its bounds, or a bias adaptive biasing is driving.
+    pub fn set_biases(&mut self, updates: &[(String, i64)]) -> Result<(), String> {
+        let biases: serde_json::Map<_, _> = updates
+            .iter()
+            .map(|(name, value)| (name.clone(), serde_json::Value::from(*value)))
+            .collect();
+        self.update_configuration(&serde_json::json!({ "biases": biases }))
+    }
+
+    /// Applies a [`BiasPreset`], refusing one saved from a different camera model: bias names and
+    /// units are vendor-specific, and two sensors can share a name with a different meaning.
+    pub fn apply_preset(&mut self, preset: &BiasPreset) -> Result<(), String> {
+        if let Some(camera) = preset.camera.as_deref().filter(|camera| *camera != self.name) {
+            return Err(format!(
+                "these biases were saved from a {camera}, not a {}",
+                self.name
+            ));
+        }
+        self.set_biases(&preset.values)
+    }
+
+    /// Restores every bias to the value the camera opened with, except those adaptive biasing is
+    /// driving.
+    pub fn reset_biases(&mut self) -> Result<(), String> {
+        let stock: Vec<(String, i64)> = self
+            .biases()?
+            .into_iter()
+            .filter(|bias| !bias.adaptive)
+            .map(|bias| (bias.name, bias.default))
+            .collect();
+        self.set_biases(&stock)
+    }
+
+    /// The driver's full, device-specific configuration (biases, masks, filters, …) as JSON. Its
+    /// shape belongs to `neuromorphic-drivers` and may change between driver versions.
+    pub fn configuration(&self) -> Result<serde_json::Value, String> {
+        Ok(self.tagged_configuration()?.1)
+    }
+
+    /// Merges `patch` into the device configuration and hands it to the driver. Unknown keys,
+    /// out-of-range or adaptively driven biases, and fields the driver only writes when the camera
+    /// opens are all rejected before anything is sent.
+    pub fn update_configuration(&mut self, patch: &serde_json::Value) -> Result<(), String> {
+        let (kind, current) = self.tagged_configuration()?;
+        let mut updated = current.clone();
+        merge_configuration(&mut updated, patch, "")?;
+        let locked = self.controlled_biases(&kind);
+        validate_update(&kind, &current, &updated, &self.bias_bounds()?, locked)?;
+        let configuration: nd::Configuration = serde_json::from_value(
+            serde_json::json!({ "type": kind, "configuration": updated }),
+        )
+        .map_err(|error| format!("invalid configuration ({error})"))?;
+        self.device
+            .update_configuration(configuration)
+            .map_err(|error| error.to_string())
+    }
+
     /// Sensor width in pixels.
     pub fn width(&self) -> usize {
         self.width
@@ -701,6 +828,13 @@ impl Capture {
     /// behind the camera.
     pub fn backlog(&self) -> usize {
         self.device.backlog()
+    }
+
+    /// Buffers [`drain_events_budgeted`](Self::drain_events_budgeted) has dropped undecoded since
+    /// the camera opened. Buffers, not events: a skipped buffer is never decoded, so how many
+    /// events it held is unknown.
+    pub fn n_budget_dropped(&self) -> usize {
+        self.budget_dropped
     }
 
     /// The region-of-interest mask events are filtered through, if any.
@@ -945,6 +1079,7 @@ impl Capture {
             if !decoding {
                 // Over budget: drop the buffer, freeing its ring slot without decoding.
                 dropped = true;
+                self.budget_dropped += 1;
                 continue;
             }
             convert_buffer(
@@ -1213,6 +1348,238 @@ fn evk4_firmware_biases(device: &nd::Device) -> Result<BiasValues, String> {
         }
         _ => Err(format!("{} is not a Prophesee EVK4", device.name())),
     }
+}
+
+/// One sensor bias, in the driver's own units: signed offsets from the chip's firmware value on
+/// Prophesee sensors (0 = stock), current-ladder indices on the DAVIS346, raw DAC codes elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BiasInfo {
+    pub name: String,
+    pub value: i64,
+    pub minimum: i64,
+    pub maximum: i64,
+    /// The value the camera opened with.
+    pub default: i64,
+    /// Driven by adaptive biasing, so read-only until the camera is reopened without it.
+    pub adaptive: bool,
+    /// A readable name (e.g. "ON threshold") for the biases eventcv knows; `None` for the rest.
+    pub label: Option<&'static str>,
+    /// What the bias does and which way to turn it.
+    pub description: Option<&'static str>,
+    /// One of the few biases worth tuning for a scene. The rest (readout, ADC, AER handshake, …)
+    /// are for chip bring-up and belong behind an "advanced" view.
+    pub primary: bool,
+}
+
+/// The biases that matter when tuning for a scene, in display order: `(driver name, label,
+/// description)`. Keyed by the driver's field name, which is distinct across vendors. Directions are
+/// as measured for adaptive biasing: on both the DAVIS346 and the IMX636 the OFF threshold sits
+/// *below* the contrast reference, so raising it brings it closer and makes OFF events easier.
+const PRIMARY_BIASES: &[(&str, &str, &str)] = &[
+    // Prophesee IMX636 / Gen3.1, CenturyArks, Lucid.
+    ("diff_on", "ON threshold", "Contrast an ON event needs. Higher: fewer ON events."),
+    ("diff_off", "OFF threshold", "Contrast an OFF event needs. Higher: more OFF events."),
+    ("refr", "Refractory period", "Dead time after each event. Higher: shorter, more events."),
+    ("pr", "Photoreceptor", "Photoreceptor bandwidth. Higher: faster response, more noise."),
+    ("fo", "Low-pass filter", "Follower bandwidth. Higher: passes faster changes, more noise."),
+    ("hpf", "High-pass filter", "Removes slow brightness changes. Higher: filters more."),
+    // iniVation DAVIS346.
+    ("onbn", "ON threshold", "Contrast an ON event needs. Higher: fewer ON events."),
+    ("offbn", "OFF threshold", "Contrast an OFF event needs. Higher: more OFF events."),
+    ("refrbp", "Refractory period", "Dead time after each event. Higher: shorter, more events."),
+    ("prbp", "Photoreceptor", "Photoreceptor bandwidth. Higher: faster response, more noise."),
+    ("prsfbp", "Low-pass filter", "Source-follower bandwidth. Higher: passes faster changes."),
+    // iniVation DVXplorer.
+    ("on", "ON threshold", "Contrast threshold for ON events."),
+    ("off", "OFF threshold", "Contrast threshold for OFF events."),
+];
+
+/// Advanced biases eventcv can still name.
+const ADVANCED_LABELS: &[(&str, &str, &str)] = &[
+    ("diff", "Contrast reference", "The level the ON and OFF thresholds sit either side of."),
+    ("diffbn", "Contrast reference", "The level the ON and OFF thresholds sit either side of."),
+];
+
+/// Biases to apply by name, optionally tied to the camera model they were saved from. On disk it is
+/// JSON: `{"camera": "Prophesee EVK4", "biases": {"diff_on": 10, ...}}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BiasPreset {
+    /// The model name ([`Capture::name`]) the values were saved from; `None` fits any camera.
+    pub camera: Option<String>,
+    pub values: Vec<(String, i64)>,
+}
+
+impl BiasPreset {
+    /// Reads a preset file written by [`write`](Self::write).
+    pub fn read(path: &std::path::Path) -> Result<Self, String> {
+        let shown = path.display();
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("could not read {shown} ({error})"))?;
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("{shown} is not valid JSON ({error})"))?;
+        let biases = json["biases"]
+            .as_object()
+            .ok_or_else(|| format!("{shown} has no \"biases\" object"))?;
+        let values = biases
+            .iter()
+            .map(|(name, value)| match value.as_i64() {
+                Some(value) => Ok((name.clone(), value)),
+                None => Err(format!("{shown}: bias `{name}` must be an integer")),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            camera: json["camera"].as_str().map(str::to_owned),
+            values,
+        })
+    }
+
+    /// Writes `biases` as a preset for `camera`.
+    pub fn write(path: &std::path::Path, camera: &str, biases: &[BiasInfo]) -> Result<(), String> {
+        let values: serde_json::Map<_, _> = biases
+            .iter()
+            .map(|bias| (bias.name.clone(), serde_json::Value::from(bias.value)))
+            .collect();
+        let json = serde_json::json!({ "camera": camera, "biases": values });
+        let text = serde_json::to_string_pretty(&json).expect("a JSON value always serializes");
+        std::fs::write(path, text + "\n")
+            .map_err(|error| format!("could not write {} ({error})", path.display()))
+    }
+}
+
+/// The EVK4 biases the adaptive-bias controller drives, as the driver names them.
+const EVK4_BIASES: [&str; 5] = ["refr", "pr", "fo", "diff_on", "diff_off"];
+
+/// Top-level configuration fields a camera's driver writes only during the opening handshake, so a
+/// runtime change to them would be silently ignored. `None`: the driver applies no runtime
+/// configuration at all (its update function is empty). From each device's `update_configuration`
+/// in neuromorphic-drivers 0.18.
+fn handshake_only(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "prophesee_evk4" => Some(&["clock", "enable_external_trigger", "rate_limiter"]),
+        "prophesee_evk3_hd" => Some(&["rate_limiter"]),
+        "centuryarks_vga" => Some(&["x_mask", "y_mask", "mask_intersection_only", "rate_limiter"]),
+        "lucid_triton" => Some(&["enable_output"]),
+        "inivation_dvxplorer" => None,
+        _ => Some(&[]),
+    }
+}
+
+/// Lists every bias that has driver bounds — the numeric ones; flags such as the DVXplorer's
+/// `log` stay reachable through the raw configuration.
+fn bias_table(
+    biases: &serde_json::Value,
+    bounds: &serde_json::Value,
+    stock: &serde_json::Value,
+    locked: &[&str],
+) -> Vec<BiasInfo> {
+    let Some(bounds) = bounds.as_object() else {
+        return Vec::new();
+    };
+    let int = |value: &serde_json::Value| value.as_i64().unwrap_or_default();
+    let mut table: Vec<BiasInfo> = bounds
+        .iter()
+        .map(|(name, range)| {
+            let primary = PRIMARY_BIASES.iter().find(|(known, ..)| known == name);
+            let named = primary.or_else(|| ADVANCED_LABELS.iter().find(|(known, ..)| known == name));
+            BiasInfo {
+                name: name.clone(),
+                value: int(&biases[name]),
+                minimum: int(&range["minimum"]),
+                maximum: int(&range["maximum"]),
+                default: int(&stock[name]),
+                adaptive: locked.contains(&name.as_str()),
+                label: named.map(|(_, label, _)| *label),
+                description: named.map(|(.., description)| *description),
+                primary: primary.is_some(),
+            }
+        })
+        .collect();
+    // The primary biases first, in the order above; the advanced ones stay alphabetical after.
+    table.sort_by_key(|bias| {
+        PRIMARY_BIASES
+            .iter()
+            .position(|(known, ..)| *known == bias.name)
+            .unwrap_or(PRIMARY_BIASES.len())
+    });
+    table
+}
+
+/// Merges `patch` into `target`, recursing through objects and replacing anything else. Only keys
+/// that already exist may be set: a typo is an error naming the valid keys, never a silent no-op.
+fn merge_configuration(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    let (Some(target), Some(patch)) = (target.as_object_mut(), patch.as_object()) else {
+        *target = patch.clone();
+        return Ok(());
+    };
+    for (key, value) in patch {
+        let field = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        let Some(slot) = target.get_mut(key) else {
+            let valid: Vec<&str> = target.keys().map(String::as_str).collect();
+            return Err(format!(
+                "unknown setting `{field}`; expected one of: {}",
+                valid.join(", ")
+            ));
+        };
+        merge_configuration(slot, value, &field)?;
+    }
+    Ok(())
+}
+
+/// Checks a configuration change before it reaches the driver: each changed bias inside its bounds
+/// and not one `locked` (driven by adaptive biasing), and nothing the driver would ignore at runtime.
+fn validate_update(
+    kind: &str,
+    current: &serde_json::Value,
+    updated: &serde_json::Value,
+    bounds: &serde_json::Value,
+    locked: &[&str],
+) -> Result<(), String> {
+    let Some(ignored) = handshake_only(kind) else {
+        return match current == updated {
+            true => Ok(()),
+            false => Err(format!(
+                "the {kind} driver cannot reconfigure the camera while it is open"
+            )),
+        };
+    };
+    for field in ignored {
+        if current[field] != updated[field] {
+            return Err(format!(
+                "`{field}` is only applied when the camera opens, so it cannot be changed live \
+                 — pass it when opening the stream instead"
+            ));
+        }
+    }
+    let (before, after) = (&current["biases"], &updated["biases"]);
+    for (name, range) in bounds.as_object().into_iter().flatten() {
+        if before[name] == after[name] {
+            continue;
+        }
+        if locked.contains(&name.as_str()) {
+            return Err(format!(
+                "`{name}` is driven by adaptive_bias; open the camera without it to set this bias"
+            ));
+        }
+        let (Some(value), Some(low), Some(high)) = (
+            after[name].as_i64(),
+            range["minimum"].as_i64(),
+            range["maximum"].as_i64(),
+        ) else {
+            return Err(format!("bias `{name}` must be an integer"));
+        };
+        if !(low..=high).contains(&value) {
+            return Err(format!("bias `{name}` = {value} is outside {low}..={high}"));
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one USB buffer with whichever adapter the open device uses, forwarding each polarity
@@ -1696,5 +2063,104 @@ mod tests {
         assert_eq!(evk4_biases(&written, firmware), target);
         // Biases the controller doesn't drive are left as they were.
         assert_eq!(written.biases.hpf, DEFAULT_CONFIGURATION.biases.hpf);
+    }
+
+    /// The tagged configuration body and bias bounds the driver would report for an open camera.
+    fn driver_json(
+        configuration: super::nd::Configuration,
+        bounds: super::nd::devices::BiasesBounds,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let mut configuration = serde_json::to_value(configuration).unwrap();
+        let mut bounds = serde_json::to_value(bounds).unwrap();
+        (
+            configuration["configuration"].take(),
+            bounds["biases_bounds"].take(),
+        )
+    }
+
+    fn evk4() -> (serde_json::Value, serde_json::Value) {
+        use super::nd::devices::prophesee_evk4::{BiasesBounds, DEFAULT_CONFIGURATION};
+        let mut bounds = BiasesBounds::default();
+        bounds.diff_on = super::nd::properties::Bounds::offsets_from(77);
+        driver_json(
+            super::nd::Configuration::PropheseeEvk4(DEFAULT_CONFIGURATION),
+            super::nd::devices::BiasesBounds::PropheseeEvk4(bounds),
+        )
+    }
+
+    #[test]
+    fn bias_table_lists_every_bounded_bias() {
+        use super::nd::devices::inivation_davis346::{BIASES_BOUNDS, DEFAULT_CONFIGURATION};
+        let (configuration, bounds) = driver_json(
+            super::nd::Configuration::InivationDavis346(DEFAULT_CONFIGURATION),
+            super::nd::devices::BiasesBounds::InivationDavis346(BIASES_BOUNDS),
+        );
+        let biases = &configuration["biases"];
+        let table = super::bias_table(biases, &bounds, biases, &super::DAVIS346_BIASES);
+        assert_eq!(table.len(), 21);
+        let refr = table.iter().find(|bias| bias.name == "refrbp").unwrap();
+        assert_eq!((refr.minimum, refr.maximum), (0, 2040));
+        assert_eq!(refr.value, refr.default);
+        assert!(refr.adaptive);
+        assert_eq!(refr.label, Some("Refractory period"));
+        let diff = table.iter().find(|bias| bias.name == "diffbn").unwrap();
+        assert!(!diff.adaptive && !diff.primary);
+        assert_eq!(diff.label, Some("Contrast reference"));
+        // The five a user tunes come first, thresholds leading; the readout biases follow.
+        let names: Vec<&str> = table.iter().take(6).map(|bias| bias.name.as_str()).collect();
+        assert_eq!(names, ["onbn", "offbn", "refrbp", "prbp", "prsfbp", "adccompbp"]);
+        assert_eq!(table.iter().filter(|bias| bias.primary).count(), 5);
+    }
+
+    #[test]
+    fn merging_only_touches_existing_keys() {
+        let (mut configuration, _) = evk4();
+        let patch = serde_json::json!({"biases": {"diff_on": 12}, "enable_output": false});
+        super::merge_configuration(&mut configuration, &patch, "").unwrap();
+        assert_eq!(configuration["biases"]["diff_on"], 12);
+        assert_eq!(configuration["biases"]["diff_off"], 0);
+        assert_eq!(configuration["enable_output"], false);
+        // What `update_configuration` hands the driver must deserialize back into its type.
+        let tagged = serde_json::json!({"type": "prophesee_evk4", "configuration": configuration});
+        match serde_json::from_value(tagged).unwrap() {
+            super::nd::Configuration::PropheseeEvk4(parsed) => assert_eq!(parsed.biases.diff_on, 12),
+            _ => panic!("wrong device type"),
+        }
+
+        let typo = serde_json::json!({"biases": {"diff_onn": 1}});
+        let error = super::merge_configuration(&mut configuration, &typo, "").unwrap_err();
+        assert!(error.contains("biases.diff_onn") && error.contains("diff_on"), "{error}");
+    }
+
+    #[test]
+    fn updates_are_checked_against_bounds_locks_and_the_handshake() {
+        let (current, bounds) = evk4();
+        let with = |patch: serde_json::Value| {
+            let mut updated = current.clone();
+            super::merge_configuration(&mut updated, &patch, "").unwrap();
+            updated
+        };
+        let check = |updated: &serde_json::Value, locked: &[&str]| {
+            super::validate_update("prophesee_evk4", &current, updated, &bounds, locked)
+        };
+        // diff_on is an offset from a firmware value of 77: -77..=178.
+        let inside = with(serde_json::json!({"biases": {"diff_on": -77}}));
+        assert!(check(&inside, &[]).is_ok());
+        let outside = with(serde_json::json!({"biases": {"diff_on": 179}}));
+        assert!(check(&outside, &[]).unwrap_err().contains("-77..=178"));
+        assert!(check(&inside, &super::EVK4_BIASES).unwrap_err().contains("adaptive_bias"));
+        // An unchanged locked bias is fine.
+        let masks = with(serde_json::json!({"enable_output": false}));
+        assert!(check(&masks, &super::EVK4_BIASES).is_ok());
+        // The rate limiter is only written while opening, so a live change would do nothing.
+        let rate = with(serde_json::json!({"rate_limiter": {
+            "reference_period_us": 1000, "maximum_events_per_period": 10
+        }}));
+        assert!(check(&rate, &[]).unwrap_err().contains("rate_limiter"));
+        // A driver with no runtime update accepts no change at all.
+        let refused =
+            super::validate_update("inivation_dvxplorer", &current, &inside, &bounds, &[]);
+        assert!(refused.is_err());
+        assert!(super::validate_update("inivation_dvxplorer", &current, &current, &bounds, &[]).is_ok());
     }
 }

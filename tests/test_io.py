@@ -392,6 +392,15 @@ class InMemoryOpenTests(unittest.TestCase):
         counts = eventcv.open(self.stream, dt_us=10, repr="count")
         self.assertEqual(counts.batch([0, 1]).shape[0], 2)
 
+    def test_array_representation_and_invalid_name(self):
+        reader = eventcv.open(
+            self.events, dt_us=10, repr="count", sensor_size=(8, 8), time_unit="us"
+        )
+        expected = eventcv.open(self.stream, dt_us=10, repr="count")
+        np.testing.assert_array_equal(reader[0], expected[0])
+        with self.assertRaises(ValueError):
+            eventcv.open(self.events, repr="not-a-representation")
+
     def test_path_like_and_bad_source(self):
         path = Path(tempfile.mkdtemp()) / "events.txt"
         path.write_text("0 0 0 1\n10 1 1 0\n")

@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "crates/eventcv-core",
-    "crates/eventcv-py"
+    "crates/eventcv-py",
+    "crates/eventcv-cli"
 ]
 resolver = "2"
 
@@ -16,3 +17,9 @@ version = "1.0.12"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# The standalone `eventcv` binaries the release attaches (`cargo build --profile dist`): release
+# with the symbols stripped, which a download has no use for.
+[profile.dist]
+inherits = "release"
+strip = true
