@@ -33,6 +33,20 @@ events = np.array([[0, 0, 100, 1], [1, 2, 250, 0]])  # x y t p
 stream = ecv.from_numpy(events, time_unit="us")
 ```
 
+Any other column layout is one `keys=` away (`keys={"x": 0, "y": 1, "p": 2, "t": 3}`), and
+**structured arrays** — what [Tonic](https://tonic.readthedocs.io) datasets return — are matched by
+field name, in any field order. To frame in-memory events like a file, hand them (or an
+`EventStream`) to {func}`eventcv.open`; frames are measured from the first event:
+
+```python
+import tonic
+
+events, label = tonic.datasets.NMNIST(save_to="data")[0]  # events["x"], events["t"], …
+stream = ecv.from_numpy(events, sensor_size=(34, 34), time_unit="us")
+reader = ecv.open(events, dt_ms=10, sensor_size=(34, 34), time_unit="us")
+frames = [reader[i].voxel() for i in range(reader.n_slices)]
+```
+
 ## Transform (chainable, functional)
 
 Transforms return a **new** stream, so they chain — and every one is also a free

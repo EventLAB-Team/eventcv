@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import atexit as _atexit
+import os
+
+import numpy as np
 
 from . import _ort, _rust
 
@@ -65,7 +68,7 @@ def load(
     offset_ms: float | None = None,
     offset_us: float | None = None,
     offset_ns: float | None = None,
-    keys: dict[str, str] | None = None,
+    keys: dict[str, str | int] | None = None,
 ) -> EventStream:
     """Load events from any supported file, detected by its extension.
 
@@ -109,7 +112,7 @@ def load(
     columns it raises, listing what the file contains. Pass ``keys`` to name them explicitly:
     ``keys={"x": …, "y": …, "t": …, "p": …}`` — for HDF5 each value is a dataset path (or
     ``dataset/field`` to pick a compound field); for text a header name or 0-based column
-    index. ``keys`` overrides auto-detection (and ``order``).
+    index (``str`` or ``int``). ``keys`` overrides auto-detection (and ``order``).
     """
     return _rust.load(
         path,
@@ -133,8 +136,9 @@ def from_numpy(
     sensor_size: tuple[int, int] | None = None,
     time_unit: str | None = None,
     order: str = "xytp",
+    keys: dict[str, str | int] | None = None,
 ) -> EventStream:
-    """Build an :class:`EventStream` from an in-memory ``(N, 4)`` NumPy array.
+    """Build an :class:`EventStream` from an in-memory NumPy array.
 
     The constructor mirror of :meth:`EventStream.numpy`: ``order`` defaults to ``xytp``
     (the column layout ``numpy()`` emits, with timestamps in microseconds), so
@@ -142,6 +146,14 @@ def from_numpy(
     ``order="txyp"`` for arrays in the common ``t x y p`` dataset layout. Any integer or
     float dtype is accepted; polarity is positive when its value is greater than zero
     (both ``0/1`` and ``-1/1`` conventions work).
+
+    **Structured arrays** — e.g. `Tonic <https://tonic.readthedocs.io>`_'s events, read as
+    ``events["x"]``/``events["t"]`` — are matched by field name, in any field order, using the
+    same synonyms as :func:`load` (``x``/``y``/``t``/``timestamp``/``p``/``polarity``/…); a
+    ``bool`` polarity field works too. ``keys={"x": …, "y": …, "t": …, "p": …}`` names the
+    columns explicitly: field names for a structured array, or 0-based column indices for a
+    plain one (so any layout works, e.g. ``keys={"x": 0, "y": 1, "p": 2, "t": 3}``). ``keys``
+    overrides both name detection and ``order``.
 
     ``sensor_size`` and ``time_unit`` are **auto-detected** when omitted, exactly like
     :func:`load`: the sensor is the smallest grid holding every event, and the time unit
@@ -154,17 +166,22 @@ def from_numpy(
         events = np.array([[0, 0, 100, 1], [1, 2, 250, 0]])   # x y t p
         stream = ecv.from_numpy(events, time_unit="us")
         stream.count().numpy()
+
+        # A Tonic sample (structured array, microsecond timestamps):
+        events, label = tonic.datasets.POKERDVS(save_to="data")[0]
+        stream = ecv.from_numpy(events, sensor_size=(35, 35), time_unit="us")
     """
     return _rust.from_numpy(
         events,
         sensor_size=sensor_size,
         time_unit=time_unit,
         order=order,
+        keys=keys,
     )
 
 
 def open(
-    path: str,
+    path: str | os.PathLike | EventStream | np.ndarray,
     *,
     dt_ms: float | None = None,
     dt_s: float | None = None,
@@ -179,14 +196,14 @@ def open(
     repr: str | None = None,
     sensor_size: tuple[int, int] | None = None,
     time_unit: str | None = None,
-    order: str = "txyp",
+    order: str | None = None,
     topic: str | None = None,
     hot_pixel_filter: bool = False,
     hot_pixel_std: float = 3.0,
-    keys: dict[str, str] | None = None,
+    keys: dict[str, str | int] | None = None,
     downsample: int | None = None,
 ) -> EventReader:
-    """Open a file for lazy slicing without loading it whole.
+    """Open a file — or in-memory events — for lazy slicing without loading it whole.
 
     Where :func:`load` is OpenCV's ``imread`` (read the entire stream eagerly),
     ``open`` is its ``VideoCapture``: it returns an :class:`EventReader` that points
@@ -204,6 +221,17 @@ def open(
     per frame constant instead of the duration. The two are mutually exclusive — pass
     one or the other, not both. Without either, slice by explicit time/count window
     instead.
+
+    **In-memory events work too.** Pass an :class:`EventStream` or a NumPy array (plain or
+    structured, e.g. a `Tonic <https://tonic.readthedocs.io>`_ sample) instead of a path and you
+    get the same reader, sliced in RAM. An array is read exactly as :func:`from_numpy` reads it
+    (``order`` defaults to ``xytp`` for arrays, ``txyp`` for files; ``sensor_size``/``time_unit``/
+    ``keys`` apply)::
+
+        events, label = tonic.datasets.POKERDVS(save_to="data")[0]
+        reader = ecv.open(events, dt_ms=10, time_unit="us")
+        frames = [reader[i].count() for i in range(reader.n_slices)]
+        ecv.open(stream, dt_ms=10).slice(3)       # frame 3, measured from the stream's start
 
     **Any timescale works.** Every time argument comes in four units — ``dt_s``, ``dt_ms``,
     ``dt_us``, ``dt_ns`` — and they mean the same thing, so ``dt_us=500`` and ``dt_ms=0.5`` open

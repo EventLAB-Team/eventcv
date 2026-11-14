@@ -244,8 +244,14 @@ fn is_header_line(line: &str) -> bool {
 /// Builds a [`ColumnMap`] from a header line by matching each name to an x/y/t/p synonym;
 /// `None` if the header doesn't name all four.
 fn header_map(line: &str) -> Option<ColumnMap> {
+    names_map(split_fields(line))
+}
+
+/// Builds a [`ColumnMap`] by matching each column name to an x/y/t/p synonym (the first
+/// match per role wins); `None` if the names don't cover all four.
+fn names_map<'a>(names: impl Iterator<Item = &'a str>) -> Option<ColumnMap> {
     let mut indices = [None; 4];
-    for (index, field) in split_fields(line).enumerate() {
+    for (index, field) in names.enumerate() {
         if let Some(role) = role_of(field) {
             indices[role].get_or_insert(index);
         }
@@ -258,21 +264,21 @@ fn header_map(line: &str) -> Option<ColumnMap> {
     })
 }
 
-/// Builds a [`ColumnMap`] from explicit `keys`, each a 0-based column index or a header name.
-fn keys_map(keys: &EventKeys, header: Option<&str>) -> Result<ColumnMap, IoError> {
+/// Builds a [`ColumnMap`] from explicit `keys`, each a 0-based column index or a column name.
+fn keys_map(keys: &EventKeys, names: Option<&[&str]>) -> Result<ColumnMap, IoError> {
     let resolve = |value: &str, field: &str| -> Result<usize, IoError> {
         if let Ok(index) = value.parse::<usize>() {
             return Ok(index);
         }
-        if let Some(names) = header {
-            if let Some(index) =
-                split_fields(names).position(|name| name.eq_ignore_ascii_case(value))
-            {
-                return Ok(index);
-            }
+        if let Some(index) = names.and_then(|names| {
+            names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(value))
+        }) {
+            return Ok(index);
         }
         Err(IoError::Format(format!(
-            "text key for '{field}' ({value:?}) is neither a column index nor a header name"
+            "key for '{field}' ({value:?}) is neither a column index nor a column name"
         )))
     };
     Ok(ColumnMap {
@@ -294,7 +300,12 @@ fn resolve_column_map(
     let has_header = first_line.is_some_and(is_header_line);
     let header = has_header.then(|| first_line.unwrap());
     let map = match keys {
-        Some(keys) => keys_map(keys, header)?,
+        Some(keys) => keys_map(
+            keys,
+            header
+                .map(|h| split_fields(h).collect::<Vec<_>>())
+                .as_deref(),
+        )?,
         None if has_header => header_map(header.unwrap()).ok_or_else(|| {
             IoError::Format(format!(
                 "text header {:?} does not name all of x/y/t/p; pass order= or keys= to map the \
@@ -305,6 +316,26 @@ fn resolve_column_map(
         None => ColumnMap::from_order(order),
     };
     Ok((map, has_header))
+}
+
+/// Resolves which columns of an in-memory event table hold x/y/t/p: `names` are a structured
+/// array's field names, `None` for a plain positional 2-D array. `keys` win (a 0-based index or
+/// a name), then synonym-matched names, then the positional `order` — the same precedence as a
+/// text file's header. Shared with `eventcv.from_numpy`.
+pub fn column_map(
+    names: Option<&[&str]>,
+    order: ColumnOrder,
+    keys: Option<&EventKeys>,
+) -> Result<ColumnMap, IoError> {
+    match (keys, names) {
+        (Some(keys), _) => keys_map(keys, names),
+        (None, Some(names)) => names_map(names.iter().copied()).ok_or_else(|| {
+            IoError::Format(format!(
+                "fields {names:?} do not name all of x/y/t/p; pass keys= to map them"
+            ))
+        }),
+        (None, None) => Ok(ColumnMap::from_order(order)),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -838,13 +869,60 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        load_text, open_text_slice, ColumnMap, ColumnOrder, TextOptions, TextReader, TimeUnit,
+        column_map, load_text, open_text_slice, ColumnMap, ColumnOrder, TextOptions, TextReader,
+        TimeUnit,
     };
-    use crate::io::{read_all, IoError, LoadOptions, SliceSource};
+    use crate::io::{read_all, EventKeys, IoError, LoadOptions, SliceSource};
     use crate::EventStream;
 
     fn read(data: &str, options: TextOptions) -> Result<EventStream, IoError> {
         read_all(TextReader::new(Cursor::new(data), options).unwrap())
+    }
+
+    #[test]
+    fn column_map_matches_names_keys_and_order() {
+        let map = |x, y, t, p| ColumnMap { x, y, t, p };
+        // Tonic-style structured fields, in any order and any synonym.
+        assert_eq!(
+            column_map(Some(&["t", "x", "y", "p"]), ColumnOrder::Xytp, None).unwrap(),
+            map(1, 2, 0, 3)
+        );
+        assert_eq!(
+            column_map(
+                Some(&["X", "y", "polarity", "timestamp"]),
+                ColumnOrder::Xytp,
+                None
+            )
+            .unwrap(),
+            map(0, 1, 3, 2)
+        );
+        assert!(column_map(Some(&["a", "b", "c", "d"]), ColumnOrder::Xytp, None).is_err());
+        // No names: positional `order`, unless `keys` gives indices (any layout, e.g. xypt).
+        assert_eq!(
+            column_map(None, ColumnOrder::Txyp, None).unwrap(),
+            map(1, 2, 0, 3)
+        );
+        let keys = |x: &str, y: &str, t: &str, p: &str| EventKeys {
+            x: x.into(),
+            y: y.into(),
+            t: t.into(),
+            p: p.into(),
+        };
+        assert_eq!(
+            column_map(None, ColumnOrder::Xytp, Some(&keys("0", "1", "3", "2"))).unwrap(),
+            map(0, 1, 3, 2)
+        );
+        // `keys` names a field (case-insensitively), overriding synonym detection.
+        assert_eq!(
+            column_map(
+                Some(&["col", "row", "stamp", "on"]),
+                ColumnOrder::Xytp,
+                Some(&keys("col", "ROW", "stamp", "on"))
+            )
+            .unwrap(),
+            map(0, 1, 2, 3)
+        );
+        assert!(column_map(None, ColumnOrder::Xytp, Some(&keys("x", "1", "2", "3"))).is_err());
     }
 
     #[test]
