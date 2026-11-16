@@ -25,7 +25,7 @@ egui-winit = { version = "=0.37.0", features = ["accesskit"] }
 egui-wgpu = "=0.37.0"
 # Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and
 # the CLI path remain available when a desktop portal is absent.
-rfd = "=0.17.2"
+rfd = "=0.18.0"
 
 [features]
 # Build `.h5`/`.hdf5` support into the extension (forwards to eventcv-core, which
