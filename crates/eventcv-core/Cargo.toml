@@ -97,6 +97,22 @@ wgpu = { version = "30", optional = true }
 pollster = { version = "1.0", optional = true }   # block on wgpu's async device/adapter requests
 bytemuck = { version = "1", optional = true, features = ["derive"] }
 
+# Optional: native neural reconstruction (`reconstruct::E2vid`). burn runs the network on the CPU
+# through its flex backend (pure Rust, gemm-based), and on the shared wgpu device when `gpu` is also
+# on (see that feature) — burn-wgpu 0.22 sits on wgpu 30, the version above, so a wheel still links
+# one wgpu.
+# Pinned exactly: burn is pre-1.0 and a minor release moves its module API. Weights are not
+# bundled; they are fetched at run time (`python/eventcv/hub.py`). Enable with `--features nn`.
+burn = { version = "=0.22.1", optional = true, default-features = false, features = ["std", "flex"] }
+# Only to switch on the CPU backend's SIMD and rayon/threaded-gemm paths, which `burn` leaves off.
+burn-flex = { version = "=0.22.1", optional = true, default-features = false, features = ["std", "simd", "rayon"] }
+# The weights file: tensors plus a string metadata map carrying the architecture. Read directly
+# rather than through burn's module store, because the network is a few functional conv calls.
+safetensors = { version = "0.8", optional = true, default-features = false, features = ["std"] }
+# The CPU's Winograd 3x3 convolution (`reconstruct/winograd.rs`) calls the matrix kernel directly.
+# The same crate and version burn-flex already builds, so this compiles nothing new.
+gemm = { version = "=0.19.0", optional = true, default-features = false, features = ["std", "rayon"] }
+
 # Optional: ROS 2 publish/subscribe over Zenoh. `hiroz` is a ROS 2 stack in pure Rust, so this
 # links no ROS libraries and needs no ROS installation to build or to run -- the reason it is here
 # rather than `rclrs` or `r2r`, either of which would put the integration in a separate,
@@ -106,6 +122,11 @@ hiroz = { version = "=0.2.1", optional = true, default-features = false, feature
 hiroz-msgs = { version = "=0.2.1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+
+# Linux only, for `accel::gpu::keep_libraries_resident`: re-opening the GPU driver's libraries with
+# `RTLD_NODELETE`, which only `dlopen` itself can express. Already in the tree via wgpu and friends.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
@@ -138,8 +159,17 @@ camera = ["dep:neuromorphic-drivers", "dep:serde_json"]
 # the published wheels turn it on (see `[tool.maturin] features` in pyproject.toml).
 onnx = ["dep:ort", "dep:libloading"]
 # GPU compute (`Device::Gpu`). Off by default: the CPU path is the reference implementation and
-# stays the default at run time even when this is built in.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# stays the default at run time even when this is built in. With `nn` it also gives burn its GPU
+# backend, and each of these three is worth having (E2VID, RTX 2080):
+# - `vulkan` adds cubecl's SPIR-V compiler beside WGSL, which is what reaches the tensor cores
+#   (Vulkan cooperative matrices): half-precision matmul ~22 TFLOP/s against ~4.5 through WGSL. It
+#   does not pin the API — the device is still opened on whatever is best here, Metal on macOS.
+# - `autotune` picks kernels per shape (~1.6x a frame), measured in memory only.
+# - `fusion` merges the elementwise work between convolutions: 1.5x a frame at 346x260, 1.9x at
+#   1280x720, once the convolutions themselves run on the tensor cores.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "burn?/vulkan", "burn?/autotune", "burn?/fusion"]
+# Native neural reconstruction on burn (CPU always; GPU when `gpu` is on as well).
+nn = ["dep:burn", "dep:burn-flex", "dep:safetensors", "dep:gemm", "dep:libc"]
 # ROS 2 publish/subscribe. Off by default: a wheel that nobody asked to speak ROS 2 should not
 # carry a Zenoh stack. Interoperates with ROS 2 running `rmw_zenoh_cpp`; a DDS deployment needs
 # `zenoh-bridge-ros2dds` in between.

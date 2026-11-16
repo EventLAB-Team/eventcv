@@ -48,6 +48,8 @@ pub mod mask;
 #[cfg(feature = "onnx")]
 pub mod model;
 pub mod net;
+#[cfg(feature = "nn")]
+pub mod reconstruct;
 #[cfg(feature = "ros2")]
 pub mod ros2;
 

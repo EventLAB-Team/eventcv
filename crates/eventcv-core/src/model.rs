@@ -2,11 +2,10 @@
 //!
 //! # Scope
 //!
-//! This is deliberately a *runner*, not a model zoo. EventCV builds the tensors; what consumes them
-//! is the user's business, and bundling architectures or weights would mean tracking every upstream
-//! model's preprocessing forever. So there is one type, [`Model`], it takes any `.onnx` file, and it
-//! knows nothing about RVT, E2VID or YOLOX beyond their input shapes — which the graph already
-//! declares and [`Model::inputs`] reports.
+//! This is a *runner* for networks EventCV does not ship: one type, [`Model`], takes any `.onnx`
+//! file and knows nothing about RVT or YOLOX beyond their input shapes — which the graph already
+//! declares and [`Model::inputs`] reports. Networks EventCV does ship (E2VID) are implemented
+//! natively in [`crate::reconstruct`] instead.
 //!
 //! The pairing that makes this worth having is with [`crate::representation`]: a voxel grid or time
 //! surface is already a dense `f32` tensor in the layout ONNX wants, so feeding one to a network is
