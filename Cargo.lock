@@ -5959,9 +5959,9 @@ dependencies = [
 
 [[package]]
 name = "neuromorphic-drivers"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbd4ccecdb8ab9abf9fd34f64f9feb7970d7e55645c8a6e05325616e2476fd6f"
+checksum = "63b220f8b44a17423c8002ed66d422dbb5c7dfecfb05642644dfff51ea1deb84"
 dependencies = [
  "bincode",
  "libc",
@@ -7131,7 +7131,7 @@ dependencies = [
  "rustc_apfloat",
  "slotmap",
  "smallvec",
- "spin 0.10.1",
+ "spin 0.12.3",
  "thiserror 2.0.18",
  "utf8-chars",
 ]
@@ -8989,9 +8989,6 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
-dependencies = [
- "lock_api",
-]
 
 [[package]]
 name = "spin"
