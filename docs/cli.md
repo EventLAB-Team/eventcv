@@ -21,7 +21,7 @@ whichever comes first on your `PATH` answers — `eventcv --version` says which 
 
 ```console
 $ eventcv --version
-eventcv 1.0.12 (hdf5, camera, onnx)
+eventcv 1.0.13 (hdf5, camera, onnx)
 Python 3.12.10 on macOS-14.8.3-arm64-arm-64bit
 ```
 
