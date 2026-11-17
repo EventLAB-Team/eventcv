@@ -1681,6 +1681,7 @@ fn device_dimensions(device: &nd::Device) -> (usize, usize) {
     let (width, height) = match device.properties() {
         Properties::InivationDavis346(properties) => (properties.width, properties.height),
         Properties::InivationDvxplorer(properties) => (properties.width, properties.height),
+        Properties::PropheseeEvk1Gen4(properties) => (properties.width, properties.height),
         Properties::PropheseeEvk3Hd(properties) => (properties.width, properties.height),
         Properties::PropheseeEvk4(properties) => (properties.width, properties.height),
         Properties::CenturyarksVga(properties) => (properties.width, properties.height),

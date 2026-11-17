@@ -47,12 +47,14 @@ See :doc:`video` for the raw view and the interactive player's controls.
 ```{eval-rst}
 .. autofunction:: simulate
 .. autofunction:: reconstruct
+.. autoclass:: eventcv.E2VID
+   :members:
 .. autoclass:: eventcv.StatefulModel
    :members:
 ```
 
-See :doc:`simulation` for the pixel model and :doc:`reconstruction` for the ONNX export
-requirements.
+See :doc:`simulation` for the pixel model and :doc:`reconstruction` for E2VID, its weights, and
+bringing your own ONNX model.
 
 ## Models
 

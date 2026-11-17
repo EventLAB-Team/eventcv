@@ -1496,6 +1496,9 @@ mod gpu_tests {
     /// `f64` before scaling, and the GPU cannot, because WGSL has no `f64`. On a run of ~25 000
     /// events that puts a couple of them one microsecond apart. The assertion is that bound, not a
     /// hopeful tolerance: anything larger would mean the model itself had diverged.
+    ///
+    /// Compared per pixel, not in stream order: a one-microsecond shift can swap two events from
+    /// different pixels in the `(t, y, x, polarity)` sort, which says nothing about the model.
     #[test]
     fn threshold_mismatch_is_the_same_silicon_on_both_backends() {
         if skip_without_gpu() {
@@ -1506,8 +1509,20 @@ mod gpu_tests {
             seed: 7,
             ..SimulatorConfig::ideal()
         };
-        let (cpu_x, cpu_y, cpu_t, cpu_p) = columns(&run(config, Device::Cpu));
-        let (gpu_x, gpu_y, gpu_t, gpu_p) = columns(&run(config, Device::Gpu));
+        let by_pixel = |(x, y, t, p): (Vec<u16>, Vec<u16>, Vec<i64>, Vec<bool>)| {
+            let mut events: Vec<_> = (0..t.len()).map(|i| (y[i], x[i], p[i], t[i])).collect();
+            events.sort_unstable();
+            let mut out = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (y, x, p, t) in events {
+                out.0.push(x);
+                out.1.push(y);
+                out.2.push(t);
+                out.3.push(p);
+            }
+            out
+        };
+        let (cpu_x, cpu_y, cpu_t, cpu_p) = by_pixel(columns(&run(config, Device::Cpu)));
+        let (gpu_x, gpu_y, gpu_t, gpu_p) = by_pixel(columns(&run(config, Device::Gpu)));
         assert_eq!(cpu_t.len(), gpu_t.len(), "event count");
         assert_eq!(cpu_x, gpu_x, "x");
         assert_eq!(cpu_y, gpu_y, "y");

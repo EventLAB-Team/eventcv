@@ -46,6 +46,10 @@ pub(crate) struct Context {
     /// and a process that has both simulated *and* built representations would hit it. One device is
     /// also simply what a single library should hold.
     pub(crate) sim: std::sync::OnceLock<super::sim::SimPipeline>,
+    /// burn's handle on this same device — it opened it, see [`acquire`] — so the networks in
+    /// [`crate::reconstruct`] share it for the reason `sim` gives above.
+    #[cfg(feature = "nn")]
+    pub(crate) burn: burn::tensor::Device,
 }
 
 /// One storage-buffer binding in the shared layout.
@@ -87,6 +91,8 @@ pub(crate) fn with_context<T>(body: impl FnOnce(&Context) -> T) -> Option<T> {
 
 /// Closes the GPU, if one was opened. Idempotent; a later call reopens it.
 pub(crate) fn shutdown() {
+    #[cfg(all(feature = "nn", target_os = "linux"))]
+    keep_libraries_resident();
     let mut guard = CONTEXT.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(Some(context)) = guard.take() {
         // Everything queued must land before the device goes away, or the driver is left tearing
@@ -96,7 +102,26 @@ pub(crate) fn shutdown() {
     }
 }
 
-fn open() -> Option<Context> {
+/// The device and its queue.
+///
+/// With `nn`, cubecl (burn's GPU runtime) opens them and eventcv's own kernels run on its device:
+/// on Vulkan it switches on the cooperative-matrix extensions its tensor-core matmuls need, which a
+/// device opened here would lack — without them half-precision matmul runs at ~4.5 TFLOP/s rather
+/// than ~22.
+#[cfg(feature = "nn")]
+fn acquire() -> Option<(wgpu::Device, wgpu::Queue, burn::tensor::Device)> {
+    let (burn, setup) = burn::tensor::Device::wgpu_options()
+        .init_with_setup()
+        .ok()?;
+    Some((setup.device, setup.queue, burn))
+}
+
+/// Without `nn` the kernels use only storage buffers and integer atomics, so the downlevel defaults
+/// are enough — which keeps software rasterisers and older drivers usable. The downlevel defaults
+/// allow four storage buffers per compute stage; the simulator kernel needs five, and asking for six
+/// rather than the adapter's maximum keeps the widest set of devices able to open this.
+#[cfg(not(feature = "nn"))]
+fn acquire() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -105,14 +130,9 @@ fn open() -> Option<Context> {
         apply_limit_buckets: false,
     }))
     .ok()?;
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("eventcv"),
         required_features: wgpu::Features::empty(),
-        // The kernels use only storage buffers and integer atomics, so the downlevel defaults
-        // are enough — which keeps software rasterisers and older drivers usable.
-        // The downlevel defaults allow four storage buffers per compute stage; the simulator
-        // kernel needs five, and asking for six rather than the adapter's maximum keeps the
-        // widest set of devices able to open this.
         required_limits: wgpu::Limits {
             max_storage_buffers_per_shader_stage: 6,
             ..wgpu::Limits::downlevel_defaults()
@@ -120,7 +140,49 @@ fn open() -> Option<Context> {
         memory_hints: wgpu::MemoryHints::Performance,
         ..Default::default()
     }))
-    .ok()?;
+    .ok()
+}
+
+/// Marks every shared library now loaded as never to be unmapped.
+///
+/// NVIDIA's Linux driver unloads parts of itself (its SPIR-V compiler among them) from its own exit
+/// handlers while worker threads it started are still running, and one of those threads then
+/// executes code that is no longer mapped: a segfault after the program's last line, roughly one
+/// exit in six here. Closing the device before exit avoids it, which is what [`shutdown`] did —
+/// but with `nn` the device belongs to cubecl, which keeps it (and its instance) for the life of
+/// the process. So instead the libraries stay: `RTLD_NOLOAD | RTLD_NODELETE` loads nothing new and
+/// turns every later `dlclose` of them into a no-op. Called from [`shutdown`], i.e. at exit, so it
+/// covers whatever the driver loaded lazily along the way.
+#[cfg(all(feature = "nn", target_os = "linux"))]
+fn keep_libraries_resident() {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return;
+    };
+    let libraries: std::collections::BTreeSet<&str> = maps
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .filter(|path| path.starts_with('/') && path.contains(".so"))
+        .collect();
+    for library in libraries {
+        let Ok(path) = std::ffi::CString::new(library) else {
+            continue;
+        };
+        // SAFETY: RTLD_NOLOAD only looks up an object that is already loaded, so no initialiser
+        // runs; the handle is deliberately never closed.
+        unsafe {
+            libc::dlopen(
+                path.as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE,
+            );
+        }
+    }
+}
+
+fn open() -> Option<Context> {
+    #[cfg(feature = "nn")]
+    let (device, queue, burn) = acquire()?;
+    #[cfg(not(feature = "nn"))]
+    let (device, queue) = acquire()?;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("eventcv representations"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -148,6 +210,8 @@ fn open() -> Option<Context> {
         pipeline_layout,
         pipelines: std::sync::Mutex::new(std::collections::HashMap::new()),
         sim: std::sync::OnceLock::new(),
+        #[cfg(feature = "nn")]
+        burn,
     })
 }
 

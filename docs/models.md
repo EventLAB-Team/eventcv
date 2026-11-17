@@ -46,17 +46,17 @@ models. Microsoft's shared build needs only glibc 2.27, below the floor the whee
 
 ## Scope
 
-EventCV ships **no architectures and no weights**. `Model` takes any `.onnx` file and knows nothing
-about what is inside it.
+`Model` takes any `.onnx` file and knows nothing about what is inside it — it is the way to run a
+network EventCV does not ship. The part that belongs in an event-vision library is building the
+tensor correctly, and that is where the pairing pays off: a voxel grid or time surface is already a
+dense `float32` array in the layout ONNX expects, so feeding one to a network is a shape check, not
+a conversion.
 
-That is a deliberate boundary rather than a missing feature. Bundling models would mean tracking
-every upstream project's preprocessing, weights hosting and version skew indefinitely — and the
-part that actually belongs in an event-vision library is building the tensor correctly. Which is
-also where the pairing pays off: a voxel grid or time surface is already a dense `float32` array in
-the layout ONNX expects, so feeding one to a network is a shape check, not a conversion.
+EventCV also ships networks of its own, implemented natively rather than as ONNX graphs, with
+weights downloaded on first use: [E2VID](reconstruction.md) for reconstruction is the first.
 
-To get an `.onnx` file: export from PyTorch with `torch.onnx.export`, or convert an existing
-checkpoint with the upstream project's own export script.
+To get an `.onnx` file for anything else: export from PyTorch with `torch.onnx.export`, or convert
+an existing checkpoint with the upstream project's own export script.
 
 ## Inspecting a graph
 

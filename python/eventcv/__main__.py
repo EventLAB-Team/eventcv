@@ -292,20 +292,24 @@ def _cmd_ros2_represent(args: argparse.Namespace) -> int:
 
 
 def _cmd_reconstruct(args: argparse.Namespace) -> int:
-    """Run a reconstruction model over a recording to recover an intensity video."""
-    from . import Model, reconstruct
+    """Recover an intensity video from a recording, with E2VID or an ONNX model."""
+    from . import E2VID, Model, reconstruct
     from . import open as open_reader
+    from .load import _trained_windows
 
-    reader = open_reader(args.input, dt_ms=args.dt_ms, **_source_options(args)).with_repr(
-        args.repr, bins=args.bins
-    )
-    frames = reconstruct(
-        reader,
-        Model(args.model),
-        args.output,
-        fps=args.fps,
-        max_frames=args.max_frames,
-    )
+    options = _source_options(args)
+    if args.model == "e2vid":
+        model = E2VID(device=args.device)
+        if args.dt_ms is None:
+            reader = _trained_windows(args.input, model, **options)
+        else:
+            reader = open_reader(args.input, dt_ms=args.dt_ms, **options)
+    else:
+        model = Model(args.model)
+        reader = open_reader(args.input, dt_ms=args.dt_ms or 33.0, **options).with_repr(
+            args.repr, bins=args.bins
+        )
+    frames = reconstruct(reader, model, args.output, fps=args.fps, max_frames=args.max_frames)
     if not args.quiet:
         print(f"wrote {args.output} ({frames} frames at {args.fps:g} fps)")
     return 0
@@ -524,25 +528,37 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.set_defaults(func=_cmd_simulate)
 
     reconstruct = subparsers.add_parser(
-        "reconstruct", help="recover an intensity video from events using an ONNX model"
+        "reconstruct", help="recover an intensity video from events (E2VID, or an ONNX model)"
     )
     reconstruct.add_argument("input", help="source recording")
     reconstruct.add_argument("output", help="destination video; the extension picks the format")
-    reconstruct.add_argument("model", help="ONNX reconstruction model (e.g. an E2VID export)")
+    reconstruct.add_argument(
+        "model",
+        nargs="?",
+        default="e2vid",
+        help="'e2vid' (default; weights are downloaded on first use) or an ONNX model file",
+    )
     _add_source_options(reconstruct)
     reconstruct.add_argument(
         "--dt-ms",
         type=float,
-        default=33.0,
+        default=None,
         metavar="MS",
-        help="time per reconstructed frame (default: 33)",
+        help="time per reconstructed frame (default: E2VID's trained event count per frame; "
+        "33 for an ONNX model)",
+    )
+    reconstruct.add_argument(
+        "--device",
+        default=None,
+        choices=("cpu", "gpu"),
+        help="where E2VID runs (default: $EVENTCV_DEVICE, else cpu)",
     )
     reconstruct.add_argument("--fps", type=float, default=30.0, help="playback rate (default: 30)")
     reconstruct.add_argument(
-        "--repr", default="voxel", help="representation the model expects (default: voxel)"
+        "--repr", default="voxel", help="representation an ONNX model expects (default: voxel)"
     )
     reconstruct.add_argument(
-        "--bins", type=int, default=5, help="bins for the voxel representation (default: 5)"
+        "--bins", type=int, default=5, help="bins for an ONNX model's voxel input (default: 5)"
     )
     reconstruct.add_argument(
         "--max-frames", type=int, default=None, metavar="N", help="stop after N frames"

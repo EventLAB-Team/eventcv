@@ -27,7 +27,7 @@ Python 3.12.10 on macOS-14.8.3-arm64-arm-64bit
 
 The first line is the two things a bug report needs: the version, and which optional features were
 compiled in. If `hdf5` is absent, `.h5` files will not open; if `onnx` is absent,
-{class}`~eventcv.Model` is unavailable.
+{class}`~eventcv.Model` is unavailable; if `nn` is absent, so is {class}`~eventcv.E2VID`.
 
 The standalone binary names itself on the second line instead of an interpreter:
 

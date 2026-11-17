@@ -55,6 +55,8 @@ const FEATURES: &[&str] = &[
     "onnx",
     #[cfg(feature = "gpu")]
     "gpu",
+    #[cfg(feature = "nn")]
+    "nn",
 ];
 
 /// Events read per pass when converting a whole `EventReader` to another format. Large enough
@@ -3953,33 +3955,51 @@ impl SimulationSink {
 
 /// Reconstructs an intensity video from events by running a trained model over each slice.
 ///
-/// `reader` must carry the representation the model expects (`open(repr=…)` / `with_repr`), and
-/// `model` is any ONNX graph taking that representation and returning a single-channel image —
-/// E2VID and its relatives. EventCV supplies the runner and the tensors, not the weights.
+/// `model` is either an `E2VID`, which builds its own input from each slice's raw events and
+/// carries its recurrent state across them, or a `Model` wrapping any ONNX graph that maps the
+/// reader's representation (`open(repr=…)` / `with_repr`) to a single-channel image.
 ///
-/// Writes to `path` in whatever format the extension names (`.gif`, `.apng`, `.mp4`) and returns
-/// the number of frames written.
-#[cfg(feature = "onnx")]
+/// With `path`, writes the frames there in whatever format the extension names (`.gif`, `.apng`,
+/// `.mp4`) and returns how many were written; without one, returns them as an `(N, H, W)` float32
+/// array in `[0, 1]`.
+#[cfg(any(feature = "onnx", feature = "nn"))]
 #[pyfunction]
-#[pyo3(signature = (reader, model, path, *, fps=30.0, colormap="grayscale", max_frames=None))]
-fn reconstruct(
-    py: Python<'_>,
+#[pyo3(signature = (reader, model, path=None, *, fps=30.0, colormap="grayscale", max_frames=None))]
+#[allow(clippy::too_many_arguments)]
+fn reconstruct<'py>(
+    py: Python<'py>,
     reader: PyRef<'_, PyEventReader>,
-    model: PyRef<'_, PyModel>,
-    path: &str,
+    model: &Bound<'py, PyAny>,
+    path: Option<&str>,
     fps: f64,
     colormap: &str,
     max_frames: Option<usize>,
-) -> PyResult<usize> {
+) -> PyResult<Bound<'py, PyAny>> {
     use eventcv_core::representation::{EventFrame, EventFrameData};
     use eventcv_core::video::{encoder_for, Fps};
     use eventcv_core::viz::{render_frame_scaled, Scale};
 
-    let spec = reader.repr.clone().ok_or_else(|| {
-        PyValueError::new_err(
+    #[cfg(feature = "nn")]
+    let e2vid = model.cast::<PyE2vid>().ok().map(|model| model.borrow());
+    #[cfg(not(feature = "nn"))]
+    let e2vid: Option<()> = None;
+    #[cfg(feature = "onnx")]
+    let onnx = model.cast::<PyModel>().ok().map(|model| model.borrow());
+    #[cfg(not(feature = "onnx"))]
+    let onnx: Option<()> = None;
+    if e2vid.is_none() && onnx.is_none() {
+        return Err(PyTypeError::new_err(
+            "model must be an eventcv.E2VID or an eventcv.Model",
+        ));
+    }
+    // Only the ONNX path consumes the reader's representation; E2VID builds its own voxel grid.
+    #[cfg(feature = "onnx")]
+    let spec = match (&onnx, reader.repr.clone()) {
+        (Some(_), None) => return Err(PyValueError::new_err(
             "reconstruct needs the representation the model expects; open(repr=…) or with_repr(…)",
-        )
-    })?;
+        )),
+        (_, spec) => spec,
+    };
     let colormap = parse_colormap(colormap)?;
     let mode = reader.require_mode()?;
     let total = reader.frame_count(mode);
@@ -3990,9 +4010,9 @@ fn reconstruct(
         ));
     }
 
-    // Capture plain references, not the GIL-bound PyRefs: `py.detach` needs a Send closure.
-    let session = &model.inner;
     let mut encoder: Option<Box<dyn eventcv_core::video::AnimationEncoder + Send>> = None;
+    let mut collected: Vec<f32> = Vec::new();
+    let mut size = (0, 0);
     for index in 0..frames {
         let stream = fetch_window(
             py,
@@ -4002,36 +4022,62 @@ fn reconstruct(
             reader.slice_ops.clone(),
             reader.hot_pixel_mask.clone(),
         )?;
-        let input = py
-            .detach(|| spec.generate(&stream))
-            .map_err(map_representation_error)?;
-        let (channels, height, width) = input.shape();
-        let tensor = frame_to_f32_array(&input, channels, height, width);
-        let mut outputs = py
-            .detach(|| {
-                session
-                    .lock()
-                    .expect("model mutex was poisoned by a previous panic")
-                    .run(tensor)
-            })
-            .map_err(map_model_error)?;
-        let output = outputs
-            .drain(..)
-            .next()
-            .ok_or_else(|| PyValueError::new_err("the model produced no output"))?;
-
-        // Reconstruction models emit [N,1,H,W] or [1,H,W]; either way the trailing H*W is the
-        // image, so the leading axes are collapsed rather than demanding one exact rank.
-        let shape = output.shape().to_vec();
-        let (out_h, out_w) = match shape.as_slice() {
-            [.., h, w] => (*h, *w),
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "expected an image output with at least two dimensions, got {shape:?}"
-                )))
-            }
+        #[cfg(feature = "nn")]
+        let image = match &e2vid {
+            Some(model) => Some(model.step(py, &stream)?),
+            None => None,
         };
-        let samples: Vec<f32> = output.iter().copied().take(out_h * out_w).collect();
+        #[cfg(not(feature = "nn"))]
+        let image: Option<(Vec<f32>, usize, usize)> = None;
+        let (samples, out_w, out_h) = match image {
+            Some(image) => image,
+            #[cfg(feature = "onnx")]
+            None => {
+                let session = &onnx.as_ref().expect("checked above").inner;
+                let spec = spec.as_ref().expect("checked above");
+                let input = py
+                    .detach(|| spec.generate(&stream))
+                    .map_err(map_representation_error)?;
+                let (channels, height, width) = input.shape();
+                let tensor = frame_to_f32_array(&input, channels, height, width);
+                let mut outputs = py
+                    .detach(|| {
+                        session
+                            .lock()
+                            .expect("model mutex was poisoned by a previous panic")
+                            .run(tensor)
+                    })
+                    .map_err(map_model_error)?;
+                let output = outputs
+                    .drain(..)
+                    .next()
+                    .ok_or_else(|| PyValueError::new_err("the model produced no output"))?;
+                // Reconstruction models emit [N,1,H,W] or [1,H,W]; either way the trailing H*W is
+                // the image, so the leading axes are collapsed rather than demanding one rank.
+                let shape = output.shape().to_vec();
+                let (out_h, out_w) = match shape.as_slice() {
+                    [.., h, w] => (*h, *w),
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "expected an image output with at least two dimensions, got {shape:?}"
+                        )))
+                    }
+                };
+                (
+                    output.iter().copied().take(out_h * out_w).collect(),
+                    out_w,
+                    out_h,
+                )
+            }
+            #[cfg(not(feature = "onnx"))]
+            None => unreachable!("an E2VID is the only model without the onnx feature"),
+        };
+        let Some(path) = path else {
+            size = (out_h, out_w);
+            collected.extend_from_slice(&samples);
+            py.check_signals()?;
+            continue;
+        };
         let image_frame = EventFrame::intensity(EventFrameData::F32(samples), out_w, out_h)
             .map_err(map_representation_error)?;
         // Natural scale: a reconstruction already lives in [0, 1], and auto-contrast would make
@@ -4054,10 +4100,15 @@ fn reconstruct(
         encoder.write_frame(&image).map_err(map_std_io_error)?;
         py.check_signals()?;
     }
+    if path.is_none() {
+        let array = numpy::ndarray::Array3::from_shape_vec((frames, size.0, size.1), collected)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        return Ok(array.into_pyarray(py).into_any());
+    }
     if let Some(encoder) = encoder.take() {
         py.detach(|| encoder.finish()).map_err(map_std_io_error)?;
     }
-    Ok(frames)
+    Ok(frames.into_pyobject(py)?.into_any())
 }
 
 /// Copies a frame into the `[1, C, H, W]` float tensor a model expects, adding the batch axis the
@@ -5045,6 +5096,148 @@ fn to_f32_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<numpy::ndar
 #[pyfunction]
 fn onnx_runtime_version() -> Option<String> {
     eventcv_core::model::runtime_version()
+}
+
+/// E2VID: reconstructs intensity frames from windows of events with a recurrent network, carrying
+/// the scene from one window to the next — call it on consecutive windows, and `reset()` between
+/// unrelated recordings.
+///
+/// Requires a build with the `nn` feature; `eventcv --version` reports whether this one has it.
+#[cfg(feature = "nn")]
+#[pyclass(name = "E2VID")]
+struct PyE2vid {
+    // `step` needs `&mut` (it advances the recurrent state) while a `#[pyclass]` hands out shared
+    // references; the lock also keeps two threads from interleaving one sequence.
+    inner: Mutex<eventcv_core::reconstruct::E2vid>,
+    bins: usize,
+    events_per_pixel: f64,
+    device: eventcv_core::accel::Device,
+    precision: &'static str,
+}
+
+#[cfg(feature = "nn")]
+#[pymethods]
+impl PyE2vid {
+    /// Loads E2VID onto `device` (`"cpu"`/`"gpu"`, default `get_device()`). `weights` is a
+    /// `.safetensors` file written by `scripts/convert_e2vid.py`; `None` fetches the published
+    /// weights, downloading them once and reusing the cached copy after that.
+    ///
+    /// `precision` applies on the GPU: `"half"` (default) convolves on the tensor cores, ~3x faster
+    /// and ~1e-3 from the reference; `"single"` matches the reference, as the CPU always does. A GPU
+    /// without half-precision support (a software adapter, some older drivers) runs `"single"`.
+    #[new]
+    #[pyo3(signature = (weights=None, *, device=None, precision="half"))]
+    fn new(
+        py: Python<'_>,
+        weights: Option<std::path::PathBuf>,
+        device: Option<&str>,
+        precision: &str,
+    ) -> PyResult<Self> {
+        let device = resolve_device(device)?;
+        let precision_mode =
+            eventcv_core::reconstruct::Precision::parse(precision).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "precision must be \"half\" or \"single\", not {precision:?}"
+                ))
+            })?;
+        let weights = match weights {
+            Some(weights) => weights,
+            None => py
+                .import("eventcv.hub")?
+                .call_method1("fetch", ("e2vid",))?
+                .extract()?,
+        };
+        let inner = py
+            .detach(|| eventcv_core::reconstruct::E2vid::load(&weights, device, precision_mode))
+            .map_err(map_reconstruct_error)?;
+        Ok(Self {
+            bins: inner.bins(),
+            events_per_pixel: inner.events_per_pixel(),
+            precision: match inner.precision() {
+                eventcv_core::reconstruct::Precision::Half => "half",
+                eventcv_core::reconstruct::Precision::Single => "single",
+            },
+            inner: Mutex::new(inner),
+            device,
+        })
+    }
+
+    /// Reconstructs the frame at the end of `stream` — the next window of the sequence — as a
+    /// `(height, width)` float32 array in `[0, 1]`.
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        stream: PyRef<'_, PyEventStream>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let (values, width, height) = self.step(py, &stream.inner)?;
+        Ok(Array2::from_shape_vec((height, width), values)
+            .expect("the frame is height * width by construction")
+            .into_pyarray(py))
+    }
+
+    /// Forgets the recurrent state, so the next call starts a new sequence.
+    fn reset(&self) {
+        self.lock().reset();
+    }
+
+    /// Voxel-grid bins the network was trained on.
+    #[getter]
+    fn bins(&self) -> usize {
+        self.bins
+    }
+
+    /// Events per window per sensor pixel the network was trained on — `reconstruct` sizes its
+    /// windows to `events_per_pixel * width * height`.
+    #[getter]
+    fn events_per_pixel(&self) -> f64 {
+        self.events_per_pixel
+    }
+
+    /// `"cpu"` or `"gpu"`: where inference runs.
+    #[getter]
+    fn device(&self) -> &'static str {
+        self.device.as_str()
+    }
+
+    /// `"half"` or `"single"`: as constructed, except `"single"` on a GPU without half precision
+    /// (the CPU computes in single precision either way).
+    #[getter]
+    fn precision(&self) -> &'static str {
+        self.precision
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "E2VID(device={:?}, precision={:?})",
+            self.device.as_str(),
+            self.precision
+        )
+    }
+}
+
+#[cfg(feature = "nn")]
+impl PyE2vid {
+    fn lock(&self) -> std::sync::MutexGuard<'_, eventcv_core::reconstruct::E2vid> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn step(
+        &self,
+        py: Python<'_>,
+        stream: &eventcv_core::EventStream,
+    ) -> PyResult<(Vec<f32>, usize, usize)> {
+        py.detach(|| self.lock().step(stream))
+            .map_err(map_reconstruct_error)
+    }
+}
+
+#[cfg(feature = "nn")]
+fn map_reconstruct_error(error: eventcv_core::reconstruct::ReconstructError) -> PyErr {
+    use eventcv_core::reconstruct::ReconstructError;
+    match error {
+        ReconstructError::Unavailable(_) => PyRuntimeError::new_err(error.to_string()),
+        _ => PyValueError::new_err(error.to_string()),
+    }
 }
 
 #[cfg(feature = "onnx")]
@@ -7095,8 +7288,10 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_camera_info, m)?)?;
     m.add_function(wrap_pyfunction!(simulate, m)?)?;
     m.add_class::<PySimulationResult>()?;
-    #[cfg(feature = "onnx")]
+    #[cfg(any(feature = "onnx", feature = "nn"))]
     m.add_function(wrap_pyfunction!(reconstruct, m)?)?;
+    #[cfg(feature = "nn")]
+    m.add_class::<PyE2vid>()?;
     m.add_function(wrap_pyfunction!(rect_mask, m)?)?;
     m.add_function(wrap_pyfunction!(ellipse_mask, m)?)?;
     m.add_function(wrap_pyfunction!(circle_mask, m)?)?;

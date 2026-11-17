@@ -46,3 +46,6 @@ gpu = ["eventcv-core/gpu"]
 # Build the ROS 2 nodes into the extension (forwards to eventcv-core, which goes over hiroz — a
 # pure-Rust Zenoh-native ROS 2 stack, so this needs no ROS installation at build time).
 ros2 = ["eventcv-core/ros2"]
+# Build native neural reconstruction (`E2VID`) into the extension (forwards to eventcv-core, which
+# pulls in burn). Runs on the GPU too when `gpu` is also enabled.
+nn = ["eventcv-core/nn"]
