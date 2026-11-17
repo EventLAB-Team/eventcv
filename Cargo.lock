@@ -3685,7 +3685,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-core"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "burn",
  "burn-core",
@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-py"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "bytemuck",
  "egui",
