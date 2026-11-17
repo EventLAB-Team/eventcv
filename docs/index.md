@@ -30,7 +30,8 @@ a NumPy-friendly Python API for loading, transforming, and representing event-ca
   event-rate analytics.
 - **Run a model** — feed a representation to any ONNX network with {class}`~eventcv.Model`.
 - **Simulate** events from video with a v2e-grade sensor model — optionally with learned frame
-  interpolation in front of it — and **reconstruct** intensity video back from events.
+  interpolation in front of it — and **reconstruct** intensity video back from events with a
+  built-in E2VID.
 - **Move the heavy work to a GPU** when it pays, with `device="gpu"` or
   {func}`eventcv.set_device`. Off by default: the CPU implementations are the reference, and on a
   modern machine they win for everything but the simulator. See {doc}`representations`.
@@ -94,7 +95,7 @@ versioning roughly twenty standard datasets. EventCV reads files and builds tens
 a downloaded dataset and load its files with {func}`eventcv.load`, or use tonic end-to-end. There is
 no value in a second, worse copy of that.
 
-**A model zoo.** {class}`~eventcv.Model` runs any ONNX graph you give it — including the
-reconstruction networks in [Reconstruction](reconstruction.md) — but EventCV ships no
-architectures and no weights. Bundling them would mean tracking every upstream model's
-preprocessing forever; building the tensors correctly is the part that belongs here.
+**A wrapper around every published model.** EventCV implements a few networks natively —
+[E2VID](reconstruction.md) first — with weights downloaded on first use, and each one has to match
+its reference implementation's output. Anything else runs through {class}`~eventcv.Model`, which
+takes any ONNX graph you give it.

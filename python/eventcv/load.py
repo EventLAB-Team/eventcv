@@ -38,6 +38,20 @@ class _MissingModel:
 
 
 Model = getattr(_rust, "Model", _MissingModel)
+
+
+class _MissingE2VID:
+    """Stand-in for `E2VID` in a build without the `nn` feature (see `_MissingModel`)."""
+
+    def __init__(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "eventcv was built without native reconstruction, so E2VID is unavailable. Reinstall "
+            "from PyPI (`pip install --force-reinstall eventcv`), or rebuild with "
+            "`maturin develop --features nn`."
+        )
+
+
+E2VID = getattr(_rust, "E2VID", _MissingE2VID)
 Tracker = _rust.Tracker
 UdpSender = _rust.UdpSender
 UdpReceiver = _rust.UdpReceiver
@@ -1052,44 +1066,61 @@ def play(source=None, **kwargs) -> None:
 
 
 def reconstruct(
-    reader,
-    model,
-    path: str,
+    source,
+    model="e2vid",
+    path: str | None = None,
     *,
+    device: str | None = None,
     fps: float = 30.0,
     colormap: str = "grayscale",
     max_frames: int | None = None,
-) -> int:
-    """Reconstruct an intensity video from events, returning the number of frames written.
+):
+    """Reconstruct an intensity video from events.
 
-    ``reader`` must carry the representation the model expects, and ``model`` is an
-    :class:`Model` wrapping any ONNX graph that maps that representation to a single-channel
-    image — E2VID and its relatives::
+    With ``path``, writes the video there and returns the number of frames; without one, returns
+    the frames as an ``(N, H, W)`` float32 array in ``[0, 1]``::
+
+        frames = ecv.reconstruct("recording.h5")
+        ecv.reconstruct("recording.h5", path="out.mp4")
+
+    ``model`` defaults to ``"e2vid"``, which builds an :class:`E2VID` on ``device`` (its weights are
+    downloaded on first use). Given a path, ``EventStream`` or array, ``source`` is cut into the
+    windows the model was trained on — ``events_per_pixel * width * height`` events each; an
+    :class:`EventReader` is used exactly as it is sliced.
+
+    ``model`` can also be an :class:`E2VID` you built (to keep its state, or choose its weights) or
+    a :class:`Model` wrapping any ONNX graph that maps a representation to a single-channel image.
+    A ``Model`` needs an ``EventReader`` opened with that representation::
 
         reader = ecv.open("recording.h5", dt_ms=33, repr="voxel", bins=5)
         ecv.reconstruct(reader, ecv.Model("e2vid.onnx"), "out.mp4")
 
-    EventCV supplies the runner and the tensors, not the weights: there is no official E2VID ONNX
-    export, so export one yourself with ``torch.onnx.export``. A recurrent model must have its
-    hidden state exposed as explicit inputs and outputs; a stateless export (``--no-recurrent``)
-    works as-is.
-
-    The output format comes from ``path``'s extension (``.gif``, ``.apng``, ``.mp4``), and the
-    reconstruction is rendered at its natural scale rather than auto-contrasted, so brightness
-    stays consistent across the sequence.
+    The output format comes from ``path``'s extension (``.gif``, ``.apng``, ``.mp4``), and frames
+    are rendered at their natural scale rather than auto-contrasted, so brightness stays
+    consistent across the sequence.
     """
-    if Model is _MissingModel:
-        raise RuntimeError(
-            "eventcv was built without ONNX support, so reconstruct is unavailable. "
-            "Reinstall from PyPI, or rebuild with `maturin develop --features onnx`."
-        )
-    return _rust.reconstruct(
-        reader,
-        model,
-        path,
-        fps=fps,
-        colormap=colormap,
-        max_frames=max_frames,
+    if isinstance(model, str):
+        if model != "e2vid":
+            raise ValueError(f"unknown model {model!r}; pass 'e2vid', an E2VID or a Model")
+        model = E2VID(device=device)
+    if not isinstance(source, EventReader):
+        if not isinstance(model, E2VID):
+            raise TypeError(
+                "a Model needs an EventReader opened with the representation it expects, "
+                "e.g. ecv.open(path, dt_ms=33, repr='voxel', bins=5)"
+            )
+        source = _trained_windows(source, model)
+    return _rust.reconstruct(source, model, path, fps=fps, colormap=colormap, max_frames=max_frames)
+
+
+def _trained_windows(source, model, **options) -> EventReader:
+    """``source`` cut into the windows ``model`` was trained on: a fixed event count per window."""
+    width, height = open(source, **options).sensor_size
+    return open(
+        source,
+        max_events=round(model.events_per_pixel * width * height),
+        sensor_size=(width, height),
+        **options,
     )
 
 
@@ -1393,6 +1424,7 @@ def collate(batch):
 
 __all__ = [
     "Camera",
+    "E2VID",
     "EventCamera",
     "EventFrame",
     "EventPointSet",
