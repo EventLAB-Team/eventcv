@@ -5439,7 +5439,8 @@ impl PyE2vid {
     /// weights, downloading them once and reusing the cached copy after that.
     ///
     /// `precision` applies on the GPU: `"half"` (default) convolves on the tensor cores, ~3x faster
-    /// and ~1e-3 from the reference; `"single"` matches the reference, as the CPU always does.
+    /// and ~1e-3 from the reference; `"single"` matches the reference, as the CPU always does. A GPU
+    /// without half-precision support (a software adapter, some older drivers) runs `"single"`.
     #[new]
     #[pyo3(signature = (weights=None, *, device=None, precision="half"))]
     fn new(
@@ -5468,12 +5469,12 @@ impl PyE2vid {
         Ok(Self {
             bins: inner.bins(),
             events_per_pixel: inner.events_per_pixel(),
-            inner: Mutex::new(inner),
-            device,
-            precision: match precision_mode {
+            precision: match inner.precision() {
                 eventcv_core::reconstruct::Precision::Half => "half",
                 eventcv_core::reconstruct::Precision::Single => "single",
             },
+            inner: Mutex::new(inner),
+            device,
         })
     }
 
@@ -5514,7 +5515,8 @@ impl PyE2vid {
         self.device.as_str()
     }
 
-    /// `"half"` or `"single"`, as constructed (the CPU computes in single precision either way).
+    /// `"half"` or `"single"`: as constructed, except `"single"` on a GPU without half precision
+    /// (the CPU computes in single precision either way).
     #[getter]
     fn precision(&self) -> &'static str {
         self.precision

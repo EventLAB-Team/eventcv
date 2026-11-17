@@ -128,6 +128,12 @@ tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", optional = true }
 
+# burn's `vulkan` (cubecl's SPIR-V compiler) for `gpu`, everywhere but macOS, where it needs the
+# Vulkan SDK just to build. Reached through burn-core, which is what `burn/vulkan` forwards to: a
+# feature list cannot be target-conditional, and Cargo refuses `burn` itself twice under two names.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+burn-core = { version = "=0.22.1", optional = true, default-features = false }
+
 [dev-dependencies]
 # Benchmarks only. `html_reports` is off to keep the dependency tree small — the terminal output
 # carries the numbers, and the plots need gnuplot or a heavier plotting stack.
@@ -163,13 +169,14 @@ onnx = ["dep:ort", "dep:libloading"]
 # backend, and each of these three is worth having (E2VID, RTX 2080):
 # - `vulkan` adds cubecl's SPIR-V compiler beside WGSL, which is what reaches the tensor cores
 #   (Vulkan cooperative matrices): half-precision matmul ~22 TFLOP/s against ~4.5 through WGSL. It
-#   does not pin the API — the device is still opened on whatever is best here, Metal on macOS.
+#   does not pin the API. Not on macOS (see `burn-core` above), where the device is Metal and burn
+#   compiles WGSL either way.
 # - `autotune` picks kernels per shape (~1.6x a frame), measured in memory only.
 # - `fusion` merges the elementwise work between convolutions: 1.5x a frame at 346x260, 1.9x at
 #   1280x720, once the convolutions themselves run on the tensor cores.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "burn?/vulkan", "burn?/autotune", "burn?/fusion"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "burn?/wgpu", "burn-core?/vulkan", "burn?/autotune", "burn?/fusion"]
 # Native neural reconstruction on burn (CPU always; GPU when `gpu` is on as well).
-nn = ["dep:burn", "dep:burn-flex", "dep:safetensors", "dep:gemm", "dep:libc"]
+nn = ["dep:burn", "dep:burn-core", "dep:burn-flex", "dep:safetensors", "dep:gemm", "dep:libc"]
 # ROS 2 publish/subscribe. Off by default: a wheel that nobody asked to speak ROS 2 should not
 # carry a Zenoh stack. Interoperates with ROS 2 running `rmw_zenoh_cpp`; a DDS deployment needs
 # `zenoh-bridge-ros2dds` in between.

@@ -127,8 +127,8 @@ impl Kernel {
     fn new(device: accel::Device, precision: Precision) -> Self {
         match (device, precision) {
             (accel::Device::Cpu, _) => Self::Native,
-            (accel::Device::Gpu, Precision::Half) => Self::Half,
-            (accel::Device::Gpu, Precision::Single) => Self::Im2col,
+            (accel::Device::Gpu, Precision::Half) if gpu_has_f16() => Self::Half,
+            (accel::Device::Gpu, _) => Self::Im2col,
         }
     }
 
@@ -139,6 +139,21 @@ impl Kernel {
             DType::F32
         }
     }
+}
+
+/// Whether the GPU can compute in f16 at all. Software adapters (WARP on a GPU-less Windows host,
+/// llvmpipe) and some older drivers cannot, and half precision there fails at shader compilation.
+fn gpu_has_f16() -> bool {
+    #[cfg(feature = "gpu")]
+    return accel::gpu::with_context(|context| {
+        context
+            .device
+            .features()
+            .contains(wgpu::Features::SHADER_F16)
+    })
+    .unwrap_or(false);
+    #[cfg(not(feature = "gpu"))]
+    false
 }
 
 /// A convolution as trained, stride 1 or 2 with `kernel / 2` padding.
@@ -423,6 +438,8 @@ pub struct E2vid {
     unsharp: Tensor<4>,
     unsharp_amount: f32,
     device: Device,
+    /// As asked for, except `Half` on a GPU without f16, which runs (and reports) `Single`.
+    precision: Precision,
     /// On the CPU the ConvLSTM step runs on the host (see [`convlstm_host`]).
     cpu: bool,
     state: Option<State>,
@@ -543,6 +560,11 @@ impl E2vid {
             unsharp: weight("unsharp.kernel")?,
             unsharp_amount: number("unsharp_amount")? as f32,
             device,
+            precision: if kernel == Kernel::Im2col {
+                Precision::Single
+            } else {
+                precision
+            },
             cpu: kernel == Kernel::Native,
             state: None,
         })
@@ -557,6 +579,11 @@ impl E2vid {
     /// `events_per_pixel * width * height` events.
     pub fn events_per_pixel(&self) -> f64 {
         self.events_per_pixel
+    }
+
+    /// The precision the GPU computes in: `Half` falls back to `Single` on a GPU without f16.
+    pub fn precision(&self) -> Precision {
+        self.precision
     }
 
     /// Forgets the recurrent state, so the next window starts a new sequence.

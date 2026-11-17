@@ -50,7 +50,9 @@ the device the rest of EventCV's kernels use.
 ### Speed and precision
 
 On the GPU the convolutions run in half precision on the tensor cores by default, which is what
-makes the GPU worth using. `precision="single"` keeps everything in single precision instead. On
+makes the GPU worth using. `precision="single"` keeps everything in single precision instead, and
+is what a GPU without half-precision support (a software adapter, some older drivers) runs either
+way — `model.precision` says which one you got. On
 an RTX 2080 and an i7-9700K, a frame — voxel grid, network, sharpening and copy back included —
 takes:
 
