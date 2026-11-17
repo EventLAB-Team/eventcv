@@ -29,6 +29,8 @@ egui-wgpu = "=0.37.0"
 # Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and
 # the CLI path remain available when a desktop portal is absent.
 rfd = "=0.18.0"
+# Bridges `EventCamera.configuration` / `update_configuration` to the driver's serde config.
+serde_json = { version = "1", optional = true }
 
 [features]
 # Build `.h5`/`.hdf5` support into the extension (forwards to eventcv-core, which
