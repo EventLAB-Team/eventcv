@@ -9,6 +9,7 @@
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/eventcv?period=monthly&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=GREEN&left_text=PyPi+downloads/month)](https://pepy.tech/projects/eventcv)
 [![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/eventcv.svg?label=Conda%20downloads)](
 https://anaconda.org/conda-forge/eventcv)
+![Discord](https://img.shields.io/discord/1572116415547318323)
 
 EventCV is "OpenCV" for event-based data and computer vision applications.
 
