@@ -1,14 +1,11 @@
-<h1 align="center">
-<img src="https://eventcv.net/wp-content/uploads/2026/10/logo.svg" width="200">
-</h1><br>
-
-
 <div align="center">
 
-# EventCV: The open-source event-based computer vision library
+<img src="https://eventcv.net/wp-content/uploads/2026/10/logo.svg" width="200">
+
+#  _The open-source event-based computer vision library_
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=flat-square&logo=rust&logoColor=white&logoSize=auto)
 ![Python](https://img.shields.io/badge/python-3670A0?style=flat-square&logo=python&logoColor=ffdd54&logoSize=auto)
-[![PyPI - Version](https://img.shields.io/pypi/v/eventcv?style=flat-square&label=PyPI&logoColor=ffffff&logoSize=auto)](https://pypi.org/project/eventcv/)
+[![PyPI - Version](https://img.shields.io/pypi/v/eventcv?style=flat-square&label=PyPI&logo=pypi&logoColor=ffffff&logoSize=auto)](https://pypi.org/project/eventcv/)
 [![Conda Version](https://img.shields.io/conda/vn/conda-forge/eventcv.svg?style=flat-square&logo=Anaconda&logoColor=ffffff&logoSize=auto)](https://anaconda.org/conda-forge/eventcv)
 
 [![PyPI Downloads](https://img.shields.io/pypi/dm/eventcv?style=flat-square&label=PyPI%20downloads&labelColor=grey&color=green)](https://pepy.tech/projects/eventcv)
@@ -16,31 +13,58 @@
 https://anaconda.org/conda-forge/eventcv)
 [![Discord](https://img.shields.io/discord/1572116415547318323?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=%235865F2&color=%235b209a)](https://eventcv.net/discord)
 
-_EventCV is "OpenCV" for event-based computer vision applications._
+**EventCV** is "OpenCV" for computer vision applications using **event cameras** and **event-based** data.
+
+_Supported for:_ 
+
+<img src="https://cdn.simpleicons.org/linux" width="60" height="60" alt="Linux">
+<img src="https://cdn.simpleicons.org/apple/FFFFFF" width="60" height="60" alt="Apple"> &nbsp;
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/windows11/windows11-original.svg" width="60" height="60" alt="Windows">
 
 </div>
 
-## Resources
-- **Website** - https://eventcv.net
-- **Documentation** - https://docs.eventcv.net
-- **Rust core API** - https://docs.rs/eventcv-core
-- **Discord Server** - https://eventcv.net/discord
-- **Supported event cameras** - [https://github.com/neuromorphicsystems](https://github.com/neuromorphicsystems/neuromorphic-drivers#supported-devices)
-
 ## Installation
+<div align="center">
+<table>
+<tr>
+<td align="center"><img src="https://cdn.simpleicons.org/pypi" width="60" height="60" alt="PyPI"><br><b>pip</b></td>
+<td>
+
 ```console
-# pip
 pip install eventcv
+```
 
-# conda
-conda install eventcv
+</td>
+<td align="center"><img src="https://cdn.simpleicons.org/anaconda" width="60" height="60" alt="Anaconda"><br><b>conda</b></td>
+<td>
 
-# pixi
+```console
+conda install -c conda-forge eventcv
+```
+
+</td>
+</tr>
+<tr>
+<td align="center"><img src="https://raw.githubusercontent.com/prefix-dev/pixi/main/docs/assets/pixi.png" width="60" height="60" alt="Pixi"><br><b>pixi</b></td>
+<td>
+
+```console
 pixi add eventcv
+```
 
-# cURL
+</td>
+<td align="center"><img src="https://cdn.simpleicons.org/curl" width="60" height="60" alt="cURL"><br><b>cURL</b></td>
+<td>
+
+```console
 curl -fsSL https://eventcv.net/install | sh
 ```
+
+</td>
+</tr>
+</table>
+
+</div>
 
 ## Getting started
 ### Basic usage
@@ -58,6 +82,14 @@ ecv.stream().show()
 ```
 > [!IMPORTANT]
 > Linux users will need to set UDEV rules for using cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
+
+## Resources
+- <img src="https://cdn.simpleicons.org/discord" width="20" height="20" align="absmiddle" alt="Discord"> **Discord Server** - https://eventcv.net/discord
+- <img src="https://cdn.simpleicons.org/readthedocs/FFFFFF" width="20" height="20" align="absmiddle" alt="Read the docs"> **Documentation** - https://docs.eventcv.net
+- <img src="https://cdn.simpleicons.org/rust/D34516" width="20" height="20" align="absmiddle" alt="Rust"> **Rust core API** - https://docs.rs/eventcv-core
+- 🔧 **Supported event cameras** - [https://github.com/neuromorphicsystems](https://github.com/neuromorphicsystems/neuromorphic-drivers#supported-devices)
+- 📚 **Tutorials** - https://eventcv.net/tutorials
+- 🌐 **Website** - https://eventcv.net
 
 ## Contributing
 EventCV is an open-sourced project for the event-based computer vision community. We welcome and appreciate contributions from users who would like to propose improvements or feature additions.
