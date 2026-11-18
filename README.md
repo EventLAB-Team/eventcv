@@ -25,7 +25,7 @@ _EventCV is "OpenCV" for event-based computer vision applications._
 - **Documentation** - https://docs.eventcv.net
 - **Rust core API** - https://docs.rs/eventcv-core
 - **Discord Server** - https://eventcv.net/discord
-- **Supported event cameras** - https://github.com/neuromorphicsystems/neuromorphic-drivers#supported-devices
+- **Supported event cameras** - [https://github.com/neuromorphicsystems](https://github.com/neuromorphicsystems/neuromorphic-drivers#supported-devices)
 
 ## Installation
 ```console
@@ -50,8 +50,11 @@ import eventcv as ecv
 # open an event stream file
 events = ecv.open("events.hdf5")
 
+# slice events and generate an event represenetation
+slice = ecv.open("events.hdf5", repr="voxel").slice(100)
+
 # stream from an event camera
-ecv.stream()
+ecv.stream().show()
 ```
 > [!IMPORTANT]
 > Linux users will need to set UDEV rules for using cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
