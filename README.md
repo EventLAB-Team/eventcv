@@ -18,7 +18,7 @@ https://anaconda.org/conda-forge/eventcv)
 _Supported for:_ 
 
 <img src="https://cdn.simpleicons.org/linux" width="60" height="60" alt="Linux">
-<img src="https://cdn.simpleicons.org/apple/FFFFFF" width="60" height="60" alt="Apple"> &nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/apple/FFFFFF"><img src="https://cdn.simpleicons.org/apple/000000" width="60" height="60" alt="Apple"></picture> &nbsp;
 <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/windows11/windows11-original.svg" width="60" height="60" alt="Windows">
 
 </div>
@@ -26,8 +26,9 @@ _Supported for:_
 ## Installation
 <div align="center">
 <table>
+<tbody>
 <tr>
-<td align="center"><img src="https://cdn.simpleicons.org/pypi" width="60" height="60" alt="PyPI"><br><b>pip</b></td>
+<td align="center"><img src="https://cdn.simpleicons.org/pypi" width="50" height="50" alt="PyPI"><br><b>pip</b></td>
 <td>
 
 ```console
@@ -35,7 +36,7 @@ pip install eventcv
 ```
 
 </td>
-<td align="center"><img src="https://cdn.simpleicons.org/anaconda" width="60" height="60" alt="Anaconda"><br><b>conda</b></td>
+<td align="center"><img src="https://cdn.simpleicons.org/anaconda" width="50" height="50" alt="Anaconda"><br><b>conda</b></td>
 <td>
 
 ```console
@@ -44,8 +45,10 @@ conda install -c conda-forge eventcv
 
 </td>
 </tr>
+</tbody>
+<tbody>
 <tr>
-<td align="center"><img src="https://raw.githubusercontent.com/prefix-dev/pixi/main/docs/assets/pixi.png" width="60" height="60" alt="Pixi"><br><b>pixi</b></td>
+<td align="center"><img src="https://raw.githubusercontent.com/prefix-dev/pixi/main/docs/assets/pixi.png" width="50" height="50" alt="Pixi"><br><b>pixi</b></td>
 <td>
 
 ```console
@@ -53,7 +56,7 @@ pixi add eventcv
 ```
 
 </td>
-<td align="center"><img src="https://cdn.simpleicons.org/curl" width="60" height="60" alt="cURL"><br><b>cURL</b></td>
+<td align="center"><img src="https://cdn.simpleicons.org/curl" width="50" height="50" alt="cURL"><br><b>cURL</b></td>
 <td>
 
 ```console
@@ -62,6 +65,7 @@ curl -fsSL https://eventcv.net/install | sh
 
 </td>
 </tr>
+</tbody>
 </table>
 
 </div>
@@ -81,7 +85,7 @@ slice = ecv.open("events.hdf5", repr="voxel").slice(100)
 ecv.stream().show()
 ```
 > [!IMPORTANT]
-> Linux users will need to set UDEV rules for using cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
+> Linux users will need to set UDEV rules to stream from cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
 
 ## Resources
 - <img src="https://cdn.simpleicons.org/discord" width="20" height="20" align="absmiddle" alt="Discord"> **Discord Server** - https://eventcv.net/discord
