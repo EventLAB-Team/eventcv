@@ -1,0 +1,29 @@
+[package]
+name = "eventcv-cli"
+version.workspace = true
+edition = "2021"
+description = "Standalone EventCV command line and terminal viewer."
+license = "Apache-2.0"
+repository = "https://github.com/EventLAB-Team/eventcv"
+# Installed from the GitHub release binaries (scripts/install.sh), not crates.io.
+publish = false
+
+[lib]
+name = "eventcv_cli"
+
+[[bin]]
+name = "eventcv"
+path = "src/main.rs"
+
+[dependencies]
+eventcv-core = { path = "../eventcv-core" }
+clap = { version = "4.6", features = ["derive"] }
+# Through ratatui's re-export (`ratatui::crossterm`), so the two can never disagree on a version.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ctrlc = "3"
+
+[features]
+# Off by default like the core's, so `cargo test --workspace` never builds libhdf5. The release
+# binaries are built with `--features hdf5,camera`.
+hdf5 = ["eventcv-core/hdf5"]
+camera = ["eventcv-core/camera"]

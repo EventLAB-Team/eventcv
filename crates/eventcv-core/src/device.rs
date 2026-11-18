@@ -39,6 +39,15 @@ const TIMESTAMP_SCALE_MS: f64 = 0.001;
 /// events that arrive between polls.
 const POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// Wall-clock budget a live display spends **decoding** events per frame, for
+/// [`Capture::drain_events_budgeted`]. At very high event rates (a 1280×720 Prophesee sensor can
+/// emit hundreds of millions of events per second) decoding a whole frame's worth of events takes
+/// far longer than a display frame, so a viewer decodes only this much of the freshest data each
+/// frame and drops the surplus — keeping the display at ~60 FPS instead of stalling to a couple of
+/// frames per second. The dropped events are invisible at that rate anyway. Iteration/`record` are
+/// unaffected (they process every event).
+pub const LIVE_DRAIN_BUDGET_MS: u64 = 10;
+
 /// A camera discovered by [`list_cameras`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CameraInfo {
@@ -513,6 +522,8 @@ pub struct Capture {
     roi: Option<((usize, usize, usize, usize), RoiPlacement)>,
     /// Collects the APS and IMU streams when [`collect_aux`](Self::collect_aux) turned them on.
     aux: Aux,
+    /// Buffers [`drain_events_budgeted`](Self::drain_events_budgeted) skipped undecoded, so far.
+    budget_dropped: usize,
     width: usize,
     height: usize,
     name: String,
@@ -587,6 +598,7 @@ impl Capture {
                 (rect, placement)
             }),
             aux: Aux::default(),
+            budget_dropped: 0,
             width,
             height,
             name,
@@ -701,6 +713,13 @@ impl Capture {
     /// behind the camera.
     pub fn backlog(&self) -> usize {
         self.device.backlog()
+    }
+
+    /// Buffers [`drain_events_budgeted`](Self::drain_events_budgeted) has dropped undecoded since
+    /// the camera opened. Buffers, not events: a skipped buffer is never decoded, so how many
+    /// events it held is unknown.
+    pub fn n_budget_dropped(&self) -> usize {
+        self.budget_dropped
     }
 
     /// The region-of-interest mask events are filtered through, if any.
@@ -945,6 +964,7 @@ impl Capture {
             if !decoding {
                 // Over budget: drop the buffer, freeing its ring slot without decoding.
                 dropped = true;
+                self.budget_dropped += 1;
                 continue;
             }
             convert_buffer(
