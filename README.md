@@ -2,22 +2,30 @@
 <img src="https://eventcv.net/wp-content/uploads/2026/10/logo.svg" width="200">
 </h1><br>
 
-# EventCV: Open source event-based computer vision library
-![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
-![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
-[![PyPI - Version](https://img.shields.io/pypi/v/eventcv)](https://pypi.org/project/eventcv/)
-[![PyPI Downloads](https://static.pepy.tech/personalized-badge/eventcv?period=monthly&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=GREEN&left_text=PyPi+downloads/month)](https://pepy.tech/projects/eventcv)
-[![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/eventcv.svg?label=Conda%20downloads)](
-https://anaconda.org/conda-forge/eventcv)
-![Discord](https://img.shields.io/discord/1572116415547318323?style=flat&logo=discord&logoColor=%23FFFFFF&logoSize=auto&label=Discord&labelColor=%235865F2&color=%235b209a&link=https%3A%2F%2Feventcv.net%2Fdiscord)
 
-EventCV is the open-source library for event-based computer vision applications.
+<div align="center">
+
+# EventCV: The open-source event-based computer vision library
+![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=flat-square&logo=rust&logoColor=white&logoSize=auto)
+![Python](https://img.shields.io/badge/python-3670A0?style=flat-square&logo=python&logoColor=ffdd54&logoSize=auto)
+[![PyPI - Version](https://img.shields.io/pypi/v/eventcv?style=flat-square&label=PyPI&logoColor=ffffff&logoSize=auto)](https://pypi.org/project/eventcv/)
+[![Conda Version](https://img.shields.io/conda/vn/conda-forge/eventcv.svg?style=flat-square&logo=Anaconda&logoColor=ffffff&logoSize=auto)](https://anaconda.org/conda-forge/eventcv)
+
+[![PyPI Downloads](https://img.shields.io/pypi/dm/eventcv?style=flat-square&label=PyPI%20downloads&labelColor=grey&color=green)](https://pepy.tech/projects/eventcv)
+[![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/eventcv.svg?style=flat-square&label=Conda%20downloads)](
+https://anaconda.org/conda-forge/eventcv)
+[![Discord](https://img.shields.io/discord/1572116415547318323?style=flat-square&logo=discord&logoColor=white&label=Discord&labelColor=%235865F2&color=%235b209a)](https://eventcv.net/discord)
+
+_EventCV is "OpenCV" for event-based computer vision applications._
+
+</div>
 
 ## Resources
 - **Website** - https://eventcv.net
 - **Documentation** - https://docs.eventcv.net
 - **Rust core API** - https://docs.rs/eventcv-core
-- **Discord Server** - 
+- **Discord Server** - https://eventcv.net/discord
+- **Supported event cameras** - https://github.com/neuromorphicsystems/neuromorphic-drivers#supported-devices
 
 ## Installation
 ```console
@@ -31,8 +39,22 @@ conda install eventcv
 pixi add eventcv
 
 # cURL
-curl -fsSL https://eventcv.com/install | sh
+curl -fsSL https://eventcv.net/install | sh
 ```
+
+## Getting started
+### Basic usage
+```python
+import eventcv as ecv
+
+# open an event stream file
+events = ecv.open("events.hdf5")
+
+# stream from an event camera
+ecv.stream()
+```
+> [!IMPORTANT]
+> Linux users will need to set UDEV rules for using cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
 
 ## Contributing
 EventCV is an open-sourced project for the event-based computer vision community. We welcome and appreciate contributions from users who would like to propose improvements or feature additions.
