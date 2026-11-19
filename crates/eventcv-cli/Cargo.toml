@@ -24,7 +24,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Sixel and iTerm2 sequences written directly; see `tui/pixels.rs` for why not the crate's.
-icy_sixel = "0.5"
+icy_sixel = "0.7"
 base64-simd = "0.8"
 ctrlc = "3"
 
