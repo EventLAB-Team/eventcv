@@ -92,7 +92,7 @@ Simply run `eventcv` for an intuitive, smooth TUI in your terminal that **stream
 
 <div align="center">
 
-![EventCV Demo](https://eventcv.net/videos/tui.webp)
+![EventCV Demo](https://eventcv.net/videos/tui480p.webp)
 
 </div>
 
