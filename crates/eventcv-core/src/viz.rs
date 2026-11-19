@@ -503,8 +503,9 @@ pub struct RawSurface {
     // Precomputed `exp(-age / decay_ms)` over quantized age buckets spanning `[0, cutoff]`, indexed
     // by `(age / decay_lut_step) as usize`. Replaces a per-pixel `exp()` call (expensive on cores
     // without a fast hardware transcendental path) with an array lookup — the render loop visits
-    // every pixel each frame, so this matters at real sensor resolutions and event rates.
-    decay_lut: Vec<f32>,
+    // every pixel each frame, so this matters at real sensor resolutions and event rates. Stored as
+    // the faded `[RAW_NEGATIVE, RAW_POSITIVE]` colours, so the loop does no float work per channel.
+    decay_lut: Vec<[[u8; 3]; 2]>,
     decay_cutoff: f64,
     decay_lut_step: f64,
 }
@@ -518,7 +519,11 @@ impl RawSurface {
         let decay_cutoff = decay_ms * 6.5;
         let decay_lut_step = decay_cutoff / (DECAY_LUT_LEN - 1) as f64;
         let decay_lut = (0..DECAY_LUT_LEN)
-            .map(|i| (-(i as f64 * decay_lut_step) / decay_ms).exp() as f32)
+            .map(|i| {
+                let intensity = (-(i as f64 * decay_lut_step) / decay_ms).exp() as f32;
+                [RAW_NEGATIVE, RAW_POSITIVE]
+                    .map(|color| color.map(|c| (f32::from(c) * intensity).round() as u8))
+            })
             .collect();
         Self {
             width,
@@ -614,16 +619,8 @@ impl RawSurface {
                 continue;
             }
             let bucket = ((age / self.decay_lut_step) as usize).min(DECAY_LUT_LEN - 1);
-            let intensity = self.decay_lut[bucket];
-            let color = if self.last_positive[index] {
-                RAW_POSITIVE
-            } else {
-                RAW_NEGATIVE
-            };
-            let base = index * 3;
-            for channel in 0..3 {
-                pixels[base + channel] = (f32::from(color[channel]) * intensity).round() as u8;
-            }
+            let color = self.decay_lut[bucket][usize::from(self.last_positive[index])];
+            pixels[index * 3..index * 3 + 3].copy_from_slice(&color);
         }
         Rgb8Image {
             width: self.width,

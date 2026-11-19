@@ -6,6 +6,7 @@
 //! driver backlog, overflows, decode drops and the adaptive-bias state.
 
 mod draw;
+mod filters;
 mod home;
 mod pixels;
 mod source;
@@ -18,6 +19,7 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Args, Parser};
+use eventcv_core::filter::Pipeline;
 use eventcv_core::representation::ReprSpec;
 use eventcv_core::viz::{Colormap, RawSurface, RenderView, Rgb8Image, Scale};
 use eventcv_core::EventStream;
@@ -28,6 +30,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use crate::camera::CameraOptions;
 use crate::commands::{duration_us, parse_colormap, Source};
 use crate::Failure;
+use filters::Filters;
 use home::{Action, Home, Target};
 use pixels::Pixels;
 use source::{FileFeed, Step};
@@ -166,8 +169,9 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
             (None, None) => unreachable!("there is always a viewer or the home screen"),
         })?;
         let deadline = now + tick;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            if !event::poll(remaining)? {
+        // Keys are read even when the frame overran its tick, or a slow frame would lock them out.
+        loop {
+            if !event::poll(deadline.saturating_duration_since(Instant::now()))? {
                 break;
             }
             let Event::Key(key) = event::read()? else {
@@ -269,6 +273,11 @@ struct App {
     back: bool,
     /// The image in real pixels, when the terminal has a graphics protocol; otherwise half blocks.
     pixels: Option<Pixels>,
+    filters: Filters,
+    /// The enabled filters, run on the events as they arrive.
+    pipeline: Pipeline,
+    /// The window being typed in, in milliseconds, after `w`.
+    typing: Option<String>,
 }
 
 impl App {
@@ -323,6 +332,9 @@ impl App {
             theme: Theme::detect(),
             back: false,
             pixels: None,
+            filters: Filters::default(),
+            pipeline: Pipeline::default(),
+            typing: None,
         };
         app.rebuild_view()?;
         Ok(app)
@@ -377,6 +389,7 @@ impl App {
             #[cfg(feature = "camera")]
             Feed::Live(feed) => feed.reset(),
         }
+        self.pipeline.reset();
         Ok(())
     }
 
@@ -396,10 +409,10 @@ impl App {
         let step = match &mut self.feed {
             Feed::File(feed) => {
                 feed.playback.advance(elapsed);
-                feed.step(self.dt_us, lookback)?
+                feed.step(self.dt_us, lookback, &mut self.pipeline)?
             }
             #[cfg(feature = "camera")]
-            Feed::Live(feed) => feed.step(self.dt_us, self.paused)?,
+            Feed::Live(feed) => feed.step(self.dt_us, self.paused, &mut self.pipeline)?,
         };
         let Some(Step { fresh, window }) = step else {
             return Ok(());
@@ -434,6 +447,32 @@ impl App {
     /// Handles one key; `false` means quit.
     #[cfg_attr(not(feature = "camera"), allow(irrefutable_let_patterns))]
     fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if let Some(text) = &mut self.typing {
+            match code {
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => text.push(c),
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Enter => {
+                    if let Ok(ms) = text.parse::<f64>() {
+                        self.dt_us =
+                            ((ms * 1000.0).round() as i64).clamp(DT_RANGE_US.0, DT_RANGE_US.1);
+                        let _ = self.rebuild_view();
+                    }
+                    self.typing = None;
+                }
+                KeyCode::Esc => self.typing = None,
+                _ => {}
+            }
+            return true;
+        }
+        if let Some(changed) = self.filters.key(code) {
+            if changed {
+                self.pipeline = self.filters.pipeline();
+                let _ = self.rebuild_view();
+            }
+            return true;
+        }
         let mut rebuild = false;
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
@@ -477,6 +516,7 @@ impl App {
                 self.dt_us = dt_us.clamp(DT_RANGE_US.0, DT_RANGE_US.1);
                 rebuild = true;
             }
+            KeyCode::Char('w') => self.typing = Some(String::new()),
             KeyCode::Char('r') => {
                 self.view_index = (self.view_index + 1) % (ReprSpec::NAMES.len() + 1);
                 rebuild = true;

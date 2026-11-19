@@ -90,6 +90,9 @@ ecv.stream().show()
 ### Text-based user interface (TUI)
 
 
+> [!TIP]
+> For best results, we recommend using a high-resolution terminal, [such as Kitty.](https://sw.kovidgoyal.net/kitty/)
+
 ## Resources
 - <img src="https://cdn.simpleicons.org/discord" width="20" align="absmiddle" alt="Discord"> **Discord Server** - https://eventcv.net/discord
 - <img src="https://cdn.simpleicons.org/readthedocs/FFFFFF" width="20" align="absmiddle" alt="Read the docs"> **Documentation** - https://docs.eventcv.net

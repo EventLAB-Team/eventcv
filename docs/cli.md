@@ -165,6 +165,8 @@ block it shrinks, so a lone event does not vanish into the average.
 | `←` `→` | seek a second back / forward (recordings) |
 | `+` `-` | double / halve the playback speed (recordings) |
 | `[` `]` | halve / double the window on screen, between 0.1 ms and 1 s |
+| `w` | type the window in milliseconds, then `enter` (`Esc` cancels) |
+| `f` | the filter box: `↑` `↓` pick a filter, `space` turns it on or off, `←` `→` tune it, `f` or `Esc` leaves |
 | `r` | next view: raw, then each representation in turn |
 | `q`, `Esc`, `Ctrl-C` | quit |
 
@@ -180,6 +182,13 @@ its health:
 
 Below that, for the window on screen: the event count, the ON/OFF split, the rate, and a sparkline
 of the rate over time.
+
+The filter box runs the same denoising filters as the GUI viewer on the events as they arrive:
+**background** activity (drops events with no neighbour within its time, default 25 ms),
+**refractory** (a pixel's dead time after it fires, default 1 ms) and **hot pixels** (drops pixels
+firing more than the set number of standard deviations above the rest, default 3σ, from counts that
+add up while the view runs). Times step through 10 µs … 1 s in 1-2-5 steps. With any filter on, the
+counts, the rate (labelled `kept`) and the sparkline are of what the filters keep.
 
 Flags: `--dt-ms` (window, default 30), `--repr`, `--decay-ms`, `--colormap` and `--speed` as for
 `play`, and `--refresh-hz` (default 30 — a full-colour screen is a lot of bytes, so lower it over a

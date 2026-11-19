@@ -19,9 +19,12 @@ use ratatui_image::{Image, Resize};
 
 use super::draw::{downsample, fit};
 
-/// One id for every frame, so each Kitty transmission replaces the last image instead of piling up
-/// a new one in the terminal at every refresh.
-const KITTY_ID: u32 = 0x00ec_0001;
+/// Frames take these Kitty ids in turn, so each transmission replaces an old image instead of
+/// piling up a new one at every refresh. The id is the placeholders' colour, so a fresh one makes
+/// ratatui rewrite every cell; with a single id it rewrites only the first, and Kitty re-places the
+/// new image on that row alone. Three, as up to two frames can finish between draws, so the frame
+/// shown never shares an id with the one on screen.
+const KITTY_IDS: [u32; 3] = [0x00ec_0001, 0x00ec_0002, 0x00ec_0003];
 
 /// Encodes frames on a worker thread: a full-screen Sixel frame takes ~100 ms, which on the UI
 /// thread would stall the keys and the camera drain. While the worker is busy, newer frames
@@ -44,8 +47,8 @@ impl Pixels {
         let (outbox, done) = mpsc::channel();
         // Ends once the viewer drops `jobs`.
         std::thread::spawn(move || {
-            for (image, area) in inbox {
-                if let Some(encoded) = encode(&picker, &image, area) {
+            for ((image, area), kitty_id) in inbox.into_iter().zip(KITTY_IDS.into_iter().cycle()) {
+                if let Some(encoded) = encode(&picker, &image, area, kitty_id) {
                     if outbox.send(encoded).is_err() {
                         break;
                     }
@@ -115,7 +118,12 @@ enum Encoded {
 
 /// `image` scaled to fill `area` at the terminal's font size by the half-block view's
 /// brightest-pixel rule, centred, and encoded for the terminal's protocol.
-fn encode(picker: &Picker, image: &Rgb8Image, area: Rect) -> Option<(Encoded, Rect)> {
+fn encode(
+    picker: &Picker,
+    image: &Rgb8Image,
+    area: Rect,
+    kitty_id: u32,
+) -> Option<(Encoded, Rect)> {
     let font = picker.font_size();
     let (font_width, font_height) = (usize::from(font.width), usize::from(font.height));
     let (width, height) = fit(
@@ -168,7 +176,7 @@ fn encode(picker: &Picker, image: &Rgb8Image, area: Rect) -> Option<(Encoded, Re
                     Kitty::new(
                         image.into(),
                         cells,
-                        KITTY_ID,
+                        kitty_id,
                         tmux,
                         picker
                             .capabilities()

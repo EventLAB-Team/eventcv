@@ -69,11 +69,12 @@ pub(super) fn downsample(image: &Rgb8Image, width: usize, height: usize) -> Vec<
         let start = index * source / out;
         start..((index + 1) * source / out).max(start + 1)
     };
+    // The same for every row, so worked out once rather than per pixel.
+    let columns: Vec<_> = (0..width).map(|x| span(x, width, image.width)).collect();
     let mut pixels = Vec::with_capacity(width * height);
     for y in 0..height {
         let rows = span(y, height, image.height);
-        for x in 0..width {
-            let columns = span(x, width, image.width);
+        for columns in &columns {
             let mut brightest = [0u8; 3];
             for source_y in rows.clone() {
                 for source_x in columns.clone() {
