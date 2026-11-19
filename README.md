@@ -88,10 +88,17 @@ ecv.stream().show()
 > Linux users will need to set UDEV rules to stream from cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
 
 ### Text-based user interface (TUI)
+Simply run `eventcv` for an intuitive, smooth TUI in your terminal that **streams from cameras** and **plays back recordings**.
 
+<div align="center">
+
+![EventCV Demo](https://eventcv.net/videos/tui.webp)
+
+</div>
 
 > [!TIP]
 > For best results, we recommend using a high-resolution terminal, [such as Kitty.](https://sw.kovidgoyal.net/kitty/)
+
 
 ## Resources
 - <img src="https://cdn.simpleicons.org/discord" width="20" align="absmiddle" alt="Discord"> **Discord Server** - https://eventcv.net/discord
