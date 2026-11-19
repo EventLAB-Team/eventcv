@@ -22,7 +22,8 @@ bytemuck = { version = "1", features = ["derive"] }
 # Immediate-mode controls drawn into the viewer's existing winit/wgpu event loop. Keep the egui
 # crates on one release and wgpu on the version used by egui-wgpu, so Cargo links one graphics
 # stack rather than multiple incompatible versions.
-egui = "=0.37.0"
+# egui 0.37 no longer bundles its fonts by default; without them every glyph renders as a box.
+egui = { version = "=0.37.0", features = ["default_fonts"] }
 egui-winit = { version = "=0.37.0", features = ["accesskit"] }
 egui-wgpu = "=0.37.0"
 # Native file chooser (XDG portal on Linux, platform dialogs on macOS/Windows). Drag-and-drop and

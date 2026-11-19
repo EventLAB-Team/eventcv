@@ -12,7 +12,7 @@ pub mod tui;
 
 use std::ffi::OsString;
 use std::fmt::Display;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -169,6 +169,11 @@ where
         return 0;
     }
     let Some(command) = cli.command else {
+        // At a terminal, a bare `eventcv` opens the home screen; anywhere else (a pipe, a script)
+        // it prints the help it always has.
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return tui::main(["eventcv"]);
+        }
         let _ = Cli::command().print_help();
         return 0;
     };

@@ -87,6 +87,9 @@ ecv.stream().show()
 > [!IMPORTANT]
 > Linux users will need to set UDEV rules to stream from cameras, [click for more details.](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules)
 
+### Text-based user interface (TUI)
+
+
 ## Resources
 - <img src="https://cdn.simpleicons.org/discord" width="20" align="absmiddle" alt="Discord"> **Discord Server** - https://eventcv.net/discord
 - <img src="https://cdn.simpleicons.org/readthedocs/FFFFFF" width="20" align="absmiddle" alt="Read the docs"> **Documentation** - https://docs.eventcv.net

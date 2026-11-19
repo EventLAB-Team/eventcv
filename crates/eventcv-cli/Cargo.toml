@@ -20,6 +20,12 @@ eventcv-core = { path = "../eventcv-core" }
 clap = { version = "4.6", features = ["derive"] }
 # Through ratatui's re-export (`ratatui::crossterm`), so the two can never disagree on a version.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# Real pixels through the Kitty, Sixel or iTerm2 protocols, where the terminal speaks one.
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Sixel and iTerm2 sequences written directly; see `tui/pixels.rs` for why not the crate's.
+icy_sixel = "0.5"
+base64-simd = "0.8"
 ctrlc = "3"
 
 [features]
