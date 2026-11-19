@@ -53,9 +53,6 @@ conda install -c conda-forge eventcv
 
 ```console
 pixi add eventcv
-
-# system
-curl -LsSf https://github.com/EventLAB-Team/eventcv/releases/latest/download/install.sh | sh
 ```
 
 </td>
