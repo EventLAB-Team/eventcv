@@ -3778,7 +3778,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-cli"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "base64-simd",
  "clap",
@@ -3792,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-core"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "burn",
  "burn-core",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "eventcv-py"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "bytemuck",
  "egui",
