@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, Pos2, Stroke, TextureHandle, TextureOptions, Vec2};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
+use eventcv_core::filter::{BackgroundProcessor, Pipeline, Processor, RefractoryProcessor};
 use eventcv_core::io::{self, LoadOptions, MemorySliceSource, Reader};
 use eventcv_core::viz::{Colormap, RawSurface, Rgb8Image, Scale};
 use eventcv_core::EventStream;
@@ -225,120 +226,9 @@ impl ProcessorConfig {
     }
 }
 
-/// Internal compiled-in processor boundary. The retained input tail makes the existing stateless
-/// EventStream filters behave continuously across playback windows and later live-camera packets.
-trait Processor: Send {
-    fn lookback_us(&self) -> i64;
-    fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream;
-    fn reset(&mut self);
-}
-
-fn process_with_history(
-    history: &mut Option<EventStream>,
-    dt_us: i64,
-    window: (i64, i64),
-    stream: EventStream,
-    filter: impl FnOnce(&EventStream) -> EventStream,
-) -> EventStream {
-    let combined = match history.take() {
-        Some(previous) if !previous.is_empty() => previous.concat(&[&stream]),
-        _ => stream,
-    };
-    let filtered = filter(&combined).time_window(window.0, window.1);
-    *history = Some(combined.time_window(window.1.saturating_sub(dt_us), window.1));
-    filtered
-}
-
-struct BackgroundProcessor {
-    dt_us: i64,
-    history: Option<EventStream>,
-}
-
-impl BackgroundProcessor {
-    fn new(dt_us: i64) -> Self {
-        Self {
-            dt_us: dt_us.max(1),
-            history: None,
-        }
-    }
-}
-
-impl Processor for BackgroundProcessor {
-    fn lookback_us(&self) -> i64 {
-        self.dt_us
-    }
-
-    fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream {
-        process_with_history(&mut self.history, self.dt_us, window, stream, |events| {
-            events.background_activity_filter(self.dt_us)
-        })
-    }
-
-    fn reset(&mut self) {
-        self.history = None;
-    }
-}
-
-struct RefractoryProcessor {
-    dt_us: i64,
-    history: Option<EventStream>,
-}
-
-impl RefractoryProcessor {
-    fn new(dt_us: i64) -> Self {
-        Self {
-            dt_us: dt_us.max(1),
-            history: None,
-        }
-    }
-}
-
-impl Processor for RefractoryProcessor {
-    fn lookback_us(&self) -> i64 {
-        self.dt_us
-    }
-
-    fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream {
-        process_with_history(&mut self.history, self.dt_us, window, stream, |events| {
-            events.refractory_filter(self.dt_us)
-        })
-    }
-
-    fn reset(&mut self) {
-        self.history = None;
-    }
-}
-
-struct Pipeline {
-    processors: Vec<Box<dyn Processor>>,
-}
-
-impl Pipeline {
-    fn new(config: &[ProcessorConfig]) -> Self {
-        Self {
-            processors: config.iter().filter_map(ProcessorConfig::build).collect(),
-        }
-    }
-
-    fn lookback_us(&self) -> i64 {
-        // Chained filters can extend one another's required input history, so sum is the safe bound.
-        self.processors.iter().fold(0_i64, |total, processor| {
-            total.saturating_add(processor.lookback_us())
-        })
-    }
-
-    fn reset(&mut self) {
-        for processor in &mut self.processors {
-            processor.reset();
-        }
-    }
-
-    fn process(&mut self, window: (i64, i64), mut stream: EventStream) -> EventStream {
-        for processor in &mut self.processors {
-            stream = processor.process(window, stream);
-        }
-        stream
-    }
+/// The enabled processors of `config`, in order.
+fn pipeline(config: &[ProcessorConfig]) -> Pipeline {
+    Pipeline::new(config.iter().filter_map(ProcessorConfig::build).collect())
 }
 
 #[derive(Clone)]
@@ -392,7 +282,7 @@ impl WorkerSource {
             metadata,
             view_config,
             view: None,
-            pipeline: Pipeline::new(&[]),
+            pipeline: Pipeline::default(),
             pipeline_config: Vec::new(),
             raw_window: None,
             processed_window: None,
@@ -424,7 +314,7 @@ impl WorkerSource {
             },
             view_config,
             view: None,
-            pipeline: Pipeline::new(&[]),
+            pipeline: Pipeline::default(),
             pipeline_config: Vec::new(),
             raw_window: None,
             processed_window: None,
@@ -443,7 +333,7 @@ impl WorkerSource {
     }
 
     fn reset(&mut self, dt_us: i64, config: &[ProcessorConfig]) {
-        self.pipeline = Pipeline::new(config);
+        self.pipeline = pipeline(config);
         self.pipeline.reset();
         self.pipeline_config = config.to_vec();
         self.raw_window = None;
@@ -2719,15 +2609,6 @@ mod tests {
     }
 
     #[test]
-    fn refractory_history_crosses_window_boundary() {
-        let mut processor = RefractoryProcessor::new(1_000);
-        let first = processor.process((0, 1_000), sample(&[(0, 0, 900, true)]));
-        let second = processor.process((1_000, 2_000), sample(&[(0, 0, 1_100, true)]));
-        assert_eq!(first.len(), 1);
-        assert!(second.is_empty());
-    }
-
-    #[test]
     fn ordered_pipeline_matches_explicit_filter_composition() {
         let input = sample(&[
             (0, 0, 0, true),
@@ -2748,7 +2629,7 @@ mod tests {
             },
         ];
         let expected = input.background_activity_filter(250).refractory_filter(100);
-        let actual = Pipeline::new(&config).process((0, 1_000), input.clone());
+        let actual = pipeline(&config).process((0, 1_000), input.clone());
         assert_eq!(actual.ts(), expected.ts());
         assert_eq!(actual.xs(), expected.xs());
         let (raw, processed) = (window_stats(&input, 1_000), window_stats(&actual, 1_000));
@@ -2807,11 +2688,11 @@ mod tests {
             enabled: true,
             dt_us: 1_000,
         }];
-        let mut uninterrupted = Pipeline::new(&config);
+        let mut uninterrupted = pipeline(&config);
         let _ = uninterrupted.process((0, 1_000), recording.time_window(0, 1_000));
         let expected = uninterrupted.process((1_000, 2_000), recording.time_window(1_000, 2_000));
 
-        let mut after_seek = Pipeline::new(&config);
+        let mut after_seek = pipeline(&config);
         let lookback = after_seek.lookback_us();
         let _ = after_seek.process(
             (1_000 - lookback, 1_000),

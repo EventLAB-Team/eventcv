@@ -8,7 +8,9 @@
 #[cfg(feature = "camera")]
 mod biases;
 mod draw;
+mod filters;
 mod home;
+mod pixels;
 mod source;
 mod theme;
 mod ui;
@@ -19,15 +21,20 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Args, Parser};
+use eventcv_core::filter::Pipeline;
 use eventcv_core::representation::ReprSpec;
 use eventcv_core::viz::{Colormap, RawSurface, RenderView, Rgb8Image, Scale};
 use eventcv_core::EventStream;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui_image::picker::cap_parser::QueryStdioOptions;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 use crate::camera::CameraOptions;
 use crate::commands::{duration_us, parse_colormap, Source};
 use crate::Failure;
+use filters::Filters;
 use home::{Action, Home, Target};
+use pixels::Pixels;
 use source::{FileFeed, Step};
 use theme::Theme;
 
@@ -132,12 +139,28 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
         }
     }
     let _restore = Restore;
+    // Asked once the alternate screen is up and before any key is read, as the query needs. Kitty
+    // compression pays off here: the frames are mostly black.
+    let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
+        kitty_compression: true,
+        ..Default::default()
+    })
+    .ok()
+    .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
+    if let Some(app) = &mut viewer {
+        app.pixels = picker.clone().map(Pixels::new);
+    }
 
     let mut last = Instant::now();
     loop {
         let now = Instant::now();
         match (&mut viewer, &mut home) {
-            (Some(app), _) => app.step(now - last)?,
+            (Some(app), _) => {
+                app.step(now - last)?;
+                if let Some(pixels) = &mut app.pixels {
+                    pixels.sync(app.image.as_ref());
+                }
+            }
             (None, Some(home)) => home.tick(),
             (None, None) => {}
         }
@@ -148,8 +171,9 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
             (None, None) => unreachable!("there is always a viewer or the home screen"),
         })?;
         let deadline = now + tick;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            if !event::poll(remaining)? {
+        // Keys are read even when the frame overran its tick, or a slow frame would lock them out.
+        loop {
+            if !event::poll(deadline.saturating_duration_since(Instant::now()))? {
                 break;
             }
             let Event::Key(key) = event::read()? else {
@@ -185,6 +209,7 @@ pub(crate) fn run(args: TuiArgs) -> Result<(), Failure> {
                         match App::new(&chosen) {
                             Ok(mut app) => {
                                 app.back = true;
+                                app.pixels = picker.clone().map(Pixels::new);
                                 home.status = None;
                                 viewer = Some(app);
                             }
@@ -251,6 +276,13 @@ struct App {
     theme: Theme,
     /// Opened from the home screen, which `q` returns to.
     back: bool,
+    /// The image in real pixels, when the terminal has a graphics protocol; otherwise half blocks.
+    pixels: Option<Pixels>,
+    filters: Filters,
+    /// The enabled filters, run on the events as they arrive.
+    pipeline: Pipeline,
+    /// The window being typed in, in milliseconds, after `w`.
+    typing: Option<String>,
 }
 
 impl App {
@@ -306,6 +338,10 @@ impl App {
             history: VecDeque::with_capacity(HISTORY),
             theme: Theme::detect(),
             back: false,
+            pixels: None,
+            filters: Filters::default(),
+            pipeline: Pipeline::default(),
+            typing: None,
         };
         app.rebuild_view()?;
         Ok(app)
@@ -360,6 +396,7 @@ impl App {
             #[cfg(feature = "camera")]
             Feed::Live(feed) => feed.reset(),
         }
+        self.pipeline.reset();
         Ok(())
     }
 
@@ -379,14 +416,14 @@ impl App {
         let step = match &mut self.feed {
             Feed::File(feed) => {
                 feed.playback.advance(elapsed);
-                feed.step(self.dt_us, lookback)?
+                feed.step(self.dt_us, lookback, &mut self.pipeline)?
             }
             #[cfg(feature = "camera")]
             Feed::Live(feed) => {
                 if let Some(panel) = &mut self.biases {
                     panel.refresh(&feed.capture);
                 }
-                feed.step(self.dt_us, self.paused)?
+                feed.step(self.dt_us, self.paused, &mut self.pipeline)?
             }
         };
         let Some(Step { fresh, window }) = step else {
@@ -407,6 +444,9 @@ impl App {
             Ok(image) => {
                 self.image = Some(image);
                 self.problem = None;
+                if let Some(pixels) = &mut self.pixels {
+                    pixels.dirty = true;
+                }
             }
             Err(error) => {
                 self.image = None;
@@ -419,13 +459,39 @@ impl App {
     /// Handles one key; `false` means quit.
     #[cfg_attr(not(feature = "camera"), allow(irrefutable_let_patterns))]
     fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if let Some(text) = &mut self.typing {
+            match code {
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => text.push(c),
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Enter => {
+                    if let Ok(ms) = text.parse::<f64>() {
+                        self.dt_us =
+                            ((ms * 1000.0).round() as i64).clamp(DT_RANGE_US.0, DT_RANGE_US.1);
+                        let _ = self.rebuild_view();
+                    }
+                    self.typing = None;
+                }
+                KeyCode::Esc => self.typing = None,
+                _ => {}
+            }
+            return true;
+        }
+        if let Some(changed) = self.filters.key(code) {
+            if changed {
+                self.pipeline = self.filters.pipeline();
+                let _ = self.rebuild_view();
+            }
+            return true;
+        }
         #[cfg(feature = "camera")]
         if self.bias_key(code) {
             return true;
         }
         let mut rebuild = false;
         match code {
-            KeyCode::Char('q') => return false,
+            KeyCode::Char('q') | KeyCode::Esc => return false,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return false,
             KeyCode::Char(' ') => match &mut self.feed {
                 Feed::File(feed) => {
@@ -466,6 +532,7 @@ impl App {
                 self.dt_us = dt_us.clamp(DT_RANGE_US.0, DT_RANGE_US.1);
                 rebuild = true;
             }
+            KeyCode::Char('w') => self.typing = Some(String::new()),
             KeyCode::Char('r') => {
                 self.view_index = (self.view_index + 1) % (ReprSpec::NAMES.len() + 1);
                 rebuild = true;
@@ -482,8 +549,8 @@ impl App {
 
 #[cfg(feature = "camera")]
 impl App {
-    /// Handles a key aimed at the bias panel: `b` opens and closes it, and while it is open the
-    /// panel takes the keys it knows. `false` leaves the key to the viewer.
+    /// Handles a key aimed at the bias panel: `b` opens it, `b` or `Esc` closes it, and while it is
+    /// open the panel takes the keys it knows. `false` leaves the key to the viewer.
     fn bias_key(&mut self, code: KeyCode) -> bool {
         let Feed::Live(feed) = &mut self.feed else {
             return false;
@@ -494,7 +561,7 @@ impl App {
             }
         }
         match (&self.biases, code) {
-            (Some(_), KeyCode::Char('b')) => self.biases = None,
+            (Some(_), KeyCode::Char('b') | KeyCode::Esc) => self.biases = None,
             (None, KeyCode::Char('b')) => {
                 self.biases = Some(biases::BiasPanel::open(&feed.capture));
             }

@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use eventcv_core::filter::Pipeline;
 use eventcv_core::io::Reader;
 use eventcv_core::EventStream;
 
@@ -81,8 +82,14 @@ impl FileFeed {
 
     /// The window `[cursor - dt, cursor)`, or `None` when the playhead has not moved. `lookback_us`
     /// is how much history a fresh read hands back as `fresh`, so a raw view's fading trails
-    /// survive a seek instead of starting from black.
-    pub fn step(&mut self, dt_us: i64, lookback_us: i64) -> Result<Option<Step>, Failure> {
+    /// survive a seek instead of starting from black. New events go through `pipeline`, which a
+    /// fresh read first warms on its own lookback.
+    pub fn step(
+        &mut self,
+        dt_us: i64,
+        lookback_us: i64,
+        pipeline: &mut Pipeline,
+    ) -> Result<Option<Step>, Failure> {
         let t1 = self.start_us + self.playback.cursor_us;
         let t0 = t1 - dt_us;
         let (fresh, window) = match self.last.take() {
@@ -92,12 +99,14 @@ impl FileFeed {
             }
             // Playing on: append what is new and trim the front, as the GUI player does.
             Some((last_t1, window)) if last_t1 < t1 && t1 - last_t1 < dt_us => {
-                let fresh = self.reader.slice_time(last_t1, t1)?;
+                let fresh = pipeline.process((last_t1, t1), self.reader.slice_time(last_t1, t1)?);
                 let window = window.concat(&[&fresh]).time_window(t0, t1);
                 (fresh, window)
             }
             _ => {
-                let fresh = self.reader.slice_time(t1 - dt_us.max(lookback_us), t1)?;
+                let start = t1 - dt_us.max(lookback_us);
+                let events = self.reader.slice_time(start - pipeline.lookback_us(), t1)?;
+                let fresh = pipeline.process((start, t1), events);
                 let window = fresh.time_window(t0, t1);
                 (fresh, window)
             }
@@ -131,7 +140,12 @@ impl LiveFeed {
     /// Drains everything the driver has queued. The ring is emptied on every refresh — paused or
     /// not — so it never backs up; past the decode budget the surplus is dropped undecoded, which
     /// keeps the screen responsive at rates no terminal could show anyway. `None` while paused.
-    pub fn step(&mut self, dt_us: i64, paused: bool) -> Result<Option<Step>, Failure> {
+    pub fn step(
+        &mut self,
+        dt_us: i64,
+        paused: bool,
+        pipeline: &mut Pipeline,
+    ) -> Result<Option<Step>, Failure> {
         use eventcv_core::device::LIVE_DRAIN_BUDGET_MS;
         use eventcv_core::EventStreamBuilder;
 
@@ -149,14 +163,20 @@ impl LiveFeed {
             return Ok(None);
         }
         let fresh = builder.build();
+        // Taken before filtering, which may drop the last event.
+        let end = fresh.ts().last().map(|&last| last + 1);
+        let fresh = match (fresh.ts().first(), end) {
+            (Some(&first), Some(end)) => pipeline.process((first, end), fresh),
+            _ => fresh,
+        };
         let joined = match self.window.take() {
             Some(window) => window.concat(&[&fresh]),
             None => fresh.clone(),
         };
         // Trimmed to `dt` even on the first drain, which holds everything buffered since the camera
         // opened — untrimmed, its rate spikes the graph and squashes everything after it.
-        let window = match fresh.ts().last() {
-            Some(&last) => joined.time_window(last + 1 - dt_us, last + 1),
+        let window = match end {
+            Some(end) => joined.time_window(end - dt_us, end),
             None => joined,
         };
         self.window = Some(window.clone());

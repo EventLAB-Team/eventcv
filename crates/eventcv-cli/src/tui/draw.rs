@@ -49,7 +49,7 @@ impl Widget for HalfBlock<'_> {
 }
 
 /// The largest `(width, height)` with `image`'s aspect that fits in `bounds`, in pixels.
-fn fit(image: (usize, usize), bounds: (usize, usize)) -> (usize, usize) {
+pub(super) fn fit(image: (usize, usize), bounds: (usize, usize)) -> (usize, usize) {
     let ((width, height), (max_width, max_height)) = (image, bounds);
     if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
         return (0, 0);
@@ -64,16 +64,17 @@ fn fit(image: (usize, usize), bounds: (usize, usize)) -> (usize, usize) {
 /// Resizes to `width × height` by keeping the **brightest** pixel of each source box. An average
 /// would wash sparse events out: shrinking a 1280×720 sensor into a terminal folds ~64 pixels into
 /// each one, and a lone event would come out at 1/64 of its brightness. Upscaling repeats pixels.
-fn downsample(image: &Rgb8Image, width: usize, height: usize) -> Vec<[u8; 3]> {
+pub(super) fn downsample(image: &Rgb8Image, width: usize, height: usize) -> Vec<[u8; 3]> {
     let span = |index: usize, out: usize, source: usize| {
         let start = index * source / out;
         start..((index + 1) * source / out).max(start + 1)
     };
+    // The same for every row, so worked out once rather than per pixel.
+    let columns: Vec<_> = (0..width).map(|x| span(x, width, image.width)).collect();
     let mut pixels = Vec::with_capacity(width * height);
     for y in 0..height {
         let rows = span(y, height, image.height);
-        for x in 0..width {
-            let columns = span(x, width, image.width);
+        for columns in &columns {
             let mut brightest = [0u8; 3];
             for source_y in rows.clone() {
                 for source_x in columns.clone() {

@@ -153,9 +153,11 @@ script or a pipe, it prints its help instead.
 
 The events in the terminal, next to the numbers that matter when something looks wrong — for a
 quick look over SSH, on a headless capture box, or anywhere a GPU window is more than the job needs.
-Each character cell draws two pixels (a `▀` half block in two colours). The sensor is scaled to fit,
-keeping the brightest pixel of each block it shrinks, so a lone event does not vanish into the
-average.
+In a terminal with a graphics protocol (Kitty, Sixel or iTerm2 images — kitty, Ghostty, WezTerm,
+foot, Konsole, xterm `-ti vt340`) the events are drawn in real pixels, up to the sensor's full
+resolution. Elsewhere, such as GNOME Terminal, each character cell draws two pixels (a `▀` half
+block in two colours). Either way the sensor is scaled to fit, keeping the brightest pixel of each
+block it shrinks, so a lone event does not vanish into the average.
 
 | Key | |
 |---|---|
@@ -163,9 +165,11 @@ average.
 | `←` `→` | seek a second back / forward (recordings) |
 | `+` `-` | double / halve the playback speed (recordings) |
 | `[` `]` | halve / double the window on screen, between 0.1 ms and 1 s |
+| `w` | type the window in milliseconds, then `enter` (`Esc` cancels) |
+| `f` | the filter box: `↑` `↓` pick a filter, `space` turns it on or off, `←` `→` tune it, `f` or `Esc` leaves |
 | `r` | next view: raw, then each representation in turn |
 | `b` | open / close the bias panel (cameras) |
-| `q`, `Ctrl-C` | quit |
+| `q`, `Esc`, `Ctrl-C` | quit |
 
 The bias panel lists the biases worth tuning for a scene by name: ON and OFF threshold,
 refractory period, photoreceptor, and the low- and high-pass filters. Under each it says what the
@@ -183,14 +187,14 @@ biases configure its readout and interface, and stay hidden until `a` shows them
 | `d` | restore the selected bias to its opening value |
 | `c` | clear every change, back to the opening values |
 | `s` / `l` | save / load `biases-<serial>.json` in the current folder |
-| `b` | close the panel |
+| `b`, `Esc` | close the panel |
 
 No key means two things on the same screen, and none needs `shift`. The arrows adjust a bias here
-because seeking only applies to recordings, and `esc` only cancels typing. With adaptive biasing on, the top of
-the panel shows what the controller is doing: measuring the scene, then its state (`Tracking`,
-`Starved`, `Flooded` or `Hunting`), how many slow steps it has taken, and the event rate against its
-target band. The biases it drives are dimmed and move on their own. A saved
-preset opens with `--biases FILE`.
+because seeking only applies to recordings, and `esc` cancels typing before it closes the panel.
+With adaptive biasing on, the top of the panel shows what the controller is doing: measuring the
+scene, then its state (`Tracking`, `Starved`, `Flooded` or `Hunting`), how many slow steps it has
+taken, and the event rate against its target band. The biases it drives are dimmed and move on
+their own. A saved preset opens with `--biases FILE`.
 
 The panel shows the sensor and either the playhead (position, duration, speed) or, for a camera,
 its health:
@@ -204,6 +208,13 @@ its health:
 
 Below that, for the window on screen: the event count, the ON/OFF split, the rate, and a sparkline
 of the rate over time.
+
+The filter box runs the same denoising filters as the GUI viewer on the events as they arrive:
+**background** activity (drops events with no neighbour within its time, default 25 ms),
+**refractory** (a pixel's dead time after it fires, default 1 ms) and **hot pixels** (drops pixels
+firing more than the set number of standard deviations above the rest, default 3σ, from counts that
+add up while the view runs). Times step through 10 µs … 1 s in 1-2-5 steps. With any filter on, the
+counts, the rate (labelled `kept`) and the sparkline are of what the filters keep.
 
 Flags: `--dt-ms` (window, default 30), `--repr`, `--decay-ms`, `--colormap` and `--speed` as for
 `play`, and `--refresh-hz` (default 30 — a full-colour screen is a lot of bytes, so lower it over a

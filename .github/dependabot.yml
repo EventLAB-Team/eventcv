@@ -4,7 +4,7 @@ multi-ecosystem-groups:
   weekly-dependencies:
     schedule:
       interval: "weekly"
-      day: "monday"
+      day: "sunday"
     labels:
       - "dependencies"
 

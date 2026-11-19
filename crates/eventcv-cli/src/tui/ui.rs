@@ -1,6 +1,6 @@
 //! The dashboard layout, after btop: rounded boxes titled in their borders, the EventCV badge and
-//! source in the frame, the event view beside the stream and playback (or camera) boxes, and a
-//! braille rate graph along the bottom.
+//! source in the frame, the event view beside the stream, filter and playback (or camera) boxes,
+//! and a braille rate graph along the bottom.
 //!
 //! ```text
 //! ╭─ ◉ EventCV ────────────────── sunset2.hdf5 · 1280×720 · ▶ ×1 ─╮
@@ -45,11 +45,17 @@ impl App {
             Layout::vertical([Constraint::Min(4), Constraint::Length(graph)]).areas(body);
         let [view, side] =
             Layout::horizontal([Constraint::Min(16), Constraint::Length(self.side_width())]).areas(top);
-        let [stream, detail] =
-            Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(side);
+        let filters = self.filters.list.len() as u16 + 2;
+        let [stream, filter_box, detail] = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Length(filters),
+            Constraint::Min(0),
+        ])
+        .areas(side);
 
         self.draw_view(frame, view);
         self.draw_stream(frame, stream);
+        self.draw_filters(frame, filter_box);
         match self.bias_panel() {
             #[cfg(feature = "camera")]
             Some(panel) => panel.draw(frame, detail, &self.theme),
@@ -92,6 +98,19 @@ impl App {
 
     /// The key hints for this source, set into the bottom border.
     fn keys(&self) -> Line<'static> {
+        if self.typing.is_some() {
+            let keys = [("0-9", "ms"), ("enter", "set"), ("esc", "cancel")];
+            return key_hints(&self.theme, &keys);
+        }
+        if self.filters.focus.is_some() {
+            let keys = [
+                ("↑↓", "pick"),
+                ("space", "on/off"),
+                ("←→", "adjust"),
+                ("f", "done"),
+            ];
+            return key_hints(&self.theme, &keys);
+        }
         let file = matches!(self.feed, Feed::File(_));
         let quit = ("q", if self.back { "back" } else { "quit" });
         if self.bias_panel().is_some() {
@@ -108,7 +127,7 @@ impl App {
                     ("c", "clear all"),
                     ("s", "save"),
                     ("l", "load"),
-                    ("b", "close"),
+                    ("b esc", "close"),
                     quit,
                 ],
             );
@@ -122,6 +141,8 @@ impl App {
         // Opened from the home screen, `q` goes back to it rather than quitting.
         keys.extend([
             ("[]", "window"),
+            ("w", "type window"),
+            ("f", "filters"),
             ("r", "view"),
             quit,
         ]);
@@ -169,7 +190,10 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         match (&self.image, &self.problem) {
-            (Some(image), _) => frame.render_widget(HalfBlock { image, theme }, inner),
+            (Some(image), _) => match &self.pixels {
+                Some(pixels) => frame.render_widget(pixels, inner),
+                None => frame.render_widget(HalfBlock { image, theme }, inner),
+            },
             (None, Some(problem)) => frame.render_widget(
                 Paragraph::new(problem.as_str())
                     .style(Style::new().fg(theme.on))
@@ -204,7 +228,9 @@ impl App {
             ));
             Line::from(spans)
         };
-        let rate_label = if matches!(self.feed, Feed::File(_)) {
+        let rate_label = if self.filters.any() {
+            "kept"
+        } else if matches!(self.feed, Feed::File(_)) {
             "rate"
         } else {
             "decoded"
@@ -223,6 +249,38 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Each filter, on (●) or off (○), with its setting; `▸` marks the pick while `f` has the keys.
+    fn draw_filters(&self, frame: &mut Frame, area: Rect) {
+        let theme = &self.theme;
+        let block = boxed(theme, " filters ").padding(Padding::horizontal(1));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let lines = self.filters.list.iter().enumerate().map(|(index, filter)| {
+            let pick = if self.filters.focus == Some(index) {
+                "▸"
+            } else {
+                " "
+            };
+            let (dot, color) = if filter.enabled {
+                ("●", theme.good)
+            } else {
+                ("○", theme.border)
+            };
+            let (name, value) = (filter.name(), filter.value());
+            // The pick, the dot and a space before the name.
+            let gap =
+                usize::from(inner.width).saturating_sub(3 + name.len() + value.chars().count());
+            Line::from(vec![
+                Span::styled(pick, theme.key()),
+                Span::styled(dot, Style::new().fg(color)),
+                Span::styled(format!(" {name}"), theme.label()),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(value, theme.value()),
+            ])
+        });
+        frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), inner);
+    }
+
     /// Playback for a recording; the driver's health for a camera.
     fn draw_detail(&self, frame: &mut Frame, area: Rect) {
         let theme = &self.theme;
@@ -236,7 +294,10 @@ impl App {
         frame.render_widget(block, area);
 
         let width = inner.width;
-        let window = format!("{} ms · {}", self.dt_ms(), self.view_name());
+        let window = match &self.typing {
+            Some(text) => format!("{text}▏ ms"),
+            None => format!("{} ms · {}", self.dt_ms(), self.view_name()),
+        };
         let lines = match &self.feed {
             Feed::File(feed) => {
                 let playback = &feed.playback;

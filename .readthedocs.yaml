@@ -13,6 +13,12 @@ build:
     rust: latest
   apt_packages:
     - cmake
+  jobs:
+    # The shipping release profile (fat LTO, 1 codegen unit) over hdf5+camera+onnx+gpu+nn blows
+    # RTD's build time limit. autodoc only imports the module, so build it unoptimised; a
+    # `.cargo/config.toml` profile overrides Cargo.toml's and is picked up by pip's in-tree build.
+    pre_install:
+      - mkdir -p .cargo && printf '[profile.release]\nlto = false\ncodegen-units = 256\nopt-level = 0\n' > .cargo/config.toml
 
 python:
   install:
