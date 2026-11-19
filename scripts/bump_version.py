@@ -25,7 +25,7 @@ def main() -> int:
     new = sys.argv[1]
 
     cargo = ROOT / "Cargo.toml"
-    text = cargo.read_text()
+    text = cargo.read_text(encoding="utf-8")
     match = WORKSPACE_VERSION.search(text)
     if match is None:
         print("no [workspace.package] version in Cargo.toml", file=sys.stderr)
@@ -34,13 +34,26 @@ def main() -> int:
     if old == new:
         print(f"already at {new}")
         return 0
-    cargo.write_text(WORKSPACE_VERSION.sub(rf"\g<1>{new}\g<3>", text, count=1))
+    cargo.write_text(WORKSPACE_VERSION.sub(rf"\g<1>{new}\g<3>", text, count=1), encoding="utf-8")
 
     cli_doc = ROOT / "docs" / "cli.md"
-    cli_doc.write_text(cli_doc.read_text().replace(f"eventcv {old} (", f"eventcv {new} ("))
+    cli_doc.write_text(
+        cli_doc.read_text(encoding="utf-8").replace(f"eventcv {old} (", f"eventcv {new} ("),
+        encoding="utf-8",
+    )
 
     subprocess.run(
-        ["cargo", "update", "--offline", "-p", "eventcv-core", "-p", "eventcv-py"],
+        [
+            "cargo",
+            "update",
+            "--offline",
+            "-p",
+            "eventcv-core",
+            "-p",
+            "eventcv-py",
+            "-p",
+            "eventcv-cli",
+        ],
         cwd=ROOT,
         check=True,
     )

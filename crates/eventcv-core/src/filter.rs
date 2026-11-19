@@ -237,8 +237,164 @@ impl EventStream {
     }
 }
 
+// Streaming pipeline, shared by the GUI viewer and the TUI.
+
+/// One stage of a [`Pipeline`]. Stages see a stream in consecutive batches (playback windows or
+/// camera packets); a retained input tail makes the stateless filters above behave continuously
+/// across batch boundaries.
+pub trait Processor: Send {
+    fn lookback_us(&self) -> i64;
+    fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream;
+    fn reset(&mut self);
+}
+
+fn process_with_history(
+    history: &mut Option<EventStream>,
+    dt_us: i64,
+    window: (i64, i64),
+    stream: EventStream,
+    filter: impl FnOnce(&EventStream) -> EventStream,
+) -> EventStream {
+    let combined = match history.take() {
+        Some(previous) if !previous.is_empty() => previous.concat(&[&stream]),
+        _ => stream,
+    };
+    let filtered = filter(&combined).time_window(window.0, window.1);
+    *history = Some(combined.time_window(window.1.saturating_sub(dt_us), window.1));
+    filtered
+}
+
+pub struct BackgroundProcessor {
+    dt_us: i64,
+    history: Option<EventStream>,
+}
+
+impl BackgroundProcessor {
+    pub fn new(dt_us: i64) -> Self {
+        Self {
+            dt_us: dt_us.max(1),
+            history: None,
+        }
+    }
+}
+
+impl Processor for BackgroundProcessor {
+    fn lookback_us(&self) -> i64 {
+        self.dt_us
+    }
+
+    fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream {
+        process_with_history(&mut self.history, self.dt_us, window, stream, |events| {
+            events.background_activity_filter(self.dt_us)
+        })
+    }
+
+    fn reset(&mut self) {
+        self.history = None;
+    }
+}
+
+pub struct RefractoryProcessor {
+    dt_us: i64,
+    history: Option<EventStream>,
+}
+
+impl RefractoryProcessor {
+    pub fn new(dt_us: i64) -> Self {
+        Self {
+            dt_us: dt_us.max(1),
+            history: None,
+        }
+    }
+}
+
+impl Processor for RefractoryProcessor {
+    fn lookback_us(&self) -> i64 {
+        self.dt_us
+    }
+
+    fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream {
+        process_with_history(&mut self.history, self.dt_us, window, stream, |events| {
+            events.refractory_filter(self.dt_us)
+        })
+    }
+
+    fn reset(&mut self) {
+        self.history = None;
+    }
+}
+
+/// Streaming [`EventStream::hot_pixel_filter`]: pixel counts add up across batches, so the mask
+/// firms up as the stream runs instead of being re-thresholded on each batch alone.
+pub struct HotPixelProcessor {
+    n_std: f64,
+    counts: Vec<u64>,
+}
+
+impl HotPixelProcessor {
+    pub fn new(n_std: f64) -> Self {
+        Self {
+            n_std,
+            counts: Vec::new(),
+        }
+    }
+}
+
+impl Processor for HotPixelProcessor {
+    fn lookback_us(&self) -> i64 {
+        0
+    }
+
+    fn process(&mut self, _window: (i64, i64), stream: EventStream) -> EventStream {
+        let (width, height) = stream.sensor_size();
+        self.counts.resize(width * height, 0);
+        stream.add_pixel_counts(&mut self.counts);
+        stream.drop_masked_pixels(&EventStream::hot_pixel_mask_from_counts(
+            &self.counts,
+            self.n_std,
+        ))
+    }
+
+    fn reset(&mut self) {
+        self.counts.clear();
+    }
+}
+
+/// [`Processor`]s applied in order.
+#[derive(Default)]
+pub struct Pipeline {
+    processors: Vec<Box<dyn Processor>>,
+}
+
+impl Pipeline {
+    pub fn new(processors: Vec<Box<dyn Processor>>) -> Self {
+        Self { processors }
+    }
+
+    pub fn lookback_us(&self) -> i64 {
+        // Chained filters can extend one another's required input history, so sum is the safe bound.
+        self.processors.iter().fold(0_i64, |total, processor| {
+            total.saturating_add(processor.lookback_us())
+        })
+    }
+
+    pub fn reset(&mut self) {
+        for processor in &mut self.processors {
+            processor.reset();
+        }
+    }
+
+    pub fn process(&mut self, window: (i64, i64), mut stream: EventStream) -> EventStream {
+        for processor in &mut self.processors {
+            stream = processor.process(window, stream);
+        }
+        stream
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{HotPixelProcessor, Processor, RefractoryProcessor};
     use crate::{EventStream, EventStreamBuilder};
 
     fn build(width: usize, height: usize, events: &[(u16, u16, i64, bool)]) -> EventStream {
@@ -429,5 +585,27 @@ mod tests {
         assert!(empty.background_activity_filter(100).is_empty());
         assert!(empty.refractory_filter(100).is_empty());
         assert!(empty.hot_pixel_filter(3.0).is_empty());
+    }
+
+    #[test]
+    fn refractory_history_crosses_window_boundary() {
+        let mut processor = RefractoryProcessor::new(1_000);
+        let first = processor.process((0, 1_000), build(4, 4, &[(0, 0, 900, true)]));
+        let second = processor.process((1_000, 2_000), build(4, 4, &[(0, 0, 1_100, true)]));
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn hot_pixel_counts_carry_across_batches() {
+        // Alone, the second batch is uniform and would keep everything; the first batch's tally
+        // still marks (0, 0) as hot.
+        let mut processor = HotPixelProcessor::new(1.0);
+        let mut first: Vec<_> = (0..50).map(|t| (0, 0, t, true)).collect();
+        first.extend((1..4).map(|x| (x, 1, 60, true)));
+        assert_eq!(processor.process((0, 100), build(4, 4, &first)).len(), 3);
+        let second = [(0, 0, 150, true), (1, 1, 150, true), (2, 1, 150, true)];
+        let second = processor.process((100, 200), build(4, 4, &second));
+        assert_eq!(second.xs(), &[1, 2]);
     }
 }

@@ -20,7 +20,7 @@ ROOT = Path(__file__).parents[1]
 
 def _declared(path, pattern=r'^version\s*=\s*"([^"]+)"'):
     """The first `version = "..."` in a TOML file, without needing a TOML parser on 3.9/3.10."""
-    for line in Path(path).read_text().splitlines():
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
         found = re.match(pattern, line)
         if found:
             return found.group(1)
@@ -35,13 +35,15 @@ class VersionTests(unittest.TestCase):
         # One declaration (bumped by `scripts/bump_version.py`); everything else must inherit it.
         expected = _declared(ROOT / "Cargo.toml")
         self.assertEqual(eventcv.__version__, expected, "compiled extension vs root Cargo.toml")
-        for crate in ("eventcv-py", "eventcv-core"):
-            manifest = (ROOT / "crates" / crate / "Cargo.toml").read_text()
+        for crate in ("eventcv-py", "eventcv-core", "eventcv-cli"):
+            manifest = (ROOT / "crates" / crate / "Cargo.toml").read_text(encoding="utf-8")
             self.assertRegex(manifest, r"(?m)^version\.workspace\s*=\s*true", crate)
-        pyproject = (ROOT / "pyproject.toml").read_text()
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertRegex(pyproject, r'(?m)^dynamic\s*=\s*\[[^\]]*"version"')
         self.assertNotRegex(pyproject, r"(?m)^version\s*=")
-        self.assertIn(f"eventcv {expected} (", (ROOT / "docs" / "cli.md").read_text())
+        self.assertIn(
+            f"eventcv {expected} (", (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+        )
 
     def test_features_list_what_was_built_in(self):
         # Published wheels carry all five; a plain `cargo build` of the bindings carries none.

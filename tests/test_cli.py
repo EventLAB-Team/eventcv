@@ -8,6 +8,8 @@ asked to, and that a failure prints an actionable line instead of a traceback.
 import contextlib
 import io
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +17,7 @@ from unittest import mock
 
 import eventcv
 import numpy as np
-from eventcv.__main__ import main
+from eventcv.__main__ import build_parser, main
 
 EXAMPLE_NPZ = Path(__file__).resolve().parent.parent / "data" / "test" / "example.npz"
 
@@ -55,6 +57,16 @@ class InfoTests(unittest.TestCase):
         code, out, _ = _run("info", str(EXAMPLE_NPZ), "--rate-bin-ms", "5")
         self.assertEqual(code, 0)
         self.assertIn("peak rate", out)
+
+    def test_peak_rate_covers_a_recording_that_does_not_start_at_zero(self):
+        # The rate window once ran from t=0 rather than the first event, so a recording on an
+        # epoch clock reported no peak at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            shifted = Path(tmp) / "shifted.npz"
+            eventcv.load(str(EXAMPLE_NPZ)).time_shift(10_000_000).save(str(shifted))
+            code, out, _ = _run("info", str(shifted), "--rate-bin-ms", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("     bins  10 x 5.0 ms", out)
 
     def test_missing_file_names_the_path_and_exits_nonzero(self):
         code, _, err = _run("info", "/nonexistent/nope.npz")
@@ -131,6 +143,17 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(target.stat().st_size > 0)
 
+    def test_representation_span_follows_dt(self):
+        # `--repr` once re-resolved the representation at the default 30 ms span, so a longer
+        # `--dt-ms` drew only the last 30 ms of each frame.
+        target, expected = self.dir / "cli.gif", self.dir / "library.gif"
+        code, _, _ = _run(
+            "render", str(EXAMPLE_NPZ), str(target), "--dt-ms", "50", "--repr", "tencode"
+        )
+        self.assertEqual(code, 0)
+        eventcv.open(str(EXAMPLE_NPZ), dt_ms=50).with_repr("tencode").save_video(str(expected))
+        self.assertEqual(target.read_bytes(), expected.read_bytes())
+
     def test_an_unknown_extension_reports_an_error(self):
         code, _, err = _run("render", str(EXAMPLE_NPZ), str(self.dir / "out.avi"))
         self.assertEqual(code, 1)
@@ -182,6 +205,41 @@ class PlayTests(unittest.TestCase):
     def test_legacy_fps_warns_before_launching(self):
         with self.assertWarns(DeprecationWarning), self.assertRaises(ValueError):
             eventcv.play(fps=30.0, max_frames=0)
+
+
+class TuiTests(unittest.TestCase):
+    """`eventcv tui` is the standalone binary's viewer, run from Rust with Rust's own flags.
+
+    Run as a subprocess: the Rust side writes to the process's descriptors, past Python's
+    `sys.stdout`, so `redirect_stdout` would not see it.
+    """
+
+    def _tui(self, *argv):
+        return subprocess.run(
+            [sys.executable, "-m", "eventcv", "tui", *argv],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_listed_in_help(self):
+        self.assertIn("tui", build_parser().format_help())
+
+    def test_help_comes_from_the_viewer(self):
+        result = self._tui("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--camera", result.stdout)
+
+    def test_refuses_without_a_terminal(self):
+        result = self._tui(str(EXAMPLE_NPZ))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "error: eventcv tui needs an interactive terminal\n")
+
+    def test_bad_arguments_fail_before_the_terminal_is_taken(self):
+        result = self._tui(str(EXAMPLE_NPZ), "--repr", "nope")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown representation: nope", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 class SimulateCommandTests(unittest.TestCase):

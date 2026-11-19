@@ -779,6 +779,60 @@ pub struct SimulateProgress {
     pub events: usize,
 }
 
+/// Prints a simulation's progress to stderr, rate-limited so a fast clip does not spend its time
+/// on terminal writes.
+///
+/// Writes with Rust's `eprint!` rather than through Python's `sys.stderr`, because the bindings run
+/// the whole simulation with the GIL released and reacquiring it every frame purely to print would
+/// serialise the run against any other Python thread.
+pub struct ProgressReporter {
+    enabled: bool,
+    last: std::time::Instant,
+    printed: bool,
+}
+
+impl ProgressReporter {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            // Back-dated so the first frame reports immediately: on a slow clip the first frame is
+            // exactly when the user most needs to see that something is happening.
+            last: std::time::Instant::now() - Self::INTERVAL,
+            printed: false,
+        }
+    }
+
+    pub fn report(&mut self, progress: SimulateProgress) {
+        if !self.enabled {
+            return;
+        }
+        let done = progress.total_frames == Some(progress.frames);
+        if !done && self.last.elapsed() < Self::INTERVAL {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        self.printed = true;
+        let of = match progress.total_frames {
+            Some(total) => format!("/{total}"),
+            None => String::new(),
+        };
+        eprint!(
+            "\rsimulating: {}{of} frames, {:.1}M events",
+            progress.frames,
+            progress.events as f64 / 1e6
+        );
+    }
+
+    /// Closes the progress line, so whatever is printed next starts on its own row.
+    pub fn finish(&mut self) {
+        if self.enabled && self.printed {
+            eprintln!();
+        }
+    }
+}
+
 /// Simulates a whole video file, calling `on_events` with each interval's events as they are
 /// produced.
 ///
