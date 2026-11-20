@@ -270,6 +270,8 @@ jobs:
         env:
           # A self-contained .exe, needing no Visual C++ runtime on the machine it lands on.
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+          # Build HDF5 with the same static MSVC runtime as the Rust executable.
+          CMAKE_MSVC_RUNTIME_LIBRARY: ${{ runner.os == 'Windows' && 'MultiThreaded' || '' }}
         run: |
           cargo build --locked -p eventcv-cli --profile dist --features hdf5,camera
           target/dist/eventcv --version
