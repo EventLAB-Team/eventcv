@@ -27,6 +27,19 @@ which features it has.
 
 In Python, `cameras` and `record` are {func}`~eventcv.list_cameras` and {func}`~eventcv.record`.
 
+## --version
+
+```console
+$ eventcv --version
+eventcv 1.0.14 (hdf5, camera, onnx, gpu, nn)
+Python 3.12.10 on macOS-14.8.3-arm64-arm-64bit
+```
+
+The first line gives the version and the optional features built in; include it in bug reports.
+Without `hdf5`, `.h5` files won't open; without `onnx`, there's no {class}`~eventcv.Model`; without
+`nn`, there's no {class}`~eventcv.E2VID`. The standalone binary prints `standalone binary on <platform>`
+on the second line instead.
+
 ## Reading text and ROS bags
 
 Text files don't record their time unit or column order, and a bag can hold several topics. Commands
