@@ -1,10 +1,8 @@
-"""Sphinx configuration for the EventCV Python API docs.
+"""Sphinx configuration for the EventCV docs.
 
-Built on Read the Docs (see ``.readthedocs.yaml``): RTD installs the compiled
-``eventcv`` extension, then autodoc imports it and pulls docstrings straight from the
-Rust-defined methods and the generated functional API — so the reference never drifts
-from the code. Build locally with ``pip install -r docs/requirements.txt`` (plus an
-editable ``maturin develop``) then ``sphinx-build -b html docs docs/_build/html``.
+autodoc imports the installed ``eventcv`` package. Build locally with
+``pip install -r docs/requirements.txt`` (plus ``maturin develop`` or the PyPI wheel), then
+``python -m sphinx -b html docs docs/_build/html``.
 """
 
 import os
@@ -31,7 +29,13 @@ extensions = [
     "sphinx.ext.viewcode",
     "sphinx.ext.intersphinx",
     "myst_nb",  # Markdown pages + (executable) notebook tutorials
+    "sphinx_design",  # grids and cards on the landing page
+    "sphinx_copybutton",
 ]
+
+# Strip shell / REPL prompts so a copied block runs as-is.
+copybutton_prompt_text = r"\$ |>>> |\.\.\. "
+copybutton_prompt_is_regexp = True
 
 # --- autodoc -------------------------------------------------------------------
 autosummary_generate = True
@@ -52,6 +56,7 @@ napoleon_numpy_docstring = True
 # and a GPU for the viewer sections).
 nb_execution_mode = "off"
 myst_enable_extensions = ["colon_fence", "deflist"]
+myst_heading_anchors = 3
 
 # --- cross-references ----------------------------------------------------------
 intersphinx_mapping = {
@@ -65,6 +70,16 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 # --- HTML ----------------------------------------------------------------------
 html_theme = "furo"
 html_title = f"EventCV {release}"
+html_logo = "_static/logo.svg"
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
+html_theme_options = {
+    "navigation_with_keys": True,
+    "source_repository": "https://github.com/EventLAB-Team/eventcv/",
+    "source_branch": "main",
+    "source_directory": "docs/",
+    "top_of_page_buttons": ["view", "edit"],
+}
 
 # Read the Docs sets this to the canonical domain and version.
 html_baseurl = os.environ.get(
