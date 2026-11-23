@@ -1,43 +1,57 @@
 # Command line
 
-Installing EventCV puts an `eventcv` command on your `PATH`. It is a thin wrapper over the library
-for the jobs where opening a REPL is the annoying part — checking what is in a recording,
-converting a folder of them, producing a video to attach to an issue.
+The `eventcv` command inspects, converts and renders recordings without writing any Python.
 
-The command comes two ways:
+```console
+eventcv info recording.h5
+eventcv convert recording.raw recording.h5
+eventcv render recording.h5 preview.gif
+```
 
-- **With the Python package** (`pip install eventcv`), it has every command below except `cameras`
-  and `record`, whose library forms are {func}`eventcv.list_cameras` and {func}`eventcv.record`.
-  It also works as `python -m eventcv …`, which is useful when several environments are in play
-  and you want to be sure which interpreter is answering.
-- **As a standalone binary** that needs no Python ([installing it](index.md)), it has `info`,
-  `convert`, `render`, `simulate`, `tui`, `cameras` and `record`. `play`, `reconstruct` and the
-  `ros2-*` commands need the GPU viewer, an ONNX Runtime or ROS, so they stay with the package.
+It comes with the Python package (also as `python -m eventcv`) and as a standalone binary that needs
+no Python (see {doc}`installation`). Run `eventcv --version` to see which one is on your `PATH` and
+which features it has.
 
-The commands both have take the same flags and print the same output. With both installed,
-whichever comes first on your `PATH` answers — `eventcv --version` says which one that is.
+| Command | Does | Package | Binary |
+|---|---|:-:|:-:|
+| [`info`](#info) | Summarise a recording. | ✓ | ✓ |
+| [`convert`](#convert) | Convert to another format. | ✓ | ✓ |
+| [`render`](#render) | Render to `.gif`, `.apng` or `.mp4`. | ✓ | ✓ |
+| [`play`](#play) | Open the interactive player. | ✓ | |
+| [`tui`](#tui) | Watch a recording or camera in the terminal. | ✓ | ✓ |
+| [`simulate`](#simulate) | Turn a video into events. | ✓ | ✓ |
+| [`reconstruct`](#reconstruct) | Turn events into a video. | ✓ | |
+| [`cameras`](#cameras) | List connected cameras. | | ✓ |
+| [`record`](#record) | Record a camera to a file. | | ✓ |
+| [`ros2-*`](#ros-2) | Publish, record and process ROS 2 topics. | `ros2` builds | |
 
-## `eventcv --version`
+In Python, `cameras` and `record` are {func}`~eventcv.list_cameras` and {func}`~eventcv.record`.
+
+## --version
 
 ```console
 $ eventcv --version
-eventcv 1.0.14 (hdf5, camera, onnx)
+eventcv 1.0.14 (hdf5, camera, onnx, gpu, nn)
 Python 3.12.10 on macOS-14.8.3-arm64-arm-64bit
 ```
 
-The first line is the two things a bug report needs: the version, and which optional features were
-compiled in. If `hdf5` is absent, `.h5` files will not open; if `onnx` is absent,
-{class}`~eventcv.Model` is unavailable; if `nn` is absent, so is {class}`~eventcv.E2VID`.
+The first line gives the version and the optional features built in; include it in bug reports.
+Without `hdf5`, `.h5` files won't open; without `onnx`, there's no {class}`~eventcv.Model`; without
+`nn`, there's no {class}`~eventcv.E2VID`. The standalone binary prints `standalone binary on <platform>`
+on the second line instead.
 
-The standalone binary names itself on the second line instead of an interpreter:
+## Reading text and ROS bags
 
-```console
-$ eventcv --version
-eventcv 1.0.12 (hdf5, camera)
-standalone binary on linux-x86_64
-```
+Text files don't record their time unit or column order, and a bag can hold several topics. Commands
+that read a recording accept:
 
-## `eventcv info`
+| Flag | Meaning |
+|---|---|
+| `--time-unit {s,ms,us,ns}` | Timestamp unit of a text file. |
+| `--order COLS` | Column order of a headerless text file, e.g. `txyp`. |
+| `--topic TOPIC` | Bag topic to read. |
+
+## info
 
 ```console
 $ eventcv info recording.h5
@@ -48,186 +62,102 @@ $ eventcv info recording.h5
 mean rate  2,137,958 ev/s
 ```
 
-Opens the index only, so it stays fast on a multi-gigabyte file. Add `--rate-bin-ms` to also report
-the peak rate, which is what tells you whether a recording saturated the sensor:
+Reads only the index, so it's fast on large files. `--rate-bin-ms 10` also reports the peak event
+rate.
 
-```console
-$ eventcv info recording.h5 --rate-bin-ms 10
-...
-peak rate  2,751,400 ev/s
-     bins  5 x 10.0 ms
-```
-
-## `eventcv convert`
+## convert
 
 ```console
 $ eventcv convert recording.raw recording.h5
 wrote recording.h5 (14,203,881 events, loaded)
 ```
 
-The output format comes from the extension. The trailing word says how it was done: `streamed`
-means the recording never had to fit in memory, which is the case for E2VID's `.zip`; `loaded`
-means it was read whole first, which is the case for the other formats.
+The output format comes from the extension. `.zip` writes E2VID's input format and streams the file;
+other formats load it into memory first.
 
-Converting to E2VID's input format for
-[rpg_e2vid](https://github.com/uzh-rpg/rpg_e2vid) is a `.zip` away:
-
-```console
-$ eventcv convert recording.h5 events.zip
-```
-
-## `eventcv render`
+## render
 
 ```console
 $ eventcv render recording.h5 preview.gif --dt-ms 20 --fps 25
 wrote preview.gif (48 frames at 25 fps)
 ```
 
-Writes `.gif`, `.apng` or `.mp4` — see [Video and analytics](video.md) for the trade-offs, and note
-that `.mp4` needs `ffmpeg` on your `PATH`.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--dt-ms` | `30` | Recording time per frame. |
+| `--fps` | `30` | Playback rate. |
+| `--repr` | `raw` | `raw` events, or a representation name. |
+| `--decay-ms` | one frame | Raw view only: trail fade time. |
+| `--colormap` | `viridis` | Colormap for single-channel representations. |
+| `--clim` | calibrated | Fixed brightness scale, to make renders comparable. |
+| `--max-frames` | all | Stop early. |
 
-Useful flags:
+`.mp4` needs `ffmpeg`. See {doc}`video`.
 
-- `--dt-ms` — time per frame; controls how much motion each frame accumulates.
-- `--fps` — playback rate. Independent of `--dt-ms`: setting `--dt-ms 10 --fps 100` plays back in
-  real time, while `--fps 10` makes the same recording a slow-motion clip.
-- `--repr` — what to draw. The default `raw` is the event stream itself (polarity dots fading by
-  age), which needs no choice of representation to be meaningful; pass a representation name
-  (`tencode`, `count`, `tsurf`, …) to render that instead.
-- `--decay-ms` — raw view only: how long an event's trail takes to fade.
-- `--clim` — fix the brightness scale, so two renders are comparable.
-- `--max-frames` — stop early, to check a long recording before committing to all of it.
-
-## `eventcv play`
+## play
 
 ```console
-$ eventcv play
-$ eventcv play recording.h5 --dt-ms 5
+eventcv play recording.h5 --dt-ms 5 --speed 0.25 --loop
 ```
 
-Opens the interactive player, empty when no recording is supplied. A file can also be opened from
-the window or dropped onto it. The view is raw by default for the same reason `render` is.
+Opens the interactive player; with no file, opens empty. Takes the `render` flags plus `--speed`
+(default `1`), `--refresh-hz` (default `60`) and `--loop`.
 
-At `--speed 1`, recording time matches wall time. `--fps` is accepted only for compatibility and
-is deprecated. The player also takes `--dt-ms`, `--refresh-hz`, `--repr`, `--decay-ms`,
-`--colormap`, and `--clim`.
+## tui
 
-- `--speed` — playback rate multiplier; `--speed 0.25` for a slow look at a fast scene.
-- `--refresh-hz` — sliding-window refresh cap; defaults to 60 Hz independently of `--dt-ms`.
-- `--loop` — restart at the end instead of pausing on the final frame.
+```console
+eventcv                       # home screen: pick a camera or recording
+eventcv tui recording.h5
+eventcv tui --camera          # first camera; --camera SERIAL for a specific one
+```
 
-## `eventcv simulate`
+Shows events in the terminal, alongside rate, ON/OFF split and, for cameras, buffer health. Useful
+over SSH or on a machine without a display. Terminals with image support (kitty, Ghostty, WezTerm,
+iTerm2, foot, Konsole) show full resolution; others use half-block characters.
+
+| Key | Action |
+|---|---|
+| `space` | Pause / resume |
+| `←` `→` | Seek 1 s (recordings) |
+| `+` `-` | Double / halve speed (recordings) |
+| `[` `]` | Halve / double the time window |
+| `w` | Type a time window in ms |
+| `f` | Filters: background activity, refractory, hot pixels |
+| `r` | Cycle raw view and representations |
+| `q`, `Esc` | Quit |
+
+Flags: `--dt-ms`, `--repr`, `--decay-ms`, `--colormap`, `--speed`, `--refresh-hz` (default `30`;
+lower it over slow SSH). For cameras, also `--max-event-rate`, `--roi X0 Y0 W H` and
+`--adaptive-bias`.
+
+## simulate
 
 ```console
 $ eventcv simulate clip.mp4 events.h5 --scale 960 540
-simulating: 39/39 frames, 18.7M events
 wrote events.h5 (18,742,110 events from 39 frames)
 ```
 
-Turns a video into synthetic events (needs `ffmpeg` on `PATH`). The events are written as they are
-produced, so memory stays flat however long the clip is, and progress is shown when stderr is a
-terminal. See [Simulation](simulation.md) for the pixel model.
+Writes events as they're generated, so memory stays flat. Needs `ffmpeg`.
 
-Beyond the model parameters (`--threshold`, `--sigma-thres`, `--cutoff-hz`, `--leak-rate-hz`,
-`--shot-noise-rate-hz`, `--refractory-us`, `--seed`):
+| Flag | Meaning |
+|---|---|
+| `--scale W H` | Decode at a smaller size. The biggest saving in time and file size. |
+| `--threshold`, `--sigma-thres`, `--cutoff-hz`, `--leak-rate-hz`, `--shot-noise-rate-hz`, `--refractory-us`, `--seed` | Sensor model. See {doc}`simulation`. |
+| `--upsample`, `--max-upsample` | Frame subdivision. |
+| `--max-frames` | Stop early. |
+| `--compression` | HDF5 gzip level `0`–`9` (default `1`). |
 
-- `--scale W H` — decode at a smaller size. The most effective lever on both time and file size:
-  halving each side quarters the pixels and roughly quarters the output.
-- `--upsample`, `--max-upsample` — how finely each frame interval is subdivided, and a ceiling on
-  it. Each sub-step is a full pass over every pixel.
-- `--compression` — HDF5 gzip level `0..9`, `0` for uncompressed (default `1`).
-
-## `eventcv tui`
+## reconstruct
 
 ```console
-$ eventcv                              # the home screen (also `eventcv tui`)
-$ eventcv tui recording.h5
-$ eventcv tui --camera                 # the first camera found; --camera SERIAL picks one
+eventcv reconstruct recording.h5 out.mp4 --device gpu
+eventcv reconstruct recording.h5 out.mp4 my_model.onnx --dt-ms 33 --bins 5
 ```
 
-Run in a terminal with nothing else, `eventcv` opens a home screen. It lists the cameras plugged
-in and the recordings in the current folder. Pick one with the arrow keys and `enter`. `tab`
-switches between the two lists, Backspace goes up a folder, and `r` looks for cameras again. A viewer
-opened from here returns to it on `q`, which also releases the camera. When `eventcv` runs in a
-script or a pipe, it prints its help instead.
+Uses E2VID unless an ONNX model is given. Flags: `--dt-ms`, `--device {cpu,gpu}`, `--fps`,
+`--max-frames`, and for ONNX models `--repr` and `--bins`. See {doc}`reconstruction`.
 
-The events in the terminal, next to the numbers that matter when something looks wrong — for a
-quick look over SSH, on a headless capture box, or anywhere a GPU window is more than the job needs.
-In a terminal with a graphics protocol (Kitty, Sixel or iTerm2 images — kitty, Ghostty, WezTerm,
-foot, Konsole, xterm `-ti vt340`) the events are drawn in real pixels, up to the sensor's full
-resolution. Elsewhere, such as GNOME Terminal, each character cell draws two pixels (a `▀` half
-block in two colours). Either way the sensor is scaled to fit, keeping the brightest pixel of each
-block it shrinks, so a lone event does not vanish into the average.
-
-| Key | |
-|---|---|
-| `space` | pause / resume — at the end of a recording, play it again |
-| `←` `→` | seek a second back / forward (recordings) |
-| `+` `-` | double / halve the playback speed (recordings) |
-| `[` `]` | halve / double the window on screen, between 0.1 ms and 1 s |
-| `w` | type the window in milliseconds, then `enter` (`Esc` cancels) |
-| `f` | the filter box: `↑` `↓` pick a filter, `space` turns it on or off, `←` `→` tune it, `f` or `Esc` leaves |
-| `r` | next view: raw, then each representation in turn |
-| `b` | open / close the bias panel (cameras) |
-| `q`, `Esc`, `Ctrl-C` | quit |
-
-The bias panel lists the biases worth tuning for a scene by name: ON and OFF threshold,
-refractory period, photoreceptor, and the low- and high-pass filters. Under each it says what the
-bias does and which way to turn it, with the driver's own name and range. The rest of the sensor's
-biases configure its readout and interface, and stay hidden until `a` shows them.
-
-| Key | |
-|---|---|
-| `↑` `↓` | pick a bias |
-| `←` `→` | adjust by 1 |
-| `PgDn` `PgUp` | adjust by a twentieth of the range |
-| `enter` | type a value; `enter` sets it, `esc` cancels |
-| `m` | show / hide the more advanced biases |
-| `a` | turn adaptive biasing on / off |
-| `d` | restore the selected bias to its opening value |
-| `c` | clear every change, back to the opening values |
-| `s` / `l` | save / load `biases-<serial>.json` in the current folder |
-| `b`, `Esc` | close the panel |
-
-No key means two things on the same screen, and none needs `shift`. The arrows adjust a bias here
-because seeking only applies to recordings, and `esc` cancels typing before it closes the panel.
-With adaptive biasing on, the top of the panel shows what the controller is doing: measuring the
-scene, then its state (`Tracking`, `Starved`, `Flooded` or `Hunting`), how many slow steps it has
-taken, and the event rate against its target band. The biases it drives are dimmed and move on
-their own. A saved preset opens with `--biases FILE`.
-
-The panel shows the sensor and either the playhead (position, duration, speed) or, for a camera,
-its health:
-
-- **backlog** — buffers waiting in the driver's ring. A number that keeps rising means the machine
-  is not keeping up.
-- **overflows** — times the ring filled and the driver dropped data.
-- **dropped** — buffers skipped undecoded so the screen stays live at rates no terminal could show.
-  Once that happens the rate is labelled `decoded`, because it no longer counts everything.
-- with `--adaptive-bias`, the controller's measured rate, target band and state.
-
-Below that, for the window on screen: the event count, the ON/OFF split, the rate, and a sparkline
-of the rate over time.
-
-The filter box runs the same denoising filters as the GUI viewer on the events as they arrive:
-**background** activity (drops events with no neighbour within its time, default 25 ms),
-**refractory** (a pixel's dead time after it fires, default 1 ms) and **hot pixels** (drops pixels
-firing more than the set number of standard deviations above the rest, default 3σ, from counts that
-add up while the view runs). Times step through 10 µs … 1 s in 1-2-5 steps. With any filter on, the
-counts, the rate (labelled `kept`) and the sparkline are of what the filters keep.
-
-Flags: `--dt-ms` (window, default 30), `--repr`, `--decay-ms`, `--colormap` and `--speed` as for
-`play`, and `--refresh-hz` (default 30 — a full-colour screen is a lot of bytes, so lower it over a
-slow SSH link). A camera also takes `--max-event-rate`, `--roi`, `--adaptive-bias` and `--biases`, as
-`record` does.
-
-Colour is 24-bit when the terminal says it supports it (`COLORTERM=truecolor`, and always on
-Windows) and the nearest xterm-256 colour otherwise. On Windows, use Windows Terminal; the legacy
-console draws slowly.
-
-## `eventcv cameras`
-
-Standalone binary only.
+## cameras
 
 ```console
 $ eventcv cameras
@@ -235,54 +165,36 @@ name            kind            serial    speed  usb
 Prophesee EVK4  prophesee_evk4  00051234  super  2:5
 ```
 
-Lists the connected USB event cameras. An empty list with a camera plugged in usually means another
-program has it open or, on Linux, that udev rules are missing — when enumeration was blocked by
-permissions the command says so.
+An empty list with a camera attached usually means another program has it open, or udev rules are
+missing on Linux.
 
-## `eventcv record`
-
-Standalone binary only.
+## record
 
 ```console
 $ eventcv record session.h5 --seconds 10
 recorded 31,402,118 events in 10.0 s -> session.h5
 ```
 
-Records a camera straight to disk. Every event format works, and the extension picks it; `.h5` is
-the one for long sessions. Without `--seconds` it records until `Ctrl-C`, which ends the recording
-cleanly and keeps everything captured (a second `Ctrl-C` quits at once).
+Without `--seconds`, records until `Ctrl-C`. Flags: `--serial`, `--compression` (default
+uncompressed), `--max-event-rate`, `--roi X0 Y0 W H`, `--adaptive-bias`. See {doc}`streaming`.
 
-- `--serial` — which camera, from `eventcv cameras` (default: the first found).
-- `--compression` — HDF5 gzip level `0..9`. The default is uncompressed, so the disk keeps up with
-  the sensor.
-- `--max-event-rate`, `--roi X0 Y0 W H` — limit what the sensor emits, as in
-  [Live camera streaming](streaming.md).
-- `--adaptive-bias` — retune the biases as it runs to hold the event rate steady across changing
-  light.
-- `--biases FILE` — apply a bias preset saved from the TUI, the GUI or `EventCamera.save_biases`.
+## ROS 2
 
-## Reading text and rosbag sources
+| Command | Does |
+|---|---|
+| `ros2-publish FILE` | Replay a recording onto a topic. |
+| `ros2-record FILE` | Record a topic to a file. |
+| `ros2-represent` | Subscribe to events and republish a representation as `sensor_msgs/Image`. |
 
-Text formats carry no timestamp unit or column order, and a rosbag has no single obvious
-connection, so `info`, `convert`, `render`, `play` and `tui` all accept:
+These need a build with the `ros2` feature, which the published wheels don't include. No ROS install
+is needed: they talk Zenoh, so the ROS 2 side must run `rmw_zenoh_cpp` (or a `zenoh-bridge-ros2dds`).
+Run `eventcv ros2-publish --help` for flags.
 
-- `--time-unit {s,ms,us,ns}` — without this, a `.txt` recording can report a duration off by a
-  factor of a thousand.
-- `--order` — column order of a headerless text file, e.g. `txyp` or `xytp`.
-- `--topic` — rosbag connection to read.
+## Exit codes
 
-```console
-$ eventcv info events.txt --time-unit us --order txyp
-```
-
-## Exit codes and errors
-
-`0` on success, `1` on a reported error, `130` on interrupt. Failures print a single actionable
-line to stderr rather than a traceback:
+`0` on success, `1` on error, `130` on `Ctrl-C`. Errors print one line to stderr:
 
 ```console
 $ eventcv render recording.h5 out.mp4
 error: writing .mp4 needs ffmpeg on PATH (macOS: `brew install ffmpeg`, ...)
 ```
-
-Long conversions and renders are interruptible with Ctrl-C.

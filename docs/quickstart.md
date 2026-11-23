@@ -1,204 +1,112 @@
 # Quickstart
 
-## Load a recording
+A five-minute tour: load a recording, transform it, turn it into a tensor, and save it.
 
-{func}`eventcv.load` reads an entire stream, detecting the format from the file
-extension. Sensor size and time unit are auto-detected; pass them only to override.
+## Load
 
 ```python
 import eventcv as ecv
 
-stream = ecv.load("recording.hdf5")
-print(stream.sensor_size)  # (width, height)
-print(len(stream))  # number of events
-events = stream.numpy()  # N×4 array of [x, y, t, p]
+stream = ecv.load("recording.h5")
+stream.sensor_size  # (width, height)
+len(stream)  # number of events
+stream.numpy()  # (N, 4) array: x, y, t, p
 ```
 
-To read only part of a large recording, `offset` skips events before an **absolute
-timestamp** (in milliseconds, the file's own time base) and `max_events` caps how many are
-kept after it:
+{func}`~eventcv.load` picks the reader from the file extension and infers the sensor size and time
+unit. Pass `sensor_size=` or `time_unit=` to override. See {doc}`loading`.
+
+Events already in memory? Build a stream from an `(N, 4)` or structured array:
 
 ```python
-window = ecv.load("recording.hdf5", offset=1_000, max_events=500_000)  # from t = 1 s on
+stream = ecv.from_numpy(events, sensor_size=(640, 480), time_unit="us")
 ```
 
-Already have events in memory (e.g. from another tool)? {func}`eventcv.from_numpy` is the
-inverse of `numpy()` — build a stream from an `(N, 4)` array. Columns default to `xytp`
-(what `numpy()` emits); sensor size and time unit are inferred when omitted:
+## Transform
+
+Transforms return a new stream and never change the original:
 
 ```python
-import numpy as np
-
-events = np.array([[0, 0, 100, 1], [1, 2, 250, 0]])  # x y t p
-stream = ecv.from_numpy(events, time_unit="us")
+cropped = stream.crop(0, 0, 320, 240)
+clean = cropped.hot_pixel_filter()
 ```
 
-Any other column layout is one `keys=` away (`keys={"x": 0, "y": 1, "p": 2, "t": 3}`), and
-**structured arrays** — what [Tonic](https://tonic.readthedocs.io) datasets return — are matched by
-field name, in any field order. To frame in-memory events like a file, hand them (or an
-`EventStream`) to {func}`eventcv.open`; frames are measured from the first event:
+Every method is also a free function that takes the stream first:
 
 ```python
-import tonic
-
-events, label = tonic.datasets.NMNIST(save_to="data")[0]  # events["x"], events["t"], …
-stream = ecv.from_numpy(events, sensor_size=(34, 34), time_unit="us")
-reader = ecv.open(events, dt_ms=10, sensor_size=(34, 34), time_unit="us")
-frames = [reader[i].voxel() for i in range(reader.n_slices)]
+clean = ecv.hot_pixel_filter(cropped)
 ```
 
-## Transform (chainable, functional)
+See {doc}`transforms` for every transform.
 
-Transforms return a **new** stream, so they chain — and every one is also a free
-function taking the stream as its first argument.
+## Represent
+
+Turn events into a dense `[C, H, W]` tensor:
 
 ```python
-# method form
-clipped = stream.crop(0, 0, 320, 240).flip_x().hot_pixel_filter()
-
-# equivalent free-function (OpenCV-style) form
-clipped = ecv.hot_pixel_filter(ecv.flip_x(ecv.crop(stream, 0, 0, 320, 240)))
+frame = stream.voxel(bins=5)  # an EventFrame
+array = frame.numpy()  # (5, H, W) float32 ndarray
 ```
 
-For training there are seeded random counterparts — `random_flip_x`, `event_drop`,
-`spatial_jitter`, and friends — which chain the same way and stay reproducible across a shuffled
-`DataLoader`. See [Augmentation](augmentation.md).
+See {doc}`representations` for the full list: voxel grids, time surfaces, counts and more.
+
+## Slice a large file
+
+{func}`~eventcv.open` returns a lazy {class}`~eventcv.EventReader`. It reads only the window you ask
+for.
 
 ```python
-augmented = stream.random_flip_x(0.5, seed=0).event_drop(0.1, seed=0)
+reader = ecv.open("huge.h5", dt_ms=30)  # 30 ms windows
+reader.n_slices  # number of windows
+window = reader[50]  # window 50, as an EventStream
 ```
 
-## Represent as a dense tensor
-
-```python
-voxel = stream.voxel(bins=5)  # or ecv.voxel(stream, bins=5)
-array = voxel.numpy()  # [C, H, W] ndarray, ready for NumPy / PyTorch
-```
-
-## Stream a large file
-
-{func}`eventcv.open` returns a lazy {class}`~eventcv.EventReader` that slices the file
-on demand instead of materialising it.
-
-```python
-reader = ecv.open("huge.hdf5", dt_ms=30)  # treat as 30 ms frames
-print(reader.n_slices)
-frame = reader.slice(50).voxel()  # the 50th 30 ms frame → voxel grid
-```
-
-Stream ops apply to a reader too: `ecv.hot_pixel_filter(reader)` (or `reader.hot_pixel_filter()`)
-returns a new lazy reader that runs the op on every slice, so filtering/geometry compose with
-slicing without loading the file.
-
-```python
-clean = ecv.hot_pixel_filter(reader).flip_x()  # still lazy — nothing read yet
-frame = clean.slice(50).voxel()  # 50th frame, hot pixels dropped + flipped
-```
-
-**Any timescale works.** Every time argument comes in four units, and they name the same
-quantity — so `dt_us=500` and `dt_ms=0.5` open the same reader. Passing two units for one
-quantity raises rather than quietly picking a winner:
-
-```python
-ecv.open("huge.hdf5", dt_us=500)  # 500 µs frames
-ecv.open("huge.hdf5", dt_s=0.03).slice(t0_us=1e6, t1_us=2e6)
-reader.windows(step_ns=5e5, span_us=800)
-reader.dt("us"), reader.duration("s"), reader.time_span("ns")
-```
-
-The same `_s`/`_ms`/`_us`/`_ns` suffixes apply to `offset`, to `slice`'s `t0`/`t1`, to
-`windows`' `step`/`span`, to `stream`'s `dt` and `decay`, and to the representation spans
-(`window`, `tau`, `max_window`). Timestamps are stored in microseconds, so a `_ns` value is
-rounded to the nearest microsecond and a duration below half a microsecond raises.
-
-Slice by a fixed **event count** instead of a fixed duration with `max_events` — each
-slice holds exactly that many consecutive events (the last may be shorter), which keeps
-the number of events per frame constant rather than the time span. It is mutually
-exclusive with `dt_ms`:
-
-```python
-reader = ecv.open("huge.hdf5", max_events=10_000)  # 10k-event frames
-frame = reader.slice(50).voxel()  # the 50th 10k-event frame
-```
-
-Pass `offset` — an **absolute timestamp in milliseconds** (the same time base as
-`slice(t0_ms=…)`) — to move the framing origin: `slice(0)`, `windows()`, and `n_slices` all
-begin at that time, and earlier events fall outside every frame. It composes with either
-`dt_ms` or `max_events`:
-
-```python
-reader = ecv.open("huge.hdf5", dt_ms=30, offset=1_000)  # frame 0 starts at t = 1 s
-```
-
-Pass `hot_pixel_filter=True` to strip stuck pixels **consistently across the whole recording**:
-`open` scans the file once up front and drops those pixels from every slice. Unlike
-`stream.hot_pixel_filter()` run per slice — whose threshold shifts window to window, so hot
-pixels leak back at long `dt_ms` — this is a single global mask. `hot_pixel_std` (default `3.0`)
-tunes it:
-
-```python
-reader = ecv.open("huge.hdf5", dt_ms=1000, hot_pixel_filter=True)  # hot pixels gone everywhere
-```
-
-For a recording whose timestamps are epoch-based, `offset` is just that epoch time in ms
-(e.g. `offset=1_587_540_271_650`). Values before the recording clamp to the start; values
-past the end give zero frames.
-
-Pass `repr=` to make the reader a **representation source**. Every slice-yielding call —
-`slice`, `slice_count`, and each item from `windows()` — applies it, returning the rendered
-{class}`~eventcv.EventFrame` directly, so `open(path, repr="mcts").slice(0)` is exactly
-`open(path).slice(0).mcts()`. It also makes the reader a PyTorch map-style dataset where
-`reader[i]` is the dense `[C, H, W]` array:
+Pass `repr=` to get tensors directly. The reader then works as a PyTorch dataset:
 
 ```python
 import torch
 
-reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")
-frame = reader.slice(500)  # an EventFrame — MCTS already applied
-frame.view()  # render it (no need to name the repr again)
-frame.numpy()  # the dense [C, H, W] array
-for frame in reader.windows():  # windows() yields rendered frames too
-    ...
-
-# as a PyTorch map-style dataset (dense arrays collate straight into a tensor)
-ds = ecv.open("huge.hdf5", dt_ms=30, repr="count")
-# len(ds) == n_slices; ds[i] -> [C, H, W]; ds.batch(idxs) -> [B, C, H, W]
-loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=True)
+dataset = ecv.open("huge.h5", dt_ms=30, repr="voxel")
+loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
 ```
 
-Without `repr`, `slice(n)` and `reader[i]` return raw {class}`~eventcv.EventStream`s, so name
-the representation on the slice yourself: `reader.slice(500).mcts()` (or `.view("count")`).
-Those streams are sparse and variable-length, so a `DataLoader` can't stack them — pass
-{func}`eventcv.collate` to batch them as a `list` instead:
+See {doc}`large-files` for sliding windows, time ranges and more.
+
+## Time units
+
+Every time argument accepts four units. These are equivalent:
 
 ```python
-import torch
-
-reader = ecv.open("huge.hdf5", dt_ms=30)
-loader = torch.utils.data.DataLoader(reader, batch_size=32, collate_fn=ecv.collate)
-for batch in loader:  # batch is a list[EventStream]
-    batch[0].view()
+ecv.open("huge.h5", dt_ms=0.5)
+ecv.open("huge.h5", dt_us=500)
 ```
+
+The suffixes are `_s`, `_ms`, `_us` and `_ns`. See {doc}`concepts`.
 
 ## Save
 
-{func}`eventcv.save` mirrors {func}`~eventcv.load`, choosing the format by extension.
+{func}`~eventcv.save` picks the format from the extension:
 
 ```python
-ecv.save(clipped, "out.npz")  # streams: .npz / .txt / .h5 / .bag
-ecv.save(voxel, "voxel.h5")  # frames: .npz / .h5
+ecv.save(clean, "clean.h5")  # streams: any supported format
+ecv.save(frame, "voxel.npz")  # frames: .npz, .h5 or .png
 ```
 
-A `.zip` target writes [E2VID](https://github.com/uzh-rpg/rpg_e2vid)'s interchange instead — a
-`width height` header, then `t x y p` with `t` in float seconds — so a recording goes straight
-into event-to-video reconstruction. Handing it an `EventReader` converts window by window, so the
-file never has to fit in memory:
+See {doc}`saving` to write large files window by window.
+
+## View
 
 ```python
-ecv.save(ecv.open("huge.hdf5"), "events.zip")
-# python run_reconstruction.py --input_file events.zip --fixed_duration -T 33
+stream.view()  # open the viewer on one frame
+ecv.play("recording.h5")  # play a recording
+ecv.save_video(stream, "clip.mp4", fps=30)  # export an animation
 ```
 
-See the [Representations](representations.md) page for every available representation
-(`voxel`, `tsurf`, `atsurf`, `count`, `tencode`, `mcts`, `flow`, `pset`, …) with its parameters
-and output shape, and the [API reference](api.md) for the full list of readers and transforms.
+See {doc}`video` for playback controls and export options.
+
+## Next steps
+
+- {doc}`representations`: every tensor representation and its parameters.
+- {doc}`streaming`: capture from a live camera.
+- {doc}`augmentation`: seeded random transforms for training.
+- {doc}`api`: the full API.

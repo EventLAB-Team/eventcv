@@ -1,397 +1,194 @@
-# Live camera streaming
+# Live cameras
 
-{func}`eventcv.stream` opens a USB event camera as an {class}`~eventcv.EventCamera` — the streaming
-twin of {func}`~eventcv.open`. It hands back the same {class}`~eventcv.EventStream` windows the file
-readers do, so every representation, transform, feature detector, and viewer in EventCV composes on
-a live feed exactly as it does on a recording.
+{func}`~eventcv.stream` opens a USB event camera. It produces the same windows as a file reader, so
+every transform, representation and viewer works on a live feed.
 
 ```python
 import eventcv as ecv
 
 ecv.list_cameras()  # [{'kind': 'prophesee_evk4', 'name': 'Prophesee EVK4', 'serial': ...}]
-ecv.stream().show()  # live raw view; Ctrl+C or close the window to stop
+ecv.stream().show()  # live view; close the window to stop
 ```
 
-Supported: Prophesee EVK4 / EVK3-HD, iniVation DVXplorer / DAVIS346, CenturyArks VGA. Camera support
-is compiled into the published wheels; on Linux the device needs udev rules for non-root USB access.
+| Supported cameras |
+|---|
+| Prophesee EVK4, EVK3 HD |
+| iniVation DVXplorer, DAVIS346 |
+| CenturyArks VGA |
 
-## Closing the camera
+:::{note}
+On Linux, cameras need
+[udev rules](https://github.com/neuromorphicsystems/neuromorphic-drivers#udev-rules) for non-root
+access.
+:::
 
-A camera allows exactly one open handle, so the device — and any `record=` file — must be released
-before the next `stream()` can use it. Closing does that, and it happens in one of three ways:
+## Read windows
 
 ```python
-with ecv.stream(dt_ms=50) as cam:  # closed on the way out, even on an exception
-    ...
-
-cam = ecv.stream(dt_ms=50)
-cam.close()  # or explicitly
-
-ecv.record("session.h5", seconds=10)  # opened, recorded, and closed in one call
+with ecv.stream(dt_ms=50) as cam:
+    for events in cam:  # one EventStream per 50 ms
+        process(events)
 ```
 
-Dropping the camera closes it too, but only whenever Python happens to collect the object — so a
-throwaway `ecv.stream()` in a REPL can hold the device well past the line that created it. Prefer
-one of the three forms above; for a script that only wants a file, {func}`~eventcv.record` is the
-shortest and leaves nothing open.
-
-## Reading windows in a loop
-
-`read()` blocks until the next window completes and returns it — an {class}`~eventcv.EventFrame`
-when the camera was opened with `repr=`, otherwise a raw {class}`~eventcv.EventStream`. Windowing
-mirrors {func}`~eventcv.open`: `dt_ms` for fixed durations, `max_events` for a fixed event count.
+Pass `repr=` to receive frames instead. Representation options (`bins`, `window_ms`, `tau_ms`, …) go
+straight to `stream`:
 
 ```python
-cam = ecv.stream(dt_ms=50, repr="mcts")  # one MCTS frame per ~50 ms of events
-while running:
-    frame = cam.read()  # blocks for the next window
-    infer(frame.numpy())
-
-frame = cam.read(timeout_ms=100)  # None if nothing completed in 100 ms
+with ecv.stream(dt_ms=50, repr="voxel", bins=5) as cam:
+    while True:
+        frame = cam.read()  # blocks until the next window
+        infer(frame.numpy())
 ```
 
-`timeout_ms` is a cap on the *wait*, not the window length — it lets an idle scene fall through to
-other work instead of blocking. Iterating (`for frame in cam:`) is the same thing in `for` form, and
-`Ctrl+C` breaks either. Only non-empty windows are emitted, so a loop never spins on idle time.
-
-### Representation options
-
-`stream` accepts the same per-representation options as {meth}`~eventcv.EventReader.with_repr` —
-`bins`, `window_ms`, `tau_ms`, `max_window_ms`, `window` (for `"flow"`), and `normalize`. Unset time
-spans **follow the capture window**, so a live representation covers exactly the events it was
-handed:
-
-```python
-ecv.stream(dt_ms=50, repr="tencode")  # window_ms = 50, matching the window
-ecv.stream(dt_ms=50, repr="tencode", window_ms=20)  # explicit: keep only the newest 20 ms
-ecv.stream(dt_ms=50, repr="voxel", bins=5)  # 5 bins across the 50 ms window
-ecv.stream(max_events=50_000, repr="tsurf")  # no fixed duration -> tau_ms stays 30 ms
-```
-
-Without that default a `dt_ms=50` window rendered with tencode's stock 30 ms span would silently
-discard its oldest 20 ms — on a real 50 ms window, 54% of the lit pixels.
-
-## Recording while you process
-
-Pass `record=` a path and every window has its **raw** events appended to that file before it is
-rendered. The loop works on representations while the file keeps the full-resolution recording for
-later:
-
-```python
-with ecv.stream(dt_ms=50, repr="mcts", record="session.h5") as cam:
-    while running:
-        infer(cam.read().numpy())  # this window's raw events are already on disk
-
-ecv.open("session.h5")  # reads back like any other recording
-```
-
-Writing happens on the capture thread, so there is no per-window Python round trip, and the file is
-flushed about once a second — a crash keeps everything up to a second ago. `compression=` takes an
-optional gzip level (`0..=9`) for HDF5; omit it for the fastest writes.
-{attr}`~eventcv.EventCamera.n_recorded` counts events written, and the `with` block (or `close()`)
-finishes the file.
-
-**Any event format works**, chosen by the extension exactly as {func}`~eventcv.save` chooses it —
-`.h5`, `.npz`, `.txt`/`.csv`, `.bag`, `.aedat`, `.aedat4`, `.dat`, `.raw`. All of them are written
-window-by-window, so nothing is ever held in memory. What differs is when the file becomes readable,
-which is what matters if a capture is interrupted:
-
-| readable after every window | complete only when the camera closes |
+| Option | Meaning |
 |---|---|
-| `.h5`, `.txt`/`.csv`, `.aedat`, `.aedat4`, `.dat`, `.raw` | `.npz`, `.bag` |
+| `dt_ms` | Window length. |
+| `max_events` | Fixed event count per window, instead of `dt_ms`. |
+| `repr` | Render each window as this {doc}`representation <representations>`. |
+| `serial` | Open a specific camera when several are connected. |
 
-npz and rosbag both have something to write at the end — a header stating the array length, a chunk
-index — so they spill to a scratch file beside the target while the capture runs and assemble it on
-close. Pick one of the others for a session you might have to kill.
+`cam.read(timeout_ms=100)` returns `None` if no window arrives in time. Empty windows are never
+returned.
 
-Iteration and the event GUI archive every decoded window before display backpressure is applied.
-To record without a loop or window, use {func}`~eventcv.record`, which opens the camera, captures,
-and closes it:
+:::{important}
+A camera can only be open once. Use `with`, or call `cam.close()`, so the device is released
+promptly.
+:::
 
-```python
-ecv.record("session.h5", seconds=10)  # blocks 10 s (or Ctrl+C); returns the event count
-ecv.record("session.npz")  # npz/txt/bag buffer in memory, write at the end
-ecv.open("session.h5")  # safe straight after: nothing is still writing
-```
+## Record
 
-{meth}`~eventcv.EventCamera.record` is the same thing on a camera you already hold open — use it
-when the session continues afterwards. A camera opened with `record=` is already archiving every
-window, so calling `record()` on it as well is refused rather than splitting the recording in two.
-
-For full control, drive the writer yourself with an {class}`~eventcv.EventSink` — the event-level
-twin of {class}`~eventcv.FrameSink`, which appends windows to an extendable HDF5 file:
+Pass `record=` to save every window's raw events while you process them:
 
 ```python
-with ecv.stream(dt_ms=50) as cam, ecv.EventSink("session.h5") as sink:
-    for events in cam:
-        sink.append(events)  # to disk, window-by-window
-        track(events)  # ...and process the same window live
+with ecv.stream(dt_ms=50, repr="voxel", record="session.h5") as cam:
+    for frame in cam:
+        infer(frame.numpy())
 ```
 
-Any event format can be recorded this way, not just HDF5: `record=` and {class}`~eventcv.EventSink`
-take `.h5`, `.npz`, `.txt`/`.csv`, `.bag`, `.aedat`, `.aedat4`, `.dat` and `.raw`, chosen by the
-extension exactly as {func}`eventcv.save` chooses it. What differs is *when* the file becomes
-readable — HDF5, text, AEDAT and the Prophesee formats append straight to disk, so an interrupted
-capture keeps everything written so far, while npz and rosbag have a header or an index to write at
-the end and are only complete once the sink is closed.
+To record without processing, use {func}`~eventcv.record`. It opens the camera, records and closes:
 
-Only events are saved either way. A DAVIS346's APS frames and IMU samples are not written to the
-recording, but they are no longer thrown away: pass `frames=True` / `imu=True` to
-{func}`~eventcv.stream` and collect them as you read.
+```python
+ecv.record("session.h5", seconds=10)  # returns the number of events
+```
+
+Any event format works, chosen by extension. If a recording might be interrupted, choose one that
+is readable while it grows:
+
+| Readable during recording | Complete only once the camera closes |
+|---|---|
+| `.h5`, `.txt`, `.csv`, `.aedat`, `.aedat4`, `.dat`, `.raw` | `.npz`, `.bag` |
+
+`compression=` sets the HDF5 gzip level (0–9). `cam.record(path, seconds=…)` records from a camera
+you already have open. For full control, append windows yourself with an
+{class}`~eventcv.EventSink` (see {doc}`saving`).
+
+## DAVIS frames and IMU
+
+Pass `frames=True` and `imu=True` to collect a DAVIS346's greyscale frames and IMU samples:
 
 ```python
 with ecv.stream(dt_ms=50, frames=True, imu=True) as cam:
     for events in cam:
-        for t_us, frame in cam.read_frames():  # EventFrame, uint16 greyscale
-            reference(frame.numpy())
-        gyro = cam.read_imu()["angular_velocity"]  # rad/s, [N, 3]
+        frames = cam.read_frames()  # [(t_us, EventFrame), ...]
+        imu = cam.read_imu()  # {"t", "angular_velocity", "linear_acceleration"}
 ```
 
-These are the shapes {func}`~eventcv.read_frames` and {func}`~eventcv.read_imu` return for a `.bag`
-or `.aedat` recording, so the same code reads a file or a camera. `cam.show("aps")` watches the APS
-video live. Only the most recent few dozen frames are held — collect them each window, or the
-oldest are dropped rather than buffered forever.
+They are returned in the same shape as {func}`~eventcv.read_frames` and {func}`~eventcv.read_imu`
+return for a file. Read them every window: only the most recent few dozen are kept. These are not
+written to `record=` files.
 
-## How capture keeps up
+## Keep up with the camera
 
-Decoding, and any `record=` writing, run on a **background thread** that owns the camera. The
-driver's ring drains continuously whatever your loop is doing, and the loop only collects windows
-that are already decoded — so the per-window budget is yours to spend. On an EVK4 at `dt_ms=50`,
-40 ms of processing per frame still holds 19.9 of an ideal 20 fps with the ring empty.
+Capture runs on a background thread, so the camera is drained while your code works. If your loop is
+slower than the camera, windows queue up and you fall behind. `latest=True` always returns the newest
+window and skips the rest:
 
-The event GUI uses the same pump. {meth}`~eventcv.EventCamera.record`, APS viewing,
-{meth}`~eventcv.EventCamera.draw_mask`, and {meth}`~eventcv.EventCamera.close` take the camera back
-directly; normal reads restart the pump when needed.
-
-Four counters tell you what the pipeline is doing:
+```python
+with ecv.stream(dt_ms=30, latest=True, record="session.h5") as cam:
+    for events in cam:
+        slow_inference(events)  # skipped windows are still recorded
+```
 
 | Property | Meaning |
-|----------|---------|
-| {attr}`~eventcv.EventCamera.backlog` | Driver ring buffers waiting. Should sit near zero. |
-| {attr}`~eventcv.EventCamera.n_skipped` | Windows a `latest=True` loop passed over. |
-| {attr}`~eventcv.EventCamera.n_overflows` | Times the driver dropped events — loss upstream of EventCV. |
-| {attr}`~eventcv.EventCamera.n_recorded` | Events written by `record=`. |
+|---|---|
+| `cam.backlog` | Buffers waiting in the driver. Should stay near zero. |
+| `cam.n_skipped` | Windows skipped by `latest=True`. |
+| `cam.n_overflows` | Times the driver dropped events before EventCV saw them. |
+| `cam.n_recorded` | Events written by `record=`. |
 
-### Staying on live data
+## Limit what the sensor sends
 
-Windows are delivered in order, so a loop slower than the camera falls behind: the thread buffers a
-few windows, then applies backpressure, and under sustained overload the driver's ring is what
-finally overflows. `latest=True` trades completeness for freshness — each read returns the **newest**
-decoded window and drops what it overtook, holding latency at about one window however slow the loop
-is. On an EVK4 with a 200 ms per-window workload, a 5 s session ends 4.3 s behind in order versus
-0.2 s behind with `latest=True`.
-
-Skipped windows are still written by `record=` from the capture thread, so the archive stays complete
-even though the loop never sees them:
+A busy scene can produce more events than the host can decode. Limit them at the sensor:
 
 ```python
-with ecv.stream(dt_ms=30, repr="count", record="session.h5", latest=True) as cam:
-    while running:
-        slow_inference(cam.read().numpy())
-print(cam.n_skipped, "windows skipped,", cam.n_recorded, "events recorded")
+ecv.stream(dt_ms=50, max_event_rate=40_000_000)  # events per second
+ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))  # x0, y0, width, height
 ```
 
-### Capping what the sensor sends
+| Camera | `max_event_rate` | `roi` |
+|---|---|---|
+| Prophesee EVK4, EVK3 HD, CenturyArks VGA | On the sensor | On the sensor |
+| iniVation DVXplorer, DAVIS346 | Not supported (raises) | Applied on the host, with a warning |
 
-Every event costs time to decode, window, and render, so the cheapest event is one the camera never
-emits. `max_event_rate` (events per second) enables the sensor's on-chip event-rate controller, and
-`roi=(x0, y0, width, height)` masks every pixel outside that rectangle. Both are hardware features,
-so neither costs the host anything:
+`cam.roi` reports where the ROI was applied. A rate cap thins events evenly across the scene, so it
+is usually the better first choice; on an EVK4, around 40 million events per second keeps up on
+one core.
 
-```python
-ecv.stream(dt_ms=50, max_event_rate=40_000_000)  # 40 Mev/s ceiling, enforced on-chip
-ecv.stream(dt_ms=50, roi=(320, 180, 640, 360))  # centre quarter only
-```
+## Mask a region
 
-Both are on-chip on the sensors built around Prophesee's pipeline — the EVK4, the EVK3-HD, and the
-CenturyArks VGA. The iniVation cameras (DVXplorer, DAVIS346) have neither, so there `roi=` falls back
-to a host-side mask: the same events are dropped, but only after crossing the cable and being
-decoded, and a `RuntimeWarning` says so. `max_event_rate` still raises there, because capping the
-rate on the host would save none of the work the setting exists to avoid.
-{attr}`~eventcv.EventCamera.roi` reports which happened:
-
-```python
-cam = ecv.stream(roi=(320, 180, 640, 360))
-cam.roi  # {'rect': (320, 180, 640, 360), 'applied': 'hardware'}
-```
-
-A saturating scene on a 1280×720 sensor can emit far more than one core can decode, and capping the
-source is the only remedy that keeps the events you *do* receive contiguous rather than riddled with
-dropout holes. Measured on an EVK4 waved to saturation, `dt_ms=50` with `repr="tencode"`:
-
-| `max_event_rate` | Frame rate | Backlog | Pixels lit per frame |
-|------------------|-----------|---------|----------------------|
-| uncapped         | 6.4 fps   | 1845    | 99.6% of the sensor  |
-| 80 Mev/s         | 16.9 fps  | 188     | 92.2%                |
-| **40 Mev/s**     | **19.9 fps** | **0** | **83.9%**           |
-| 20 Mev/s         | 19.9 fps  | 0       | 60.9%                |
-
-40 Mev/s is the knee here: the first cap that clears the backlog entirely and holds the full frame
-rate, while keeping 84% of the lit pixels. Tightening further buys no extra frames and only costs
-scene content. The controller drops events proportionally rather than spatially, so the structure of
-the scene survives the cull — which is why a rate cap is usually the better default, and `roi` is for
-when you genuinely only care about part of the frame.
-
-Where the knee falls depends on your host: the decode pipeline costs about 16 ns per event
-(~6 ns parsing the sensor's wire format, ~10 ns accumulating events into a window), i.e. a ceiling
-near 62 Mev/s on one core. Caps below that keep up; caps above it leave a backlog.
-
-### Masking a region of interest
-
-`roi=` is a rectangle, fixed when the camera opens. When the region you care about is some other
-shape — a circular aperture, a window frame, a lens vignette — or when you need to change it while
-the camera runs, pass `mask=` instead: an `(H, W)` boolean array covering the sensor, always enforced
-on the host. Events outside it are dropped as they are decoded, before windowing, so they never reach
-a `record=` file, the windows your loop reads, or `show()`:
+For a region that isn't a rectangle, or one you want to change while streaming, pass a `mask=`.
+Events outside it are dropped before they reach your loop or the recording:
 
 ```python
 aperture = ecv.circle_mask((640, 480), cx=320, cy=240, r=230)
 
-with ecv.stream(dt_ms=50, mask=aperture, record="session.h5") as cam:
-    for events in cam:  # already masked — and so is the recording
-        track(events)
+with ecv.stream(dt_ms=50, mask=aperture) as cam:
+    ...
 ```
 
-Easiest is to draw it over the live view. {meth}`~eventcv.EventCamera.draw_mask` opens the viewer,
-lets you drag shapes, and applies what you drew to the camera:
+Or draw one over the live view:
 
 ```python
 cam = ecv.stream(dt_ms=50)
-cam.draw_mask()  # drag an ellipse over the aperture, press Enter
-ecv.save_mask(cam.mask, "aperture.png")  # reuse it next session with mask=ecv.load_mask(...)
+cam.draw_mask()  # draw, then press Enter; applied to the camera
+ecv.save_mask(cam.mask, "aperture.png")
 ```
 
-Drag to keep an area, shift+drag to drop one, `e`/`r`/`f` to switch between ellipse, rectangle, and
-freehand, `a`/`c` to select all or clear, `z` to undo. Whatever stays bright is what the mask keeps;
-`Enter` accepts and `Esc` cancels. Assign {attr}`~eventcv.EventCamera.mask` to change it mid-session
-(`None` clears it). Unlike `roi=`, a host-side mask does not reduce what crosses the USB cable — on
-a Prophesee sensor, combine the two: `roi=` for the bounding box, `mask=` for the shape inside it.
+Set `cam.mask` to change it mid-stream, or to `None` to clear it. A mask is applied on the host, so it
+doesn't reduce USB traffic; combine it with `roi=` on Prophesee cameras. See
+{ref}`roi-masking` for building masks and the drawing controls.
 
-See {ref}`ROI masking <roi-masking>` for building masks without a camera and for applying them to
-recordings.
+## Adaptive biasing
 
-### Tuning biases
-
-A camera opens on its factory biases. {meth}`~eventcv.EventCamera.list_biases` reports every bias
-the sensor exposes, with its current value, range, and the value it opened with, and
-{meth}`~eventcv.EventCamera.set_bias` changes one live, without interrupting the stream:
+Fixed sensor biases give very different event rates as lighting changes. `adaptive_bias=True` adjusts
+them as the camera runs to hold the event rate steady (Nair et al., IROS 2024):
 
 ```python
-with ecv.stream(dt_ms=50) as cam:
-    print(cam.list_biases()["diff_on"])  # {'value': 0, 'min': -77, 'max': 178, 'default': 0, ...}
-    cam.set_biases({"diff_on": 20, "diff_off": -20})  # less sensitive to contrast (Prophesee)
-    cam.save_biases("outdoor.json")
-
-cam = ecv.stream(biases="outdoor.json")  # opens straight onto the preset
+with ecv.stream(dt_ms=50, adaptive_bias=True) as cam:
+    for events in cam:
+        print(cam.bias_state)  # event rate, bias values, controller state
 ```
 
-`reset_biases()` puts back the values the camera opened with. Each entry carries a readable
-`label` and a `description` of which way to turn it. Entries with `primary=True` are the ones worth
-tuning for a scene, and they come first: ON/OFF threshold, refractory period, photoreceptor, and
-the filters. A DAVIS346 exposes 21 biases, but the other 16 set up its readout, ADC and interface,
-and rarely need changing. The same controls are in the live GUI (**Camera biases** in the
-inspector, with the rest under **Advanced**) and in `eventcv tui --camera` (press `b`; see
-[the CLI page](cli.md) for its keys). Both save and load presets.
-
-Names and units come from the camera's driver and differ by vendor. Prophesee values are signed
-offsets from the chip's factory value (`0` is stock, as in Metavision). DAVIS346 values are indices
-into its 2041-step bias-current ladder. These are *not* the absolute values `bias_state` reports for
-an EVK4. A preset remembers which camera model it came from and will not load onto another. While
-`adaptive_bias` runs, the biases it drives are marked `adaptive` and cannot be set by hand; the rest
-can.
-
-Settings beyond biases are vendor-specific: region masks, the DAVIS346 activity and polarity
-filters, and so on. {attr}`~eventcv.EventCamera.configuration` returns the driver's whole
-configuration as a nested dict, and {meth}`~eventcv.EventCamera.update_configuration` merges a
-change into it:
-
-```python
-cam.update_configuration({"activity_filter": {"refractory_period_enable": True}})  # DAVIS346
-```
-
-Its shape belongs to the `neuromorphic-drivers` crate and can change between driver versions. An
-unknown key is an error. So is a setting the driver only applies when the camera opens, such as
-the EVK4's rate limiter (use `max_event_rate=`). The DVXplorer driver applies no settings after it
-opens, so on a DVXplorer biases are read-only. Live writes have been checked on a DAVIS346. The
-EVK3-HD, DVXplorer and CenturyArks paths go through the same code but have not been tried on
-hardware.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Frame rate below `1000 / dt_ms`, `backlog` climbing | The camera outruns decoding | Cap with `max_event_rate`, or narrow the field with `roi` |
-| Noise outside the useful part of the sensor | The scene doesn't fill the sensor (a circular aperture, a vignette) | `mask=` an ROI of any shape, or draw one with `cam.draw_mask()` |
-| `n_overflows` rising | The driver dropped events before EventCV saw them | Same — cap the source; a busy scene on a large sensor can exceed any host |
-| Frames arrive but are stale | In-order delivery behind a slow loop | `latest=True` (and check `n_skipped`) |
-| `n_skipped` rising fast | Per-window work slower than the camera | Expected with `latest=True`; `record=` still archives everything |
-| Too many or too few events for the scene | Factory biases don't suit the lighting | Tune `diff_on`/`diff_off` (or `onbn`/`offbn`) with `set_bias`, or let `adaptive_bias=True` do it |
-| "no event camera found" with a camera attached | Another handle holds the device, or udev rules are missing | Close the other handle (`with ecv.stream() as cam:`), or install udev rules |
-| A panic from `usb.rs` ("callback called for a transfer marked as complete") aborting the process, usually on Windows and usually right after a camera is released | A race in the USB teardown inside `neuromorphic-drivers`, the driver crate underneath EventCV: a cancelled transfer's completion callback can arrive after its slot was retired. It is an abort, not a Python exception, so it cannot be caught | Open the camera **once** and keep it for the session rather than opening and closing one per recording. `ecv.record(...)` and `with ecv.stream(...) as cam:` both close deterministically, which keeps the teardown off unpredictable GC timing |
+For about the first second it measures the scene, then holds the rate it found. To aim for a
+specific rate instead, pass `adaptive_bias={"target_rate": (3e4, 1.2e5)}` (events per second).
+Supported on the DAVIS346 and EVK4; other cameras raise an error.
 
 ## Live viewer
 
-{meth}`~eventcv.EventCamera.show` opens an interactive window. With no argument it renders the raw
-event stream (polarity dots with exponential decay, tuned by `decay_ms`); pass a representation name
-to render that instead:
-
 ```python
-ecv.stream().show()  # raw polarity view (the default)
-ecv.stream(dt_ms=30).show("count", refresh_hz=60)
+ecv.stream().show()  # raw events
+ecv.stream(dt_ms=30).show("count")  # a representation
 ```
 
-The same accumulation, refresh-rate, statistics, and ordered processor controls used for recordings
-work live. Capture and `record=` continue while display is paused; the source panel reports windows
-the freshness queue skipped. It blocks on the main thread until the window closes, then the camera
-is usable again. `show("aps")` keeps the specialized APS viewer.
+`show()` blocks until the window closes. Recording continues while the view is paused.
+`show("aps")` shows a DAVIS's greyscale frames. See {doc}`video` for the viewer's controls.
 
-## Reference
+## Troubleshooting
 
-Full signatures and every {class}`~eventcv.EventCamera` method and property live in the
-{ref}`API reference <live-camera-streaming>`: {func}`~eventcv.stream`,
-{func}`~eventcv.list_cameras`, {class}`~eventcv.EventCamera`, and {class}`~eventcv.EventSink`.
-
-
-## Streaming over the network
-
-Events can be sent and received over UDP, wire-compatible with
-[aestream](https://github.com/aestream/aestream) and the SPIF transport SpiNNaker boards speak.
-
-```python
-import eventcv as ecv
-
-sender = ecv.UdpSender("127.0.0.1:3333")
-for events in ecv.stream(dt_ms=10):  # from a live camera
-    sender.send(events)
-```
-
-```python
-receiver = ecv.UdpReceiver("0.0.0.0:3333", sensor_size=(640, 480))
-while True:
-    events = receiver.recv(dt_ms=30)  # empty means silence, not failure
-    frame = events.tencode()
-```
-
-### What UDP does and does not promise
-
-There is no handshake, no acknowledgement and no retransmission. That suits event data — dropping a
-late packet beats delaying every packet behind it — but it has a consequence worth stating: **the
-count `send` returns is what was handed to the socket, not what arrived.**
-
-A large stream sent in one burst will overrun the receiver's kernel buffer unless something is
-draining it concurrently, even over loopback. The intended shape is a receiver looping on `recv`
-while the sender runs, not a send followed by a receive.
-
-### Wire format and byte order
-
-Events are 32-bit words: `x` in the high half, `y` in the low half, polarity in bit 15, and bit 31
-marking whether a timestamp word follows. A receiver detects the mode from the first word, so it
-does not need to be configured to match the sender.
-
-`timestamps=True` includes a timestamp per event, doubling the bandwidth. Without it the receiver
-stamps events on arrival — fine for live display, wrong for anything measuring latency. Note the
-wire timestamp is 32-bit and wraps after about 71 minutes at microsecond resolution.
-
-`host_endian` defaults to `True`, matching aestream — whose source concedes in comments that the
-packing *should* use `htons`/`htonl` and does not. Matching a documented bug is the only way to
-actually interoperate; set `host_endian=False` for correct network byte order with anything else.
+| Symptom | Fix |
+|---|---|
+| Frame rate below `1000 / dt_ms`, `backlog` rising | Cap with `max_event_rate`, or narrow with `roi`. |
+| `n_overflows` rising | The driver is dropping events. Cap the source as above. |
+| Frames lag behind real time | Use `latest=True`. |
+| "No event camera found" with one attached | Another handle has it open, or udev rules are missing. |
+| Process aborts with a `usb.rs` panic on Windows after closing a camera | A known race in the underlying driver. Open the camera once per session rather than repeatedly. |

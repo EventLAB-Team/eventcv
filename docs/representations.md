@@ -1,426 +1,315 @@
 # Representations
 
-A **representation** turns a sparse {class}`~eventcv.EventStream` into a dense tensor
-(most are `[C, H, W]`, ready for NumPy / PyTorch) or, for {func}`~eventcv.pset`, a sparse
-point array. Most are reachable three ways:
+A representation turns events into a dense image or tensor that NumPy, PyTorch and the viewer can
+use. Each call returns an {class}`~eventcv.EventFrame`; `.numpy()` gives the `(C, H, W)` array.
 
 ```python
-stream.voxel(bins=5)  # method
-ecv.voxel(stream, bins=5)  # free function (OpenCV-style)
-stream.flatten("voxel")  # by name (defaults; see "By name" below)
+import eventcv as ecv
+
+stream = ecv.load("recording.h5")
+frame = stream.voxel(bins=5)
+array = frame.numpy()  # (5, H, W) float32
 ```
 
-The **method** and **free-function** forms take the representation's parameters directly. The
-**name** form (a string like `"voxel"`) selects a representation for
-{meth}`~eventcv.EventStream.flatten`, {meth}`~eventcv.EventStream.view`, `open(..., repr=...)`,
-and `reader.with_repr(...)` — but only `reader.with_repr(name, **opts)` also forwards the
-representation's parameters; the other three use its defaults. A few representations don't fit
-all three forms; each is flagged in its section below.
+## Choose a representation
 
-## Summary
+Click a representation to jump to its parameters. All images are from the same 50 ms recording.
 
-| Name       | Method            | Channels | Dtype             | What it encodes |
-|------------|-------------------|----------|--------------------|-----------------|
-| `polarity` | *(none — default view, or by name)* | 2   | `uint64`/`uint8`   | Per-pixel event count, split into positive/negative planes. The default view when no representation is requested. |
-| `binary`   | *(none — `flatten(binary=True)`, or by name)* | 1 | `uint8`         | Pixel fired at all (`1`) or not (`0`), both polarities merged. |
-| `count`    | {func}`~eventcv.count`   | 1  | `uint64`/`uint8`   | Total events per pixel, both polarities summed. |
-| `voxel`    | {func}`~eventcv.voxel`   | `bins` | `float32`      | Signed, time-interpolated polarity across `bins` temporal bins over the last `window_ms`. |
-| `tsurf`    | {func}`~eventcv.tsurf`   | 2  | `float32`          | Time surface: `exp(-age/tau_ms)` of the *latest* event per pixel/polarity. |
-| `atsurf`   | {func}`~eventcv.atsurf`  | 2  | `float32`          | Averaged time surface: mean of `exp(-age/tau_ms)` over *all* events per pixel/polarity. |
-| `tencode`  | {func}`~eventcv.tencode` | 3  | `uint8`            | Latest polarity + normalized age within `window_ms`, as an RGB-like image. |
-| `redblue` | {func}`~eventcv.redblue` | 3 | `uint8` | White-background red/blue counts, independently normalized per polarity; the stronger normalized polarity wins. |
-| `countmask`| {func}`~eventcv.countmask` | 3 | `uint8`           | Positive/negative event counts in red/blue, jointly normalized by a percentile of the non-zero counts, plus a binary activity mask in green. Timestamps unused. |
-| `mcts`     | {func}`~eventcv.mcts`    | `2·N` (10) | `float32`  | Multi-channel time surface: 5 log-spaced windows up to `max_window_ms` (or the `N` windows in `windows_ms`), per polarity. |
-| `flow`     | {func}`~eventcv.optical_flow` | 2 | `float32`     | Dense Lucas-Kanade optical flow `(flow_x, flow_y)` on the time surface, pixels/ms. |
-| `pset`     | {func}`~eventcv.pset`    | — (`[N, 4]`) | `float32`    | Sparse, normalized `(x, y, t, p)` point array — not a dense frame. |
-| `labels`   | {meth}`~eventcv.EventFrame.connected_components` | 1 | `uint64`   | Connected-component labels of an existing frame (post-processing, not stream-level). |
+::::{grid} 2 2 3 3
+:gutter: 2
 
-Two rows are special cases rather than string-selectable representations: `pset` returns a
-sparse point array (not a dense frame), and `labels` is computed from an existing frame — so
-neither is a valid `repr=` / `flatten` / `view` name. See their sections below.
+:::{grid-item-card} polarity
+:img-top: images/representations/polarity.png
+:link: repr-polarity
+:link-type: ref
+Counts per pixel, per polarity.
+:::
 
-The time-span parameters (`window_ms`, `tau_ms`, `max_window_ms`) default to `30.0` on a plain
-stream, but **an unset span follows the window the events came from**: on a live capture it
-defaults to `stream(dt_ms=…)`, and on a file it defaults to the slice duration — `open(path,
-dt_ms=50).slice(0).mcts()` covers the full 50 ms rather than clipping to 30. An explicit span
-always wins. Count-based windows (`max_events`) have no fixed duration, so the 30 ms default
-stands there.
+:::{grid-item-card} count
+:img-top: images/representations/count.png
+:link: repr-count
+:link-type: ref
+Counts per pixel, polarities summed.
+:::
 
-The dtype column lists `uint64`/`uint8` for the two representations with a `normalize` option
-(`count` and `polarity`): raw `uint64` counts, or `uint8` rescaled so the busiest pixel maps to `downsample=k` bins `k`×`k` sensor pixels into one cell (`x // k`, `y // k`) as it counts — the same integers as `stream.resize(width // k, height // k)` followed by the histogram, in one pass; on a reader (`open(..., repr="polarity", downsample=k)` or `with_repr("polarity", downsample=k)`) the RAW decoder feeds the accumulator directly, so no event stream is built per window.
-255 when `normalize=True`. The default differs by representation: `polarity` normalizes by
-default (`True`), while `count` returns raw counts by default (`False`) so the frame preserves
-exact event totals. The rest have no normalization option. `view` always auto-contrasts for
-display regardless of the frame's dtype.
+:::{grid-item-card} binary
+:img-top: images/representations/binary.png
+:link: repr-binary
+:link-type: ref
+Whether a pixel fired.
+:::
 
-## Polarity
+:::{grid-item-card} voxel
+:img-top: images/representations/voxel.png
+:link: repr-voxel
+:link-type: ref
+Polarity spread over time bins.
+:::
+
+:::{grid-item-card} tsurf
+:img-top: images/representations/tsurf.png
+:link: repr-tsurf
+:link-type: ref
+How recently each pixel fired.
+:::
+
+:::{grid-item-card} atsurf
+:img-top: images/representations/atsurf.png
+:link: repr-atsurf
+:link-type: ref
+Time surface averaged over all events.
+:::
+
+:::{grid-item-card} mcts
+:img-top: images/representations/mcts.png
+:link: repr-mcts
+:link-type: ref
+Time surfaces over several windows.
+:::
+
+:::{grid-item-card} tencode
+:img-top: images/representations/tencode.png
+:link: repr-tencode
+:link-type: ref
+Latest polarity and event age as RGB.
+:::
+
+:::{grid-item-card} countmask
+:img-top: images/representations/countmask.png
+:link: repr-countmask
+:link-type: ref
+Counts in red/blue, activity in green.
+:::
+
+:::{grid-item-card} redblue
+:img-top: images/representations/redblue.png
+:link: repr-redblue
+:link-type: ref
+Red/blue counts on white.
+:::
+
+:::{grid-item-card} flow
+:img-top: images/representations/flow.png
+:link: repr-flow
+:link-type: ref
+Dense optical flow.
+:::
+::::
+
+## Where to use one
+
+| Where | Example | Parameters |
+|---|---|---|
+| A stream | `stream.voxel(bins=5)` or `ecv.voxel(stream, bins=5)` | All |
+| Every slice of a file | `ecv.open(path, dt_ms=30, repr="voxel")` | Defaults only |
+| Every slice, with parameters | `ecv.open(path, dt_ms=30).with_repr("voxel", bins=5)` | All |
+| A live camera | `ecv.stream(dt_ms=50, repr="voxel")` | All, as keywords |
+| The viewer | `stream.view("voxel")` | Defaults only |
+| By name on a stream | `stream.flatten("voxel")` | Defaults only |
+
+With `repr=` set, a reader returns frames from `slice()` and arrays from `reader[i]`, so it works
+directly as a PyTorch dataset. See {doc}`large-files`.
+
+## Common parameters
+
+| Parameter | Applies to | Default | Meaning |
+|---|---|---|---|
+| `window_ms`, `tau_ms`, `max_window_ms` | voxel, tencode, tsurf, atsurf, mcts | The slice length, else 30 ms | Time span the representation covers. |
+| `normalize` | polarity, count | `True` for polarity, `False` for count | Scale to `uint8` with the busiest pixel at 255, or keep raw `uint64` counts. |
+| `device` | count, voxel, tsurf, atsurf, countmask, redblue | `"cpu"` | Run on `"gpu"`. The CPU is usually faster; see {doc}`gpu`. |
+
+Time spans also accept `_s`, `_us` and `_ns` forms, e.g. `window_us=500`. An explicit span always
+overrides the slice length.
+
+## Counts
+
+(repr-polarity)=
+### polarity
 
 ```python
-stream.view()  # implicit — polarity is the default when nothing is stored/named
-stream.flatten("polarity")
-ecv.flatten(stream, "polarity", normalize=False)
+frame = stream.flatten()  # or stream.flatten("polarity")
 ```
 
-Two channels, `[positive, negative]`: raw event counts per pixel per polarity (`uint64`), or
-`uint8` rescaled to the busiest pixel when `normalize=True` (the default). This is the frame
-rendered whenever no representation is requested or stored on the stream — there is no
-dedicated `.polarity()` method, only the name form and the implicit default. (A reader opened
-with `open(repr=...)` renders that representation on `slice()` directly instead of falling back
-to polarity.)
+| Parameter | Default | Meaning |
+|---|---|---|
+| `normalize` | `True` | See [common parameters](#common-parameters). |
+| `downsample` | `None` | Bin `k`×`k` pixels into one cell while counting. |
 
-## Binary
+**Output:** 2 channels `[positive, negative]` · `uint8`, or `uint64` with `normalize=False`.
 
-```python
-stream.flatten(binary=True)  # dedicated flag
-stream.flatten("binary")  # equivalent, by name
-```
+The default frame when no representation is named. There is no `.polarity()` method.
 
-Single channel, `uint8`, `1` where a pixel fired at all (either polarity) and `0` elsewhere.
-No parameters, and — like `polarity` — no dedicated method; only reachable via
-`flatten(binary=True)` or the `"binary"` name.
-
-## Count
-
-```python
-stream.count()  # raw uint64 counts (default)
-ecv.count(stream, normalize=True)  # uint8, busiest pixel → 255
-```
-
-- `normalize` (`bool`, default `False`) — when `True`, rescale to `uint8` (busiest pixel → 255)
-  instead of the default raw `uint64` counts.
-
-Single channel: total events per pixel, both polarities summed. The plainest "how much
-happened here" frame — unlike `polarity`, it collapses polarity into one intensity map. The raw
-`uint64` default keeps exact totals (e.g. `count().numpy().sum()` equals the event count), which
-is what you want for analysis; pass `normalize=True` for a display-scaled image.
-
-## Voxel grid
-
-```python
-stream.voxel(bins=9, window_ms=30.0)
-ecv.voxel(stream, bins=5, window_ms=50.0)
-```
-
-- `bins` (`int`, default `9`) — number of temporal bins; must be at least 1.
-- `window_ms` (`float`, default `30.0`) — trailing time window before the stream's last event.
-
-`bins` channels, `float32`, signed. Each event contributes `+1`/`-1` (by polarity), linearly
-interpolated between its two nearest bins by how far into `window_ms` it falls — events outside
-the window are dropped.
-
-## Time surface (`tsurf`)
-
-```python
-stream.tsurf(tau_ms=30.0)
-ecv.tsurf(stream, tau_ms=10.0)
-```
-
-- `tau_ms` (`float`, default `30.0`) — exponential decay constant; must be finite and positive.
-
-Two channels, `[positive, negative]`, `float32`. Each pixel/polarity holds
-`exp(-age_ms / tau_ms)` for its **most recent** event only (`0` if that polarity never fired
-there) — a snapshot of "how recently did this fire."
-
-## Averaged time surface (`atsurf`)
-
-```python
-stream.atsurf(tau_ms=30.0)
-ecv.atsurf(stream, tau_ms=30.0)
-```
-
-- `tau_ms` (`float`, default `30.0`) — exponential decay constant; must be finite and positive.
-
-Two channels, `[positive, negative]`, `float32`. Same exponential response as `tsurf`, but
-**averaged over every event** that hit the pixel rather than keeping only the latest — recurring
-activity reads brighter than a single stale hit.
-
-Related in spirit to HATS (Sironi et al., CVPR 2018), but not that paper's scheme: HATS partitions
-the sensor into cells, keeps a local memory per cell and polarity, and builds a local neighbourhood
-surface for every event before averaging into per-cell histograms. `atsurf` is a per-pixel mean in a
-single pass, with a different output shape.
-
-## Tencode
-
-```python
-stream.tencode(window_ms=30.0)
-ecv.tencode(stream, window_ms=30.0)
-```
-
-- `window_ms` (`float`, default `30.0`) — trailing time window; must be finite and positive.
-
-Three channels, `[positive, age, negative]`, `uint8`. Per pixel: whichever polarity fired most
-recently sets its channel to `255` (the other stays `0`), and the `age` channel holds that
-event's age rescaled to `0-255` across `window_ms`. Reads like an RGB image (red/green-style
-polarity planes plus a brightness-coded age plane).
-
-## Count mask
-
-```python
-stream.countmask(pct=99.0)
-ecv.countmask(stream, pct=99.0, white_frame=False)
-```
-
-- `pct` (`float`, default `99.0`) — normalization percentile; must be between `0` and `100`.
-- `white_frame` (`bool`, default `False`) — invert to a white background.
-
-Three channels, `[positive, activity, negative]`, `uint8` — the event-accumulation image of the
-GEPT paper (Sec. 3.2, Eq. 2). Red holds the per-pixel count of positive events and blue the count
-of negative ones; green is a binary mask, `255` wherever an event of either polarity landed and
-`0` elsewhere. **Timestamps are not used at all**, which is what separates it from `tencode`
-(latest polarity plus event age) and from `count` (one plane of raw totals).
-
-Both count planes are clipped and rescaled by a **single** scale: the `pct`-th percentile of the
-non-zero counts of the two planes *pooled together*. Pooling matters — a per-channel percentile
-would let a quiet polarity saturate against a busy one, so the joint scale is what keeps red and
-blue comparable. Counts above the percentile clamp to full scale.
-
-Expect a dark red/blue image over a bright green mask; on typical data the green plane averages
-several times brighter than the other two. `white_frame=True` inverts the whole image, background
-included, and exists for parity with the reference renderer — descriptor models trained on these
-frames expect the black-background default.
-
-## Red/blue counts
-
-```python
-stream.redblue(pct=99.0)
-ecv.redblue(stream, pct=99.0, white_frame=True, device="cpu")
-```
-
-Three RGB channels `[red, green, blue]`, shape `[3, H, W]`, `uint8`. Positive activity
-shades white toward red and negative activity shades it toward blue. Each polarity is clipped
-and normalized independently by the `pct`-th percentile of its nonzero counts, using linear
-interpolation. At each pixel only the stronger normalized polarity contributes; ties favor
-positive. Green is the inverse winning intensity, not a binary activity mask.
-
-`pct` defaults to `99.0` and must be finite and between `0` and `100`, inclusive.
-`white_frame` defaults to `True` and is accepted for compatibility: either value produces the
-same white background. Empty streams produce white frames. Timestamps are unused.
-`device` follows the session default; GPU counting uses the existing polarity kernel and
-normalization stays on the CPU. Colors pass through unchanged when displayed or exported.
-
-## MCTS (multi-channel time surface)
-
-```python
-stream.mcts(max_window_ms=30.0)
-ecv.mcts(stream, max_window_ms=16.0)
-stream.mcts(windows_ms=[1, 5, 20])  # explicit windows: 6 channels
-```
-
-- `max_window_ms` (`float`, default: the slice/capture window, else `30.0`) — largest of the
-  5 log-spaced windows; must be at least `1.0`.
-- `windows_ms` (`list[float]`) — explicit windows instead of the log-spaced ladder: `N`
-  finite, positive spans, used in the order given, producing `2·N` channels. Mutually
-  exclusive with `max_window_ms` (passing both is a `ValueError`); duplicates are allowed
-  (and yield duplicate channel names). Takes the usual unit siblings
-  (`windows_s`/`windows_us`/`windows_ns`).
-
-`2·N` channels, `float32` (ten by default): one channel per window for each of
-`negative`/`positive` (channel names carry the window, like `negative_1.000ms` …
-`positive_30.000ms`). By default the windows are 5 log-spaced spans from `1 ms` up to
-`max_window_ms`. Each channel holds `max(1 - age/window)` over events within that window — a
-multi-timescale generalization of `tsurf`.
-
-## Optical flow
-
-```python
-stream.optical_flow(window=3)
-ecv.optical_flow(stream, window=5)
-stream.view("flow")  # by name; also valid for open(repr="flow")
-```
-
-- `window` (`int`, default `3`) — half-width of the least-squares neighbourhood (a
-  `(2·window+1)²` patch); must be at least 1.
-
-Two channels, `[flow_x, flow_y]`, `float32`, in pixels/ms. Dense Lucas-Kanade on the time
-surface (the Surface of Active Events): fits one velocity per pixel by least squares, falling
-back to normal flow along the gradient in the aperture-problem case, and leaving flat,
-event-free windows at zero. Flow is emitted only at pixels that saw an event, and assumes the
-stream is sorted ascending by time.
-
-## Sparse point set
-
-```python
-points = stream.pset()
-ecv.pset(stream).numpy()  # [N, 4] float32 array: columns (x, y, t, p)
-```
-
-No parameters. Unlike the frame representations above, `pset` returns an
-{class}`~eventcv.EventPointSet`, not an {class}`~eventcv.EventFrame`: an `[N, 4]` array with
-`x`/`y` normalized to `[0, 1]` by sensor size, `t` normalized to `[0, 1]` over the stream's
-span, and `p` as `+1`/`-1`. Because it's sparse rather than a dense `[C, H, W]` tensor, it
-isn't a valid choice for `open(repr=...)` / `reader.with_repr(...)` (those require a dense
-frame per slice).
-
-## Connected-component labels
+(repr-count)=
+### count
 
 ```python
 frame = stream.count()
-labels = frame.connected_components(connectivity=8)
 ```
 
-- `connectivity` (`int`, default `8`) — `4` or `8`-connectivity for the flood fill.
+| Parameter | Default | Meaning |
+|---|---|---|
+| `normalize` | `False` | See [common parameters](#common-parameters). |
 
-Single channel, `uint64`. This is a **post-processing** step on an existing
-{class}`~eventcv.EventFrame` (typically a `binary` or `count` image), not a representation
-generated directly from a stream: any non-zero pixel (across all channels) is foreground, and
-each maximal connected blob gets a distinct label `1..k`, with background `0`.
+**Output:** 1 channel · `uint64`, or `uint8` with `normalize=True`.
 
-## By name
+The raw default keeps exact totals: `stream.count().numpy().sum() == len(stream)`.
 
-A representation can be picked by string anywhere a name is accepted:
-{meth}`~eventcv.EventStream.flatten`, {meth}`~eventcv.EventStream.view`, `open(..., repr=...)`,
-and `reader.with_repr(...)`. The name is one of `"polarity"`, `"binary"`, `"count"`,
-`"countmask"`, `"redblue"`, `"voxel"`, `"tsurf"`, `"atsurf"`, `"tencode"`, `"mcts"`, or `"flow"`.
-
-`flatten`, `view`, and `open(repr=...)` render the representation with its **default**
-parameters — they don't accept a representation's own parameters (`bins`, `tau_ms`, `window_ms`,
-`max_window_ms`, `windows_ms`, `window`, `pct`, `white_frame`), so `stream.flatten("voxel", bins=5)` is a
-`TypeError`. The one
-exception is `normalize`, which is an argument of `flatten`/`view` themselves, so
-`stream.flatten("count", normalize=True)` does work (and each representation keeps its own
-`normalize` default when the argument is omitted — `False` for `count`, `True` for `polarity`).
-To override the other parameters by name, use `reader.with_repr(name, **opts)`, which returns a
-new dataset reader:
+(repr-binary)=
+### binary
 
 ```python
-# defaults, by name:
-stream.flatten("voxel")  # == stream.voxel()  (bins=9)
-reader = ecv.open("huge.hdf5", dt_ms=30, repr="mcts")  # mcts, max_window_ms follows dt (30)
-
-# parameters by name — only with_repr forwards them:
-reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("voxel", bins=5)
-array = reader[0]  # [5, H, W] voxel for frame 0
-frame = reader.slice(7)  # EventFrame — voxel(bins=5) applied
-reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("countmask", pct=95.0)
-reader = ecv.open("huge.hdf5", dt_ms=30).with_repr("mcts", windows_ms=[1, 5, 20])
-
-# a repr-less reader yields a stream; name the representation on the slice:
-frame = ecv.open("huge.hdf5", dt_ms=30).slice(7).flatten("mcts")  # → EventFrame
+frame = stream.flatten(binary=True)  # or stream.flatten("binary")
 ```
 
-`"pset"` and `"labels"` are not valid names here — `pset` is sparse (see above), and `labels`
-is generated from a frame, not a stream.
+**Output:** 1 channel · `uint8`. `1` where a pixel fired, `0` elsewhere. No parameters.
 
-## Running on a GPU
+## Time-based
 
-Every representation runs on the CPU by default, and those implementations are the reference: the
-GPU kernels are checked against them, not the other way round. `device="gpu"` moves one call,
-`eventcv.set_device("gpu")` moves the session, and `EVENTCV_DEVICE=gpu` moves a whole process
-without touching any code.
+(repr-voxel)=
+### voxel
 
 ```python
-frame = stream.voxel(bins=5, device="gpu")
-
-ecv.set_device("gpu")  # everything from here on, including reader slices
-print(ecv.get_device())  # "gpu"
-print(ecv.gpu_available())  # False on a build or a machine without one
+frame = stream.voxel(bins=9, window_ms=30)
 ```
 
-The backend is `wgpu`, so the same shaders run on **Metal** (macOS), **Vulkan** (Linux) and
-**DX12** (Windows) — there is no CUDA path to install and no separate Apple path to maintain.
-Asking for a GPU that is not there raises rather than quietly falling back, because "my GPU is not
-being used" should not be something you discover by timing a benchmark.
+| Parameter | Default | Meaning |
+|---|---|---|
+| `bins` | `9` | Number of time bins. |
+| `window_ms` | slice length | Span ending at the last event. Earlier events are dropped. |
 
-### Whether it is worth it
+**Output:** `bins` channels · `float32`.
 
-Usually not, and the numbers say so. Measured on an RTX 2080 against a 12-core CPU, release build,
-8 M events from a 346×260 recording:
+Each event adds `+1` or `-1` by polarity, split between its two nearest bins.
 
-| kernel | CPU | GPU | |
-|---|---|---|---|
-| `count` | 10.5 ms | 19.1 ms | CPU wins |
-| `countmask` | 16.7 ms | 20.3 ms | CPU wins |
-| `voxel(bins=5)` | 20.8 ms | 28.8 ms | CPU wins |
-| `tsurf` | 34.2 ms | 29.8 ms | about even |
-| `atsurf` | 83.9 ms | 29.2 ms | **2.9× faster** |
-
-The pattern is not about the GPU being slow. These kernels are scatter-adds that the CPU already
-does at memory speed, so the cost is dominated by getting the events across the bus — and only
-`atsurf`, which evaluates an exponential per event, has enough arithmetic to pay for the trip. The
-place the GPU wins clearly is the **simulator**, where every sub-step is a full pass of real
-arithmetic over every pixel; see {doc}`simulation`.
-
-So: leave it on the CPU unless you have measured otherwise on your own data. `cargo bench --features
-gpu -- representations_gpu` runs the comparison above on your machine.
-
-### What changes, numerically
-
-Nothing you would notice, and the tests pin exactly how much:
-
-- `count`, `polarity`, `countmask`, `redblue` and `tsurf` are **bit-identical** to the CPU. They accumulate
-  integers, and integer addition commutes exactly where float addition does not.
-- `voxel` and `atsurf` accumulate in Q16.16 fixed point, which is what makes them independent of
-  the order the GPU happened to run in. They agree with the CPU to about 1e-4 on a cell — well
-  below `float32`'s own resolution for those values — and are bit-reproducible run to run.
-- A representation with no kernel (`tencode`, `mcts`, `binary`, `flow`) simply runs on the CPU when
-  you ask for the GPU. A pipeline that sets `device="gpu"` once should not have to know which steps
-  were ported.
-
-## Experimental custom representations
-
-Define a stateless dense representation with a NumPy-style function. EventCV traces
-it once, generates Rust source, and compiles a CPU kernel on its first call:
+(repr-tsurf)=
+### tsurf
 
 ```python
-import numpy as np
-import eventcv as ecv
-
-
-@ecv.representation(channels=2, channel_names=["negative", "positive"])
-def weighted_counts(events):
-    out = np.zeros((2, events.height, events.width), dtype=np.float32, like=events)
-    weights = np.exp(-events.age_ms / 30)
-    np.add.at(out, (events.p.astype(np.int64), events.y, events.x), weights)
-    return out
-
-
-frame = weighted_counts(stream)  # EventFrame, shape [2, H, W]
-reader = ecv.open("recording.npz", dt_ms=30).with_repr(weighted_counts)
-array = reader[0]  # NumPy array
-weighted_counts.compile()  # optional explicit preparation
-print(weighted_counts.rust_source)
+frame = stream.tsurf(tau_ms=30)
 ```
 
-`like=events` is required to dispatch allocation to the tracer. Output must be
-`float32`, with the declared channel count and original sensor dimensions. Names
-must contain one string per channel; defaults are `channel_0`, `channel_1`, etc.
-Use a function factory to choose parameters or channel counts. Configuration is
-captured at decoration time; recreate the representation to change it.
+| Parameter | Default | Meaning |
+|---|---|---|
+| `tau_ms` | slice length | Decay constant. |
 
-The event input exposes integer `x`, `y`, and raw `t`, boolean `p`,
-`timestamp_scale_ms`, and `age_ms` relative to the final event. Relative ages
-subtract integers before conversion to floating point, preserving small differences
-between large timestamps. Sensor dimensions are allocation placeholders, not
-values for Python arithmetic or branching.
+**Output:** 2 channels `[positive, negative]` · `float32`.
 
-Supported operations include scalar and elementwise arithmetic, comparisons,
-boolean conjunction/disjunction, boolean event masks, `np.where`, `np.exp`,
-`np.floor`, `np.minimum`, `np.maximum`, `np.clip`, and explicit casts to `float32`,
-`float64`, `int64`, and `uint64`. Use `np.add.at` or `np.maximum.at` to accumulate
-into `(channel, y, x)`. Two-dimensional allocations also support `(y, x)` indices;
-`np.stack([plane_a, plane_b])` combines them into channels. Integer indices must
-be in bounds; negative indices raise rather than wrapping. Empty inputs produce
-zero frames. Maximum accumulation starts at zero.
+Each pixel holds `exp(-age / tau)` of its most recent event, or `0` if it never fired.
 
-Arithmetic preserves matching operand types and otherwise uses float64; division
-uses float64. Contributions are cast to float32 before accumulation. This is an
-explicit numerical subset, not NumPy's complete promotion and broadcasting rules.
-Accumulation follows event order with no parallel scatter or fast-math flags.
-Python loops over fixed configuration are allowed; loops over events,
-data-dependent Python branches, general array mutation, and other NumPy
-operations raise during tracing. No Python execution fallback is provided.
+(repr-atsurf)=
+### atsurf
 
-Compilation requires `rustc` and the platform linker. The generated library uses
-only Rust's standard library. Source and binaries are cached under
-`$XDG_CACHE_HOME/eventcv/kernels-v1` (otherwise `~/.cache/eventcv/kernels-v1`),
-keyed by source, platform, compiler version and flags. Compatible cached kernels
-can be loaded without the compiler. Kernel execution releases the GIL and borrows
-event columns directly. Cold compilation and warm execution have different costs;
-benchmark your representation before assuming handwritten-kernel performance.
+```python
+frame = stream.atsurf(tau_ms=30)
+```
 
-Custom representations are CPU-only, including when the session device is GPU.
-They work as direct calls and reader objects passed to `with_repr`; custom string
-selectors, `open(repr=...)`, live capture integration, state across windows, sparse
-outputs and GPU compilation are outside this experimental API. Saved frames retain
-custom channel names and values, but do not contain executable kernels. Functions
-are trusted Python code and execute during tracing; this API is not a sandbox.
+| Parameter | Default | Meaning |
+|---|---|---|
+| `tau_ms` | slice length | Decay constant. |
+
+**Output:** 2 channels `[positive, negative]` · `float32`.
+
+Like `tsurf`, but averaged over every event at the pixel, so repeated activity reads brighter.
+
+(repr-mcts)=
+### mcts
+
+```python
+frame = stream.mcts(max_window_ms=30)  # 5 log-spaced windows, 10 channels
+frame = stream.mcts(windows_ms=[1, 5, 20])  # your own windows, 6 channels
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `max_window_ms` | slice length | Largest of 5 log-spaced windows starting at 1 ms. |
+| `windows_ms` | `None` | Explicit windows instead. Cannot be combined with `max_window_ms`. |
+
+**Output:** 2 channels per window, negative then positive (e.g. `negative_1.000ms`) · `float32`.
+
+Each channel holds `max(1 - age / window)` over the events in that window.
+
+(repr-tencode)=
+### tencode
+
+```python
+frame = stream.tencode(window_ms=30)
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `window_ms` | slice length | Span used to scale event age. |
+
+**Output:** 3 channels `[positive, age, negative]` · `uint8`.
+
+The polarity that fired last is set to 255. The age channel scales that event's age to 0–255.
+
+## Colour images
+
+(repr-countmask)=
+### countmask
+
+```python
+frame = stream.countmask(pct=99)
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `pct` | `99.0` | Percentile of non-zero counts that maps to full brightness. |
+| `white_frame` | `False` | Invert to a white background. |
+
+**Output:** 3 channels `[positive, activity, negative]` · `uint8`.
+
+Red and blue hold polarity counts on one shared scale. Green is 255 wherever an event landed.
+Timestamps are ignored. This is the event image from the GEPT tracker.
+
+(repr-redblue)=
+### redblue
+
+```python
+frame = stream.redblue(pct=99)
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `pct` | `99.0` | Percentile of non-zero counts that maps to full colour. |
+
+**Output:** 3 channels RGB · `uint8`.
+
+Positive events shade the white background toward red, negative toward blue. Each polarity is
+scaled separately, and the stronger one wins at each pixel. Timestamps are ignored.
+
+## Other outputs
+
+(repr-flow)=
+### flow
+
+```python
+frame = stream.optical_flow(window=3)  # or stream.view("flow")
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `window` | `3` | Half-width of the fitting patch. |
+
+**Output:** 2 channels `[flow_x, flow_y]` in pixels/ms · `float32`.
+
+Lucas–Kanade on the time surface, set only at pixels that saw an event. The stream must be sorted by
+time.
+
+### pset
+
+```python
+points = stream.pset().numpy()  # (N, 4) float32: x, y, t, p
+```
+
+A sparse point set rather than an image, returned as an {class}`~eventcv.EventPointSet`. `x`, `y` and
+`t` are scaled to `[0, 1]`; `p` is `+1` or `-1`. It can't be used with `repr=`.
+
+### Connected components
+
+```python
+labels = stream.flatten(binary=True).connected_components(connectivity=8)
+```
+
+Labels each connected blob of non-zero pixels in a frame `1, 2, …`, with background `0`.
+`connectivity` is `4` or `8`. Output is 1 channel, `uint64`.
