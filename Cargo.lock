@@ -3784,6 +3784,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "eventcv-core",
+ "flate2",
  "icy_sixel 0.7.0",
  "image",
  "ratatui",

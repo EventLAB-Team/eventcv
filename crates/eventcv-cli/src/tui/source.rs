@@ -105,6 +105,8 @@ impl FileFeed {
             }
             _ => {
                 let start = t1 - dt_us.max(lookback_us);
+                // The filters carry state from earlier batches, which this read may go back over.
+                pipeline.reset();
                 let events = self.reader.slice_time(start - pipeline.lookback_us(), t1)?;
                 let fresh = pipeline.process((start, t1), events);
                 let window = fresh.time_window(t0, t1);

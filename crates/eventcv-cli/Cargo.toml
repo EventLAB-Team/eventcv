@@ -26,6 +26,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Sixel and iTerm2 sequences written directly; see `tui/pixels.rs` for why not the crate's.
 icy_sixel = "0.7"
 base64-simd = "0.8"
+# Kitty frames are deflated (`o=z`) ourselves; already in the tree through ratatui-image.
+flate2 = "1.1"
 ctrlc = "3"
 
 [features]

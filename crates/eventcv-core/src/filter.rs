@@ -104,23 +104,47 @@ impl EventStream {
         neighbourhood: Neighbourhood,
     ) -> EventStream {
         let (width, height) = self.sensor_size();
+        self.background_activity_on(&mut vec![i64::MIN; width * height], dt, neighbourhood)
+    }
+
+    /// [`Self::background_activity_filter_with`] against `last`, each pixel's latest timestamp
+    /// (row-major `width·height`, `i64::MIN` for none), which it updates. Carried from one batch to
+    /// the next, it filters a stream batch by batch exactly as in a single call.
+    fn background_activity_on(
+        &self,
+        last: &mut [i64],
+        dt: i64,
+        neighbourhood: Neighbourhood,
+    ) -> EventStream {
+        let (width, height) = self.sensor_size();
         if width == 0 || height == 0 {
             return self.clone();
         }
         let offsets = neighbourhood.offsets();
-        let mut last = vec![i64::MIN; width * height]; // surface of active events
+        // The same offsets as steps through the row-major surface, for pixels off the border.
+        let steps: Vec<isize> = offsets
+            .iter()
+            .map(|&(dx, dy)| dy as isize * width as isize + dx as isize)
+            .collect();
         let (xs, ys, ts, ps) = (self.xs(), self.ys(), self.ts(), self.ps());
         let mut builder =
             EventStreamBuilder::with_capacity(width, height, self.timestamp_scale_ms(), self.len());
         for index in 0..self.len() {
             let (x, y, t) = (xs[index] as usize, ys[index] as usize, ts[index]);
-            let keep = offsets.iter().any(|&(dx, dy)| {
-                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                (0..width as i32).contains(&nx)
-                    && (0..height as i32).contains(&ny)
-                    && t.saturating_sub(last[ny as usize * width + nx as usize]) <= dt
-            });
-            last[y * width + x] = t; // seed the surface even for dropped noise
+            let pixel = y * width + x;
+            let keep = if x > 0 && y > 0 && x + 1 < width && y + 1 < height {
+                steps
+                    .iter()
+                    .any(|&step| t.saturating_sub(last[pixel.wrapping_add_signed(step)]) <= dt)
+            } else {
+                offsets.iter().any(|&(dx, dy)| {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    (0..width as i32).contains(&nx)
+                        && (0..height as i32).contains(&ny)
+                        && t.saturating_sub(last[ny as usize * width + nx as usize]) <= dt
+                })
+            };
+            last[pixel] = t; // seed the surface even for dropped noise
             if keep {
                 builder.push(xs[index], ys[index], t, ps[index]);
             }
@@ -142,10 +166,17 @@ impl EventStream {
     /// [`Self::refractory_filter`] under a chosen [`RefreshOn`] rule.
     pub fn refractory_filter_with(&self, dt: i64, refresh: RefreshOn) -> EventStream {
         let (width, height) = self.sensor_size();
+        self.refractory_on(&mut vec![i64::MIN; width * height], dt, refresh)
+    }
+
+    /// [`Self::refractory_filter_with`] against `last`, each pixel's dead-time start (row-major
+    /// `width·height`, `i64::MIN` for none), which it updates — so carried across batches it
+    /// filters as one call over them all.
+    fn refractory_on(&self, last: &mut [i64], dt: i64, refresh: RefreshOn) -> EventStream {
+        let (width, height) = self.sensor_size();
         if width == 0 || height == 0 {
             return self.clone();
         }
-        let mut last = vec![i64::MIN; width * height]; // last emitted timestamp per pixel
         let (xs, ys, ts, ps) = (self.xs(), self.ys(), self.ts(), self.ps());
         let mut builder =
             EventStreamBuilder::with_capacity(width, height, self.timestamp_scale_ms(), self.len());
@@ -206,20 +237,10 @@ impl EventStream {
     /// `mean + n_std·std` taken over the **active** (non-zero) pixels. All-zero counts flag nothing.
     /// The chunked-scan counterpart of [`Self::hot_pixel_mask`].
     pub fn hot_pixel_mask_from_counts(counts: &[u64], n_std: f64) -> Vec<bool> {
-        let active: Vec<u64> = counts.iter().copied().filter(|&c| c > 0).collect();
-        if active.is_empty() {
-            return vec![false; counts.len()]; // no events -> nothing is hot
+        match hot_pixel_threshold(counts, n_std) {
+            Some(threshold) => counts.iter().map(|&c| c as f64 > threshold).collect(),
+            None => vec![false; counts.len()], // no events -> nothing is hot
         }
-        let n = active.len() as f64;
-        let mean = active.iter().sum::<u64>() as f64 / n;
-        let variance = active
-            .iter()
-            .map(|&c| (c as f64 - mean).powi(2))
-            .sum::<f64>()
-            / n;
-        let threshold = mean + n_std * variance.sqrt();
-
-        counts.iter().map(|&c| c as f64 > threshold).collect()
     }
 
     /// Drops every event whose pixel is flagged `true` in `mask` (row-major `width·height`, as
@@ -237,43 +258,57 @@ impl EventStream {
     }
 }
 
+/// The count above which a pixel is hot: `mean + n_std·std` over the active (non-zero) `counts`, or
+/// `None` when there are none.
+fn hot_pixel_threshold(counts: &[u64], n_std: f64) -> Option<f64> {
+    let active = || counts.iter().filter(|&&c| c > 0);
+    let (n, sum) = active().fold((0_u64, 0_u64), |(n, sum), &c| (n + 1, sum + c));
+    if n == 0 {
+        return None;
+    }
+    let n = n as f64;
+    let mean = sum as f64 / n;
+    let variance = active().map(|&c| (c as f64 - mean).powi(2)).sum::<f64>() / n;
+    Some(mean + n_std * variance.sqrt())
+}
+
 // Streaming pipeline, shared by the GUI viewer and the TUI.
 
 /// One stage of a [`Pipeline`]. Stages see a stream in consecutive batches (playback windows or
-/// camera packets); a retained input tail makes the stateless filters above behave continuously
-/// across batch boundaries.
+/// camera packets) and carry their per-pixel state from one to the next, so the filters above
+/// behave continuously across batch boundaries. A caller going back over time it has already fed
+/// (a seek) must [`reset`](Self::reset) first, then warm the stage on [`lookback_us`] of input
+/// before the window it wants.
+///
+/// [`lookback_us`]: Self::lookback_us
 pub trait Processor: Send {
     fn lookback_us(&self) -> i64;
+    /// Feeds `stream` through and returns its events inside `window`, `[start, end)`.
     fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream;
     fn reset(&mut self);
 }
 
-fn process_with_history(
-    history: &mut Option<EventStream>,
-    dt_us: i64,
-    window: (i64, i64),
-    stream: EventStream,
-    filter: impl FnOnce(&EventStream) -> EventStream,
-) -> EventStream {
-    let combined = match history.take() {
-        Some(previous) if !previous.is_empty() => previous.concat(&[&stream]),
-        _ => stream,
-    };
-    let filtered = filter(&combined).time_window(window.0, window.1);
-    *history = Some(combined.time_window(window.1.saturating_sub(dt_us), window.1));
-    filtered
+/// `surface` sized for `stream`'s sensor; a new (or resized) one starts with no events.
+fn fit_surface(surface: &mut Vec<i64>, stream: &EventStream) {
+    let (width, height) = stream.sensor_size();
+    if surface.len() != width * height {
+        *surface = vec![i64::MIN; width * height];
+    }
 }
 
+/// Streaming [`EventStream::background_activity_filter`]. The timestamp surface persists, rather
+/// than being rebuilt each batch from a re-filtered `dt` of history: a 1280×720 surface is 7 MB
+/// to refill, and at sensor rates the history is as many events again as the batch.
 pub struct BackgroundProcessor {
     dt_us: i64,
-    history: Option<EventStream>,
+    last: Vec<i64>,
 }
 
 impl BackgroundProcessor {
     pub fn new(dt_us: i64) -> Self {
         Self {
             dt_us: dt_us.max(1),
-            history: None,
+            last: Vec::new(),
         }
     }
 }
@@ -284,26 +319,28 @@ impl Processor for BackgroundProcessor {
     }
 
     fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream {
-        process_with_history(&mut self.history, self.dt_us, window, stream, |events| {
-            events.background_activity_filter(self.dt_us)
-        })
+        fit_surface(&mut self.last, &stream);
+        stream
+            .background_activity_on(&mut self.last, self.dt_us, Neighbourhood::Block)
+            .time_window(window.0, window.1)
     }
 
     fn reset(&mut self) {
-        self.history = None;
+        self.last.fill(i64::MIN);
     }
 }
 
+/// Streaming [`EventStream::refractory_filter`], its dead-time surface carried across batches.
 pub struct RefractoryProcessor {
     dt_us: i64,
-    history: Option<EventStream>,
+    last: Vec<i64>,
 }
 
 impl RefractoryProcessor {
     pub fn new(dt_us: i64) -> Self {
         Self {
             dt_us: dt_us.max(1),
-            history: None,
+            last: Vec::new(),
         }
     }
 }
@@ -314,13 +351,14 @@ impl Processor for RefractoryProcessor {
     }
 
     fn process(&mut self, window: (i64, i64), stream: EventStream) -> EventStream {
-        process_with_history(&mut self.history, self.dt_us, window, stream, |events| {
-            events.refractory_filter(self.dt_us)
-        })
+        fit_surface(&mut self.last, &stream);
+        stream
+            .refractory_on(&mut self.last, self.dt_us, RefreshOn::Kept)
+            .time_window(window.0, window.1)
     }
 
     fn reset(&mut self) {
-        self.history = None;
+        self.last.fill(i64::MIN);
     }
 }
 
@@ -349,10 +387,15 @@ impl Processor for HotPixelProcessor {
         let (width, height) = stream.sensor_size();
         self.counts.resize(width * height, 0);
         stream.add_pixel_counts(&mut self.counts);
-        stream.drop_masked_pixels(&EventStream::hot_pixel_mask_from_counts(
-            &self.counts,
-            self.n_std,
-        ))
+        let Some(threshold) = hot_pixel_threshold(&self.counts, self.n_std) else {
+            return stream;
+        };
+        // Tested against the counts directly: a whole-sensor mask each batch costs more than the
+        // events it removes.
+        let counts = &self.counts;
+        stream.remap(width, height, |x, y, t, p| {
+            (counts[y as usize * width + x as usize] as f64 <= threshold).then_some((x, y, t, p))
+        })
     }
 
     fn reset(&mut self) {
@@ -585,6 +628,86 @@ mod tests {
         assert!(empty.background_activity_filter(100).is_empty());
         assert!(empty.refractory_filter(100).is_empty());
         assert!(empty.hot_pixel_filter(3.0).is_empty());
+    }
+
+    /// Pseudo-random events in time order, dense enough that neighbours and dead times interact.
+    fn noise(n: usize) -> EventStream {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let events: Vec<_> = (0..n as i64)
+            .map(|t| {
+                let r = next();
+                (
+                    (r % 24) as u16,
+                    (r >> 8) as u16 % 16,
+                    t * 7,
+                    r >> 20 & 1 == 1,
+                )
+            })
+            .collect();
+        build(24, 16, &events)
+    }
+
+    fn assert_same(a: &EventStream, b: &EventStream) {
+        assert_eq!(
+            (a.xs(), a.ys(), a.ts(), a.ps()),
+            (b.xs(), b.ys(), b.ts(), b.ps())
+        );
+    }
+
+    /// `processor` fed `stream` in `batch`-µs windows, the pieces joined back up.
+    fn in_batches(mut processor: impl Processor, stream: &EventStream, batch: i64) -> EventStream {
+        let end = stream.ts().last().unwrap() + 1;
+        let pieces: Vec<_> = (0..end)
+            .step_by(batch as usize)
+            .map(|start| {
+                let window = (start, (start + batch).min(end));
+                processor.process(window, stream.time_window(window.0, window.1))
+            })
+            .collect();
+        let empty = EventStreamBuilder::new(24, 16, 0.001).build();
+        empty.concat(&pieces.iter().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn streaming_matches_one_call_over_the_whole_stream() {
+        use super::BackgroundProcessor;
+
+        let stream = noise(5_000);
+        for batch in [1, 97, 1_000, 40_000] {
+            let background = in_batches(BackgroundProcessor::new(60), &stream, batch);
+            assert_same(&background, &stream.background_activity_filter(60));
+            let refractory = in_batches(RefractoryProcessor::new(900), &stream, batch);
+            assert_same(&refractory, &stream.refractory_filter(900));
+        }
+        // Neither the filters nor the batching make this vacuous.
+        let kept = stream.background_activity_filter(60).len();
+        assert!(0 < kept && kept < stream.len());
+    }
+
+    #[test]
+    fn reset_forgets_what_was_fed() {
+        use super::BackgroundProcessor;
+
+        let mut processor = BackgroundProcessor::new(100);
+        let pair = build(4, 4, &[(1, 1, 10, true)]);
+        processor.process((0, 20), build(4, 4, &[(0, 1, 5, true)]));
+        assert_eq!(processor.process((0, 20), pair.clone()).len(), 1);
+        processor.reset();
+        assert!(processor.process((0, 20), pair).is_empty());
+    }
+
+    #[test]
+    fn hot_pixel_processor_matches_the_mask() {
+        let stream = noise(3_000).concat(&[&build(24, 16, &[(3, 3, 30_000, true); 400])]);
+        let filtered = HotPixelProcessor::new(2.0).process((0, i64::MAX), stream.clone());
+        assert_same(&filtered, &stream.hot_pixel_filter(2.0));
+        assert!(filtered.len() < stream.len());
     }
 
     #[test]
